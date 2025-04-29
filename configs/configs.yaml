@@ -1,0 +1,19 @@
+diffusion_model:
+  state_dim: 7           # dimensionality of state vector
+  hidden_dim: 128        # transformer hidden size
+  num_layers: 4          # number of transformer layers
+  nhead: 4               # number of attention heads
+
+sampler:
+  horizon: 16            # planning horizon
+  stride: 1              # jump-step stride
+
+critic:
+  model_path: "path/to/critic_model.pt"  # path to trained critic weights
+  state_dim: 7          # must match diffusion_model.state_dim
+  horizon: 16           # must match sampler.horizon
+  hidden_dim: 128       # hidden dimension of critic MLP
+  device: "cpu"        # device to load critic on
+
+planner:
+  n_samples: 8          # number of candidate trajectories to sample
