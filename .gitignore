@@ -1,0 +1,43 @@
+data/input.txt
+data/train.bin
+data/val.bin
+checkpoints/
+lerobot/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+wandb/*
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# VSCode
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Mac OS
+.DS_Store
+
+#nohup conda run --name rss python /home/ahrilab/Desktop/DraftLLM/traindiffusion.py > train.log 2>&1 &
+#nohup conda run --name rss python /home/ahrilab/Desktop/DraftLLM/train.py > train.log 2>&1 &

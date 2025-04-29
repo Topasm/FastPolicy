@@ -1,0 +1,62 @@
+# Example Configuration for VisionConditionedDiffusionPolicy
+
+model:
+  image_tokenizer:
+    image_size: [224, 224]  # Input image height, width
+    patch_size: 16         # Patch size for ViT
+    embed_dim: 768         # Embedding dimension (output of tokenizer, input to transformer)
+    num_frames: 8          # Number of image frames in the input sequence T_img
+    # type: 'vit_base'     # Optional: Specify underlying ViT model if using library like timm
+
+  denoising_head:
+    input_dim: 768         # Should match transformer_dim
+    hidden_dim: 512        # Hidden dimension(s) in the MLP head
+    output_dim: 7          # Action dimension A
+    # type: 'mlp'          # Optional: Specify head type ('mlp' or 'transformer')
+
+  scheduler:
+    scheduler_type: 'ddpm' # 'ddpm' or 'ddim'
+    num_train_timesteps: 100 # Number of diffusion steps during training
+    beta_schedule: 'linear'  # Noise schedule ('linear', 'squaredcos_cap_v2', etc.)
+    prediction_type: 'epsilon' # 'epsilon' or 'sample' (predict noise or clean data)
+    # Optional DDIM parameters if scheduler_type is 'ddim'
+    # clip_sample: False
+    # set_alpha_to_one: False
+    # steps_offset: 0
+    # Optional inference scheduler override
+    # inference_scheduler_type: 'ddim' # Use DDIM for inference even if trained with DDPM
+
+  policy:
+    action_dim: 7          # Action dimension A (must match denoising_head.output_dim)
+    transformer_dim: 768   # Internal dimension of the main transformer (must match image_tokenizer.embed_dim)
+    num_transformer_layers: 6 # Number of layers in the TransformerDecoder
+    transformer_heads: 12    # Number of attention heads
+    use_task_embedding: False # Whether to condition on a task embedding
+    task_embed_dim: 512    # Dimension of the raw task embedding (if use_task_embedding is True)
+    # max_action_seq_len: 16 # Optional: If using fixed learned pos embedding for actions
+
+training:
+  device: 'cuda'         # 'cuda' or 'cpu'
+  batch_size: 32
+  epochs: 100
+  lr: 1e-4
+  optimizer: 'adamw'     # 'adam', 'adamw'
+  weight_decay: 1e-6     # For AdamW
+  # Gradient clipping
+  # max_grad_norm: 1.0
+  # Learning rate scheduler
+  # lr_scheduler: 'cosine'
+  # warmup_steps: 500
+  cfg_prob: 0.1          # Probability of dropping conditioning for Classifier-Free Guidance (0.0 to disable)
+  # Dataset specific
+  # data_path: '/path/to/your/dataset'
+  # num_workers: 4
+
+inference:
+  device: 'cuda'         # 'cuda' or 'cpu'
+  checkpoint_path: '/path/to/your/trained_model.pth' # Path to the saved model weights
+  num_inference_steps: 50 # Number of denoising steps (can be fewer for DDIM)
+  guidance_scale: 2.0    # Classifier-Free Guidance scale (1.0 = disabled)
+  action_horizon: 16     # Length of the action sequence T_act to generate
+  # Optional: Specify initial noise for reproducibility
+  # initial_noise_seed: 42

@@ -3,8 +3,8 @@ from typing import List
 import numpy as np
 import torch
 import zarr
-from cleandiffuser.utils import MinMaxNormalizer, create_indices
-from cleandiffuser.utils.codecs import jpeg  # noqa
+# from cleandiffuser.utils import MinMaxNormalizer, create_indices
+# from cleandiffuser.utils.codecs import jpeg  # noqa
 
 FULL_OBS_LIST = [
     "color",
@@ -166,3 +166,4 @@ class LiberoDataset(torch.utils.data.Dataset):
             "language_embedding": self.root.meta.language_embeddings[episode_idx],
             "language_mask": self.root.meta.language_masks[episode_idx],
         }
+# this is for fine-tuning

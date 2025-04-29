@@ -1,0 +1,7 @@
+torch
+diffusers
+transformers
+PyYAML
+gym-aloha
+# Add other dependencies as needed, e.g., for specific ViT backbones (timm), data loading, etc.
+# timm
