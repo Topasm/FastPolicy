@@ -97,9 +97,7 @@ def train():
     # save models
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(diffusion_model.state_dict(), "checkpoints/diffusion_model.pt")
-
-
-inv_dyn.save("checkpoints/inv_dyn.pt")
+    inv_dyn.save("checkpoints/inv_dyn.pt")
 
 
 if __name__ == "__main__":

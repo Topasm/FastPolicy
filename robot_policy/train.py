@@ -3,10 +3,11 @@ import torch
 import torch.nn as nn  # Add missing import
 from torch.utils.data import DataLoader, Dataset
 
-from model.diffusion_policy import VisionConditionedDiffusionPolicy
-from model.image_tokenizer import ImageTokenizer
-from model.denoising_head import DenoisingHead
-from model.scheduler_wrapper import DiffusionSchedulerWrapper
+# Updated import paths
+from model.vision_policy.diffusion_policy import VisionConditionedDiffusionPolicy
+from model.vision_policy.image_tokenizer import ImageTokenizer
+from model.vision_policy.denoising_head import DenoisingHead
+from model.vision_policy.scheduler_wrapper import DiffusionSchedulerWrapper
 
 # --- Dummy Dataset ---
 

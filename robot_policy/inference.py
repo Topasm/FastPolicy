@@ -1,10 +1,11 @@
 # Placeholder for inference script
 import torch
 
-from model.diffusion_policy import VisionConditionedDiffusionPolicy
-from model.image_tokenizer import ImageTokenizer
-from model.denoising_head import DenoisingHead
-from model.scheduler_wrapper import DiffusionSchedulerWrapper
+# Updated import paths
+from model.vision_policy.diffusion_policy import VisionConditionedDiffusionPolicy
+from model.vision_policy.image_tokenizer import ImageTokenizer
+from model.vision_policy.denoising_head import DenoisingHead
+from model.vision_policy.scheduler_wrapper import DiffusionSchedulerWrapper
 
 
 def inference():
