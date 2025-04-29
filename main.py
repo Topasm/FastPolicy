@@ -5,6 +5,7 @@ from model.diffusion.model import DiffusionModel
 from model.diffusion.sampler import TrajectorySampler
 from model.critic.critic_model import CriticScorer
 from model.planner.diffusion_planner import DiffusionPlanner
+from model.invdynamics.invdyn import MlpInvDynamic
 
 
 def main():
@@ -39,18 +40,30 @@ def main():
         device=sc_cfg["device"],
     )
 
+    # build inverse dynamics model
+    inv_cfg = conf["invdynamics"]
+    inv_dyn = MlpInvDynamic(
+        o_dim=inv_cfg["o_dim"],
+        a_dim=inv_cfg["a_dim"],
+        hidden_dim=inv_cfg["hidden_dim"],
+        device=inv_cfg["device"],
+    )
+    inv_dyn.load(inv_cfg["model_path"])
+
     # build planner
     pl_cfg = conf["planner"]
-    planner = DiffusionPlanner(sampler, scorer, n_samples=pl_cfg["n_samples"])
+    planner = DiffusionPlanner(
+        sampler, scorer, inv_dyn, n_samples=pl_cfg["n_samples"])
 
     # example initial state and optional goal
     s0 = torch.zeros(dm_cfg["state_dim"])
     goal = None
 
     # run planning
-    best_traj = planner.plan(s0, goal)
+    best_traj, actions = planner.plan(s0, goal)
     print("Best trajectory shape:", best_traj.shape)
-    print("First state:", best_traj[0])
+    print("Actions shape:", actions.shape)
+    print("First action:", actions[0])
 
 
 if __name__ == "__main__":

@@ -1,3 +1,24 @@
+import torch
+import torch.nn as nn
+
+
+class Mlp(nn.Module):
+    """Simple MLP backbone for inverse dynamics"""
+
+    def __init__(self, in_dim, hidden_dims, out_dim, hidden_act, out_act):
+        super().__init__()
+        layers = []
+        last = in_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(last, h))
+            layers.append(hidden_act)
+            last = h
+        layers.append(nn.Linear(last, out_dim))
+        layers.append(out_act)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class MlpInvDynamic:
