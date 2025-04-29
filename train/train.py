@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data.libero import LiberoDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
 from model.diffusion.model import DiffusionModel
 from model.invdynamics.invdyn import MlpInvDynamic
 
@@ -19,12 +20,21 @@ def train():
     diffusion_lr = tr_cfg.get("diffusion_lr", 1e-3)
     invdyn_lr = tr_cfg.get("invdyn_lr", 5e-4)
     epochs = tr_cfg.get("epochs", 10)
+    repo_id = tr_cfg.get("repo_id", None)
+    delta_timestamps = tr_cfg.get("delta_timestamps", None)
+
+    if repo_id is None:
+        raise ValueError(
+            "Training config must include 'repo_id' for LeRobotDataset")
+    if delta_timestamps is None:
+        raise ValueError(
+            "Training config must include 'delta_timestamps' for LeRobotDataset")
 
     device = torch.device(conf.get("device", "cpu"))
 
     # dataset and loader
-    data_path = tr_cfg.get("data_path", "data/libero.zarr")
-    dataset = LiberoDataset(data_path)
+    dataset = LeRobotDataset(
+        repo_id=repo_id, delta_timestamps=delta_timestamps)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # diffusion model and optimizer
@@ -53,11 +63,16 @@ def train():
         total_diff_loss = 0.0
         total_inv_loss = 0.0
         for batch in loader:
-            # observations: dict of arrays; use 'states'
-            states = torch.tensor(
-                batch['observation']['states'], dtype=torch.float32, device=device)
-            # shape [B, T, state_dim]
-            B, T, D = states.shape
+            states = batch['observation.state'].to(device)
+            actions = batch['action'].to(device)
+
+            if states.ndim == 3 and states.shape[1] == 1:
+                states = states.squeeze(1)
+            if actions.ndim == 3 and actions.shape[1] == 1:
+                actions = actions.squeeze(1)
+
+            B, D = states.shape
+
             # diffusion training
             noise = torch.randn_like(states)
             x_noisy = states + noise
@@ -69,30 +84,30 @@ def train():
             loss_diff.backward()
             diffusion_opt.step()
 
-            # inverse dynamics training: predict actions between states
-            # flatten pairs
-            o = states[:, :-1, :].reshape(-1, D)
-            o_next = states[:, 1:, :].reshape(-1, D)
-            # ground truth actions: use dataset action sequence
-            actions = torch.tensor(
-                batch['action'], dtype=torch.float32, device=device)
-            # assume actions shape [B, T, action_dim]
-            A = actions.shape[-1]
-            # align to T-1
-            a_gt = actions[:, :T-1, :].reshape(-1, A)
-            inv_pred = inv_dyn.forward(o, o_next)
-            loss_inv = mse_loss(inv_pred, a_gt)
+            # inverse dynamics training
+            if states.ndim > 2 and states.shape[1] > 1:
+                T = states.shape[1]
+                A = actions.shape[-1]
+                o = states[:, :-1, :].reshape(-1, D)
+                o_next = states[:, 1:, :].reshape(-1, D)
+                a_gt = actions[:, :T-1, :].reshape(-1, A)
+                inv_pred = inv_dyn.forward(o, o_next)
+                loss_inv = mse_loss(inv_pred, a_gt)
 
-            inv_opt.zero_grad()
-            loss_inv.backward()
-            inv_opt.step()
+                inv_opt.zero_grad()
+                loss_inv.backward()
+                inv_opt.step()
+                total_inv_loss += loss_inv.item() * B
+            else:
+                loss_inv = torch.tensor(0.0)
 
             total_diff_loss += loss_diff.item() * B
-            total_inv_loss += loss_inv.item() * B
 
         n = len(dataset)
+        avg_diff_loss = total_diff_loss / n
+        avg_inv_loss = total_inv_loss / n if total_inv_loss > 0 else 0.0
         print(
-            f"Epoch {ep}/{epochs}: diffusion_loss={total_diff_loss/n:.4f}, invdyn_loss={total_inv_loss/n:.4f}")
+            f"Epoch {ep}/{epochs}: diffusion_loss={avg_diff_loss:.4f}, invdyn_loss={avg_inv_loss:.4f}")
 
     # save models
     os.makedirs("checkpoints", exist_ok=True)

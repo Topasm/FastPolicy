@@ -30,5 +30,8 @@ training:
   diffusion_lr: 1e-3
   invdyn_lr: 5e-4
   epochs: 10
-  data_path: "data/libero.zarr"
+  repo_id: "lerobot/pusht" # Example dataset, change as needed
+  delta_timestamps:
+    observation.state: [0.0]
+    action: [0.0]
 device: "cpu"
