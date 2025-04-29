@@ -19,7 +19,6 @@ def main():
         state_dim=dm_cfg["state_dim"],
         hidden_dim=dm_cfg["hidden_dim"],
         num_layers=dm_cfg["num_layers"],
-        nhead=dm_cfg["nhead"],
     )
 
     # build sampler

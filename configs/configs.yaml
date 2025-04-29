@@ -24,3 +24,11 @@ invdynamics:
   hidden_dim: 512      # hidden dimension in inverse dynamics MLP
   model_path: "path/to/inv_dyn.pt"  # path to trained inverse dynamics model
   device: "cpu"
+
+training:
+  batch_size: 64
+  diffusion_lr: 1e-3
+  invdyn_lr: 5e-4
+  epochs: 10
+  data_path: "data/libero.zarr"
+device: "cpu"
