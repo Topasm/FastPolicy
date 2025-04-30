@@ -187,7 +187,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             )
 
         batch = self.normalize_diffusion_target(batch)
-        loss = self.diffusion.compute_loss(batch)
+        loss = self.diffusion.compute_loss(batch, self.inv_dyn_model)
         # no output_dict so returning None
         return loss, None
 
@@ -410,19 +410,20 @@ class MyDiffusionModel(nn.Module):
 
         return actions_to_execute
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
+        """
+        Computes the diffusion loss and the inverse dynamics loss.
+        """
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
         state_seq_len = batch["observation.state"].shape[1]
 
         # The state sequence must contain n_obs_steps for conditioning
         # PLUS horizon steps for the target prediction.
-        # Corrected minimum length calculation
         expected_min_len = n_obs_steps + horizon
         if state_seq_len < expected_min_len:
             raise ValueError(
                 f"observation.state sequence length ({state_seq_len}) is too short. "
-                # Corrected error message to reflect the required length
                 f"Need at least {expected_min_len} steps ({n_obs_steps} obs steps + {horizon} prediction horizon)."
             )
         if self.config.image_features:
@@ -432,13 +433,13 @@ class MyDiffusionModel(nn.Module):
         assert batch["action_is_pad"].shape[1] == horizon, \
             f"action_is_pad length ({batch['action_is_pad'].shape[1]}) must match prediction horizon ({horizon})"
 
+        # Prepare global conditioning
         cond_batch = {
             "observation.state": batch["observation.state"][:, :n_obs_steps],
         }
         if self.config.image_features:
             cond_batch["observation.images"] = batch["observation.images"]
         if self.config.env_state_feature:
-            # Ensure env state also has n_obs_steps length if provided
             if batch[OBS_ENV].shape[1] < n_obs_steps:
                 raise ValueError(
                     f"{OBS_ENV} sequence length ({batch[OBS_ENV].shape[1]}) "
@@ -449,8 +450,9 @@ class MyDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(cond_batch)
 
         # Extract target states: sequence of length `horizon` starting after `n_obs_steps`
+        # Shape: (B, horizon, state_dim)
         clean_targets = batch["observation.state"][:,
-                                                   n_obs_steps: n_obs_steps + horizon, :]  # Shape: (B, horizon, state_dim)
+                                                   n_obs_steps:n_obs_steps + horizon, :]
 
         # Ensure clean_targets has the expected horizon length after slicing
         if clean_targets.shape[1] != horizon:
@@ -462,19 +464,17 @@ class MyDiffusionModel(nn.Module):
         B = clean_targets.shape[0]
         device = clean_targets.device
 
+        # Diffusion loss
         noise = torch.randn(clean_targets.shape, device=device)
-
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps,
             size=(B,), device=device,
         ).long()
-
         noisy_targets = self.noise_scheduler.add_noise(
             clean_targets, noise, timesteps)  # Shape: (B, horizon, state_dim)
-
-        # Pass noisy targets (shape B, horizon, state_dim) to transformer
+        # Output: (B, horizon, state_dim)
         pred = self.transformer(noisy_targets, timesteps,
-                                global_cond=global_cond)  # Output: (B, horizon, state_dim)
+                                global_cond=global_cond)
 
         if self.config.prediction_type == "epsilon":
             target = noise
@@ -485,14 +485,53 @@ class MyDiffusionModel(nn.Module):
                 f"Unsupported prediction type {self.config.prediction_type}")
 
         # Shape: (B, horizon, state_dim)
-        loss = F.mse_loss(pred, target, reduction="none")
+        diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
         if self.config.do_mask_loss_for_padding:
             padding_mask = batch["action_is_pad"]  # Shape: (B, horizon)
             in_episode_bound = ~padding_mask
-            loss = loss * in_episode_bound.unsqueeze(-1)  # Apply mask
+            diffusion_loss = diffusion_loss * \
+                in_episode_bound.unsqueeze(-1)  # Apply mask
 
-        return loss.mean()
+        diffusion_loss = diffusion_loss.mean()
+
+        # --- Single-step inverse dynamics loss (using the first step of the horizon) ---
+        # s_t: state at t = n_obs_steps - 1
+        # s_tp1: state at t = n_obs_steps
+        s_t = batch["observation.state"][
+            :, n_obs_steps - 1, :
+        ]  # (B, state_dim)
+        s_tp1 = batch["observation.state"][
+            :, n_obs_steps, :
+        ]  # (B, state_dim)
+
+        # predict action for the first transition (s_t, s_tp1)
+        pred_actions = inv_dyn_model.predict(s_t, s_tp1)  # (B, action_dim)
+
+        # ground‐truth action for the first transition
+        # (B, action_dim)
+        true_actions = batch["action"][:, 0, :]  # Use action at index 0
+
+        # Apply padding mask if configured (using the mask for the first step)
+        if self.config.do_mask_loss_for_padding:
+            # Shape: (B,)
+            padding_mask_first_step = batch["action_is_pad"][:, 0]
+            in_episode_bound_first_step = ~padding_mask_first_step
+            # Calculate masked loss
+            inv_dyn_loss = F.mse_loss(
+                pred_actions, true_actions, reduction="none")  # (B, action_dim)
+            inv_dyn_loss = inv_dyn_loss * \
+                in_episode_bound_first_step.unsqueeze(-1)  # Apply mask
+            # Average over non-masked elements
+            inv_dyn_loss = inv_dyn_loss.sum() / (in_episode_bound_first_step.sum()
+                                                 * self.action_dim + 1e-8)
+        else:
+            inv_dyn_loss = F.mse_loss(pred_actions, true_actions)
+
+        # total loss
+        total_loss = diffusion_loss + self.config.inv_dyn_loss_weight * inv_dyn_loss
+
+        return total_loss
 
     def conditional_sample(
         self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None

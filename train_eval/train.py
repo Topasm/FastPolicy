@@ -106,7 +106,7 @@ def main():
         "lerobot/pusht", delta_timestamps=delta_timestamps)
 
     # Then we create our optimizer and dataloader for offline training.
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=4,

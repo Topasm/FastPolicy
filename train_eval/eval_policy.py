@@ -33,14 +33,14 @@ import torch
 from model.diffusion.modeling_mymodel import MYDiffusionPolicy
 
 # Create a directory to store the video of the evaluation
-output_directory = Path("outputs/eval/dit_policy")
+output_directory = Path("outputs/eval/dit_plan_policy")
 output_directory.mkdir(parents=True, exist_ok=True)
 
 # Select your device
 device = "cuda"
 
 # Provide the [hugging face repo id](https://huggingface.co/lerobot/diffusion_pusht):
-pretrained_policy_path = "outputs/train/dit_policy"
+pretrained_policy_path = "outputs/train/dit_plan_policy"
 # OR a path to a local outputs/train folder.
 # pretrained_policy_path = Path("outputs/train/example_pusht_diffusion")
 

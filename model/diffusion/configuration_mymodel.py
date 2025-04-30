@@ -48,7 +48,6 @@ class DiffusionConfig(PreTrainedConfig):
             - "action" is required as an output key for the diffusion model target.
         - If `predict_state` is True:
             - "next_observation.state" (or similar key representing future states) is required as the diffusion model target.
-            - `inv_dyn_model_path` must be provided for action generation during inference.
             - "action" is still required in `output_shapes` for the final policy output.
 
     Args:
@@ -80,7 +79,6 @@ class DiffusionConfig(PreTrainedConfig):
         clip_sample_range: Clipping range magnitude.
         num_inference_steps: Number of steps for inference. Defaults to `num_train_timesteps`.
         num_inference_samples: Number of candidate sequences (states or actions) to generate during inference.
-        inv_dyn_model_path: Path to the pretrained inverse dynamics model (required if `predict_state` is True).
         inv_dyn_hidden_dim: Hidden dimension for the inverse dynamics MLP.
         critic_model_path: Path to the pretrained critic model (optional, used for selecting best sample).
         critic_hidden_dim: Hidden dimension for the critic MLP.
@@ -129,11 +127,12 @@ class DiffusionConfig(PreTrainedConfig):
     num_inference_steps: int | None = None
     num_inference_samples: int = 1
 
-    # Auxiliary Models (Paths and Config)
-    inv_dyn_model_path: Optional[str] = None
+    inv_dyn_loss_weight: float = 0.00001
     inv_dyn_hidden_dim: int = 512
     critic_model_path: Optional[str] = None
     critic_hidden_dim: int = 128
+
+    critic_loss_weight: float = 1.0
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
