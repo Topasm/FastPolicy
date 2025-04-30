@@ -35,3 +35,4 @@ training:
     observation.state: [0.0]
     action: [0.0]
 device: "cpu"
+dataset_repo_id: lerobot/aloha_sim_insertion_human
