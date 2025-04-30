@@ -99,8 +99,7 @@ class DiffusionConfig(PreTrainedConfig):
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MIN_MAX,
-            "ACTION": NormalizationMode.MIN_MAX,
-            "NEXT_STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX
         }
     )
 
@@ -149,10 +148,31 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Validation logic
+        if self.predict_state:
+            # Check if a state key exists for prediction target
+            state_keys = [k for k in self.output_features if k.endswith(
+                "state") and k != "observation.state"]
+            if not state_keys:
+                raise ValueError(
+                    "When predict_state is True, output_features must contain a key ending with 'state' (e.g., 'next_observation.state') to be used as the diffusion target."
+                )
+            # Ensure action is still in output_features for the final policy output
+            if "action" not in self.output_features:
+                raise ValueError(
+                    "'action' must be included in output_features even when predict_state is True, as it is the final policy output."
+                )
+        else:
+            # Ensure action is the only output if not predicting state
+            if list(self.output_features.keys()) != ["action"]:
+                raise ValueError(
+                    "When predict_state is False, 'action' should be the only key in output_features."
+                )
 
-        if not self.vision_backbone.startswith("resnet"):
+        # Validate horizon vs n_action_steps and n_obs_steps
+        if self.transformer_dim % self.transformer_num_heads != 0:
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"{self.transformer_dim=} must be divisible by {self.transformer_num_heads=}"
             )
 
         supported_prediction_types = ["epsilon", "sample"]
@@ -166,29 +186,6 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
-
-        if self.transformer_dim % self.transformer_num_heads != 0:
-            raise ValueError(
-                f"{self.transformer_dim=} must be divisible by {self.transformer_num_heads=}"
-            )
-
-        if self.predict_state:
-            if self.inv_dyn_model_path is None:
-                raise ValueError(
-                    "`inv_dyn_model_path` must be provided when `predict_state` is True."
-                )
-            if not any(k.endswith("state") and k != "observation.state" for k in self.output_features):
-                print(
-                    "Warning: `predict_state` is True, but no obvious future state key "
-                    "(like 'next_observation.state') found in `output_features`. "
-                    "Ensure the diffusion target is correctly configured."
-                )
-        else:
-            if "action" not in self.output_features:
-                raise ValueError(
-                    "`predict_state` is False, but 'action' not found in `output_features`. "
-                    "The diffusion model needs an action target."
-                )
 
         if self.num_inference_samples > 1 and self.critic_model_path is None:
             print(
@@ -244,8 +241,22 @@ class DiffusionConfig(PreTrainedConfig):
         return list(range(1 - self.n_obs_steps, 1))
 
     @property
+    def target_delta_indices(self) -> list:
+        """Indices relative to the start of the observation window for the target sequence."""
+        # If predicting states, the target sequence starts right after the last observation step.
+        # If predicting actions, the target sequence might include the action concurrent with the last obs step.
+        # Assuming state prediction target starts at index 1 relative to last observation step.
+        start_index = 1
+        return list(range(start_index, start_index + self.horizon))
+
+    @property
     def action_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
+        """Indices relative to the start of the observation window for the action sequence.
+        Required by the base class, even if not directly used for state prediction targets.
+        Assumes actions start from the last observation step (index 0).
+        """
+        start_index = 0
+        return list(range(start_index, start_index + self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:

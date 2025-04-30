@@ -57,11 +57,11 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         self.normalize_inputs = Normalize(
             config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
-            # Example target key
-            {"next_observation.state": config.robot_state_feature},
+            # Use the dynamic target key
+            {self.config.diffusion_target_key:
+                self.config.output_features[self.config.diffusion_target_key]},
             config.normalization_mapping, dataset_stats
         )
-        # TODO: Add normalization for other features if needed
         self.unnormalize_outputs = Unnormalize(
             config.output_features, config.normalization_mapping, dataset_stats
         )
@@ -152,12 +152,12 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             batch["observation.images"] = torch.stack(
                 [batch[key] for key in self.config.image_features], dim=-4
             )
-        batch = self.normalize_targets(batch)
 
-        target_batch = {
-            "next_observation.state": batch["next_observation.state"]}
-        target_batch = self.normalize_targets(target_batch)
-        batch["normalized_next_observation.state"] = target_batch["next_observation.state"]
+        # Normalize the specific target data using the dynamic key
+        target_key = self.config.diffusion_target_key
+        target_data = {target_key: batch[target_key]}
+        target_data = self.normalize_targets(target_data)
+        batch[f"normalized_{target_key}"] = target_data[target_key]
 
         # Compute loss using the diffusion model
         loss = self.diffusion.compute_loss(batch)
@@ -186,6 +186,9 @@ class MyDiffusionModel(nn.Module):
         self.config = config
         self.state_dim = config.robot_state_feature.shape[0]  # Store state dim
         self.action_dim = config.action_feature.shape[0]  # Store action dim
+
+        # Determine the dimension the diffusion model should predict
+        self.diffusion_target_dim = self.state_dim if config.predict_state else self.action_dim
 
         # --- Observation Encoders ---
         global_cond_dim = 0
@@ -219,7 +222,9 @@ class MyDiffusionModel(nn.Module):
 
         # --- Diffusion Transformer ---
         self.transformer = DiffusionTransformer(
-            config, global_cond_dim=global_cond_dim
+            config,
+            global_cond_dim=global_cond_dim,
+            output_dim=self.diffusion_target_dim  # Pass the correct target dimension
         )
 
         # --- Noise Scheduler ---
@@ -287,7 +292,7 @@ class MyDiffusionModel(nn.Module):
         num_samples: int = 1,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Samples future STATE sequences using the DDPM/DDIM reverse process."""
+        """Samples future sequences (states or actions) using the DDPM/DDIM reverse process."""
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -295,10 +300,10 @@ class MyDiffusionModel(nn.Module):
             num_samples, dim=0)
         effective_batch_size = batch_size * num_samples
 
-        # Sample initial noise for future STATES
-        noisy_states = torch.randn(
+        # Sample initial noise for future TARGETS (states or actions)
+        noisy_targets = torch.randn(
             size=(effective_batch_size, self.config.horizon,
-                  self.state_dim),  # Use state_dim
+                  self.diffusion_target_dim),  # Use the target dimension
             dtype=dtype, device=device, generator=generator,
         )
 
@@ -308,24 +313,24 @@ class MyDiffusionModel(nn.Module):
             timesteps_batch = torch.full(
                 (effective_batch_size,), t, dtype=torch.long, device=device)
 
-            # Predict model output (noise or state sample)
+            # Predict model output (noise or target sample)
             model_output = self.transformer(
-                noisy_states,  # Input noisy states
+                noisy_targets,  # Input noisy targets
                 timesteps_batch,
                 global_cond=expanded_global_cond,
             )
 
             scheduler_output = self.noise_scheduler.step(
-                model_output, t, noisy_states, generator=generator
+                model_output, t, noisy_targets, generator=generator
             )
-            noisy_states = scheduler_output.prev_sample
+            noisy_targets = scheduler_output.prev_sample
 
-        # Reshape the output states
-        # (B * num_samples, horizon, state_dim) -> (B, num_samples, horizon, state_dim)
-        predicted_states = noisy_states.view(
-            batch_size, num_samples, self.config.horizon, self.state_dim
+        # Reshape the output targets
+        # (B * num_samples, horizon, target_dim) -> (B, num_samples, horizon, target_dim)
+        predicted_targets = noisy_targets.view(
+            batch_size, num_samples, self.config.horizon, self.diffusion_target_dim
         )
-        return predicted_states
+        return predicted_targets
 
     @torch.no_grad()
     def generate_actions_via_inverse_dynamics(
@@ -410,59 +415,61 @@ class MyDiffusionModel(nn.Module):
         return actions_to_execute  # (B, n_action_steps, action_dim)
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """Computes the diffusion loss for STATE prediction."""
-        required_keys = {"observation.state",
-                         "normalized_next_observation.state"}
-        # Add padding mask key if needed for states
+        """Computes the diffusion loss for the configured target (state or action)."""
+        target_key = self.config.diffusion_target_key
+        normalized_target_key = f"normalized_{target_key}"
+
+        required_keys = {"observation.state", normalized_target_key}
+        # Add padding mask key if needed
         # if self.config.do_mask_loss_for_padding:
-        #     required_keys.add("next_state_is_pad") # Example key
+        #     required_keys.add("target_is_pad") # Example key
         assert set(batch).issuperset(required_keys)
         assert self.config.image_features or self.config.env_state_feature
 
         n_obs_steps = batch["observation.state"].shape[1]
-        horizon = batch["normalized_next_observation.state"].shape[1]
+        horizon = batch[normalized_target_key].shape[1]
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
 
         global_cond = self._prepare_global_conditioning(batch)
 
-        # Target is the sequence of clean future states
-        # (B, horizon, state_dim)
-        clean_states = batch["normalized_next_observation.state"]
-        B = clean_states.shape[0]
-        device = clean_states.device
+        # Target is the sequence of clean future states or actions
+        # (B, horizon, target_dim)
+        clean_targets = batch[normalized_target_key]
+        B = clean_targets.shape[0]
+        device = clean_targets.device
 
-        noise = torch.randn(clean_states.shape, device=device)
+        noise = torch.randn(clean_targets.shape, device=device)
 
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps,
             size=(B,), device=device,
         ).long()
 
-        # Add noise to clean states
-        noisy_states = self.noise_scheduler.add_noise(
-            clean_states, noise, timesteps)
+        # Add noise to clean targets
+        noisy_targets = self.noise_scheduler.add_noise(
+            clean_targets, noise, timesteps)
 
-        # Predict noise or clean state
-        pred = self.transformer(noisy_states, timesteps,
+        # Predict noise or clean target
+        pred = self.transformer(noisy_targets, timesteps,
                                 global_cond=global_cond)
 
         # Determine target for loss
         if self.config.prediction_type == "epsilon":
             target = noise
         elif self.config.prediction_type == "sample":
-            target = clean_states
+            target = clean_targets
         else:
             raise ValueError(
                 f"Unsupported prediction type {self.config.prediction_type}")
 
         # Compute MSE loss
-        # (B, horizon, state_dim)
+        # (B, horizon, target_dim)
         loss = F.mse_loss(pred, target, reduction="none")
 
-        # Mask loss for padding if needed (adapt mask key/logic for states)
+        # Mask loss for padding if needed (adapt mask key/logic)
         # if self.config.do_mask_loss_for_padding:
-        #     in_episode_mask = ~batch["next_state_is_pad"] # Example mask
+        #     in_episode_mask = ~batch["target_is_pad"] # Example mask
         #     loss = loss * in_episode_mask.unsqueeze(-1)
         #     loss = loss.sum() / in_episode_mask.sum().clamp(min=1.0)
         # else:

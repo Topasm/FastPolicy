@@ -34,7 +34,7 @@ from lerobot.configs.types import FeatureType
 
 def main():
     # Create a directory to store the training checkpoint.
-    output_directory = Path("outputs/train/dit_policy")
+    output_directory = Path("outputs/train/dit_plan_policy")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # # Select your device
@@ -42,7 +42,7 @@ def main():
 
     # Number of offline training steps (we'll only do offline training for this example.)
     # Adjust as you prefer. 5000 steps are needed to get something worth evaluating.
-    training_steps = 50000
+    training_steps = 5000
     log_freq = 1
 
     # When starting from scratch (i.e. not from a pretrained policy), we need to specify 2 things before
@@ -58,8 +58,13 @@ def main():
 
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
-    cfg = DiffusionConfig(input_features=input_features,
-                          output_features=output_features)
+    cfg = DiffusionConfig(
+        input_features=input_features,
+        output_features=output_features,
+        predict_state=True,  # Set to predict states
+        # Ensure inv_dyn_model_path is set if needed for inference later
+        # inv_dyn_model_path="path/to/your/inv_dyn_model.pt",
+    )
 
     # We can now instantiate our policy with this config and the dataset stats.
     policy = MYDiffusionPolicy(cfg, dataset_stats=dataset_metadata.stats)
@@ -68,23 +73,25 @@ def main():
 
     # Another policy-dataset interaction is with the delta_timestamps. Each policy expects a given number frames
     # which can differ for inputs, outputs and rewards (if there are some).
+    # Use the config properties to define the required timestamps
     delta_timestamps = {
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
         "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
+        # Use the target_delta_indices for the state prediction target
+        cfg.diffusion_target_key: [i / dataset_metadata.fps for i in cfg.target_delta_indices],
+        # Include action timestamps if needed by the inverse dynamics model during training or for other purposes
+        # "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices], # Assuming action_delta_indices exists or is defined
     }
 
-    # In this case with the standard configuration for Diffusion Policy, it is equivalent to this:
-    delta_timestamps = {
-        # Load the previous image and state at -0.1 seconds before current frame,
-        # then load current image and state corresponding to 0.0 second.
-        "observation.image": [-0.1, 0.0],
-        "observation.state": [-0.1, 0.0],
-        # Load the previous action (-0.1), the next action to be executed (0.0),
-        # and 14 future actions with a 0.1 seconds spacing. All these actions will be
-        # used to supervise the policy.
-        "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
-    }
+    # Example delta_timestamps for state prediction (adjust based on your config):
+    # Assuming n_obs_steps=2, horizon=6 (matching your example comment)
+    # observation_delta_indices = [-1, 0]
+    # target_delta_indices = [1, 2, 3, 4, 5, 6]
+    # delta_timestamps = {
+    #     "observation.image": [-0.1, 0.0],
+    #     "observation.state": [-0.1, 0.0],
+    #     "next_observation.state": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], # Target future states
+    # }
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
     dataset = LeRobotDataset(

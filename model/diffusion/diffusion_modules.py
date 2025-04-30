@@ -315,13 +315,12 @@ class DitBlock(nn.Module):
 class DiffusionTransformer(nn.Module):
     """
     A Diffusion Transformer model.
-    Takes noisy actions, timestep, and global conditioning, predicts noise or clean actions.
+    Takes noisy data (actions or states), timestep, and global conditioning, predicts noise or clean data.
     """
 
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int, output_dim: int):
         super().__init__()
         self.config = config
-        action_dim = config.action_feature.shape[0]
         transformer_dim = config.transformer_dim
 
         # 1. Embeddings
@@ -331,12 +330,13 @@ class DiffusionTransformer(nn.Module):
             nn.GELU(),
             nn.Linear(transformer_dim, transformer_dim),
         )
-        self.action_embed = nn.Linear(action_dim, transformer_dim)
+        # Input embedding (for actions or states)
+        self.input_embed = nn.Linear(output_dim, transformer_dim)
         # Conditioning embedding (time + global condition)
         self.cond_embed = nn.Linear(
             transformer_dim + global_cond_dim, transformer_dim)
 
-        # Learnable positional embedding for the action sequence
+        # Learnable positional embedding for the target sequence
         self.pos_embed = nn.Parameter(
             torch.zeros(1, config.horizon, transformer_dim))
 
@@ -358,17 +358,17 @@ class DiffusionTransformer(nn.Module):
         self.denoising_head = DenoisingHead(
             input_dim=transformer_dim,
             hidden_dim=transformer_dim,  # Can adjust hidden dim if needed
-            output_dim=action_dim
+            output_dim=output_dim  # Use the provided output_dim
         )
 
         # Initialize weights
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize positional embedding and action embedding
+        # Initialize positional embedding and input embedding
         nn.init.normal_(self.pos_embed, std=0.02)
-        nn.init.normal_(self.action_embed.weight, std=0.02)
-        nn.init.constant_(self.action_embed.bias, 0)
+        nn.init.normal_(self.input_embed.weight, std=0.02)
+        nn.init.constant_(self.input_embed.bias, 0)
 
         # Initialize transformer blocks and MLP heads (like in Vision Transformer)
         for m in self.modules():
@@ -391,17 +391,17 @@ class DiffusionTransformer(nn.Module):
         nn.init.constant_(self.denoising_head.net[-1].weight, 0)
         nn.init.constant_(self.denoising_head.net[-1].bias, 0)
 
-    def forward(self, noisy_actions: Tensor, timesteps: Tensor, global_cond: Tensor) -> Tensor:
+    def forward(self, noisy_input: Tensor, timesteps: Tensor, global_cond: Tensor) -> Tensor:
         """
         Args:
-            noisy_actions: (B, T_action, action_dim) Noisy actions.
+            noisy_input: (B, T_horizon, output_dim) Noisy data (actions or states).
             timesteps: (B,) Diffusion timesteps.
             global_cond: (B, global_cond_dim) Global conditioning vector.
         Returns:
-            (B, T_action, action_dim) Predicted noise or clean action.
+            (B, T_horizon, output_dim) Predicted noise or clean data.
         """
-        B, T, _ = noisy_actions.shape
-        device = noisy_actions.device
+        B, T, _ = noisy_input.shape
+        device = noisy_input.device
 
         # 1. Embeddings
         # (B, transformer_dim)
@@ -412,9 +412,9 @@ class DiffusionTransformer(nn.Module):
         c = self.cond_embed(cond)
 
         # (B, T, transformer_dim)
-        action_emb = self.action_embed(noisy_actions)
+        input_emb = self.input_embed(noisy_input)
         # Add positional embedding
-        x = action_emb + self.pos_embed  # Uses broadcasting
+        x = input_emb + self.pos_embed  # Uses broadcasting
 
         # 2. Apply Transformer blocks
         for block in self.blocks:
@@ -426,7 +426,7 @@ class DiffusionTransformer(nn.Module):
         x = self.norm_out(x)
         x = x * (1 + scale_out.unsqueeze(1)) + shift_out.unsqueeze(1)
 
-        # (B, T, action_dim)
+        # (B, T, output_dim)
         pred = self.denoising_head(x)
 
         return pred
