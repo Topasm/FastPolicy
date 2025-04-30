@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+from typing import Optional
 
 from lerobot.common.optim.optimizers import AdamConfig
 from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
@@ -26,6 +27,9 @@ from lerobot.configs.types import NormalizationMode
 @dataclass
 class DiffusionConfig(PreTrainedConfig):
     """Configuration class for DiffusionPolicy using a Transformer backbone (DiT).
+
+    Can be configured to predict actions directly or predict future states and use
+    an inverse dynamics model to infer actions.
 
     Defaults are configured for training with PushT providing proprioceptive and single camera observations.
 
@@ -40,14 +44,18 @@ class DiffusionConfig(PreTrainedConfig):
             - The key "observation.environment_state" is required as input.
         - If there are multiple keys beginning with "observation.image" they are treated as multiple camera
           views. Right now we only support all images having the same shape.
-        - "action" is required as an output key.
+        - If `predict_state` is False (default):
+            - "action" is required as an output key for the diffusion model target.
+        - If `predict_state` is True:
+            - "next_observation.state" (or similar key representing future states) is required as the diffusion model target.
+            - `inv_dyn_model_path` must be provided for action generation during inference.
+            - "action" is still required in `output_shapes` for the final policy output.
 
     Args:
-        n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
-            current step and additional steps going back).
-        horizon: Diffusion model action prediction size (length of the action sequence).
+        predict_state: If True, the diffusion model predicts future states. If False, it predicts actions directly.
+        n_obs_steps: Number of environment steps worth of observations to pass to the policy.
+        horizon: Diffusion model prediction size (length of the state/action sequence).
         n_action_steps: The number of action steps to run in the environment for one invocation of the policy.
-            See `DiffusionPolicy.select_action` for more details.
         input_shapes: A dictionary defining the shapes of the input data for the policy.
         output_shapes: A dictionary defining the shapes of the output data for the policy.
         input_normalization_modes: A dictionary specifying normalization modes for input modalities.
@@ -71,8 +79,16 @@ class DiffusionConfig(PreTrainedConfig):
         clip_sample: Whether to clip samples during inference.
         clip_sample_range: Clipping range magnitude.
         num_inference_steps: Number of steps for inference. Defaults to `num_train_timesteps`.
-        do_mask_loss_for_padding: Whether to mask loss for padded actions.
+        num_inference_samples: Number of candidate sequences (states or actions) to generate during inference.
+        inv_dyn_model_path: Path to the pretrained inverse dynamics model (required if `predict_state` is True).
+        inv_dyn_hidden_dim: Hidden dimension for the inverse dynamics MLP.
+        critic_model_path: Path to the pretrained critic model (optional, used for selecting best sample).
+        critic_hidden_dim: Hidden dimension for the critic MLP.
+        do_mask_loss_for_padding: Whether to mask loss for padded targets (actions or states).
     """
+
+    # Prediction mode
+    predict_state: bool = False
 
     # Inputs / output structure.
     n_obs_steps: int = 2
@@ -84,15 +100,13 @@ class DiffusionConfig(PreTrainedConfig):
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
+            "NEXT_STATE": NormalizationMode.MIN_MAX,
         }
     )
 
-    # The original implementation doesn't sample frames for the last 7 steps,
-    # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int = 7
 
     # Architecture / modeling.
-    # Vision backbone.
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
@@ -100,11 +114,9 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Diffusion Transformer (DiT).
     transformer_dim: int = 512
     transformer_num_layers: int = 6
     transformer_num_heads: int = 8
-    # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
@@ -116,6 +128,13 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+    num_inference_samples: int = 1
+
+    # Auxiliary Models (Paths and Config)
+    inv_dyn_model_path: Optional[str] = None
+    inv_dyn_hidden_dim: int = 512
+    critic_model_path: Optional[str] = None
+    critic_hidden_dim: int = 128
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
@@ -131,7 +150,6 @@ class DiffusionConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -149,10 +167,34 @@ class DiffusionConfig(PreTrainedConfig):
                 f"Got {self.noise_scheduler_type}."
             )
 
-        # Transformer heads must divide dimension
         if self.transformer_dim % self.transformer_num_heads != 0:
             raise ValueError(
-                f"{self.transformer_dim=} must be divisible by {self.transformer_num_heads=}")
+                f"{self.transformer_dim=} must be divisible by {self.transformer_num_heads=}"
+            )
+
+        if self.predict_state:
+            if self.inv_dyn_model_path is None:
+                raise ValueError(
+                    "`inv_dyn_model_path` must be provided when `predict_state` is True."
+                )
+            if not any(k.endswith("state") and k != "observation.state" for k in self.output_features):
+                print(
+                    "Warning: `predict_state` is True, but no obvious future state key "
+                    "(like 'next_observation.state') found in `output_features`. "
+                    "Ensure the diffusion target is correctly configured."
+                )
+        else:
+            if "action" not in self.output_features:
+                raise ValueError(
+                    "`predict_state` is False, but 'action' not found in `output_features`. "
+                    "The diffusion model needs an action target."
+                )
+
+        if self.num_inference_samples > 1 and self.critic_model_path is None:
+            print(
+                f"Warning: `num_inference_samples` is {self.num_inference_samples}, but no "
+                "`critic_model_path` provided. The first sample will be chosen by default."
+            )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
@@ -171,7 +213,8 @@ class DiffusionConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if len(self.image_features) == 0 and self.env_state_feature is None:
             raise ValueError(
-                "You must provide at least one image or the environment state among the inputs.")
+                "You must provide at least one image or the environment state among the inputs."
+            )
 
         if self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
@@ -182,7 +225,6 @@ class DiffusionConfig(PreTrainedConfig):
                         f"`{key}`."
                     )
 
-        # Check that all input images have the same shape.
         if len(self.image_features) > 0:
             first_image_key, first_image_ft = next(
                 iter(self.image_features.items()))
@@ -191,6 +233,11 @@ class DiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
+
+        if "action" not in self.output_features:
+            raise ValueError(
+                "The key 'action' must be present in `output_features` for the final policy output."
+            )
 
     @property
     def observation_delta_indices(self) -> list:
@@ -203,3 +250,15 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def diffusion_target_key(self) -> str:
+        if self.predict_state:
+            state_keys = [k for k in self.output_features if k.endswith(
+                "state") and k != "observation.state"]
+            if not state_keys:
+                raise ValueError(
+                    "Cannot determine diffusion target key for state prediction.")
+            return state_keys[0]
+        else:
+            return "action"
