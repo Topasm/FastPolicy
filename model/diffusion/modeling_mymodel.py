@@ -1,6 +1,7 @@
 import math
 from collections import deque
 from typing import Callable, Optional
+import os
 
 import einops
 import numpy as np
@@ -54,23 +55,50 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
+        # Normalizers/Unnormalizers
         self.normalize_inputs = Normalize(
             config.input_features, config.normalization_mapping, dataset_stats)
-        self.normalize_targets = Normalize(
-            # Use the dynamic target key
-            {self.config.diffusion_target_key:
-                self.config.output_features[self.config.diffusion_target_key]},
+        # Diffusion normalizes states
+        self.normalize_diffusion_target = Normalize(
+            {config.diffusion_target_key:
+                config.output_features[config.diffusion_target_key]},
             config.normalization_mapping, dataset_stats
         )
-        self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+        # Inverse dynamics normalizes states and actions
+        self.normalize_invdyn_state = Normalize(
+            {"observation.state": config.robot_state_feature},
+            config.normalization_mapping, dataset_stats
+        )
+        self.normalize_invdyn_action = Normalize(
+            {"action": config.action_feature},
+            config.normalization_mapping, dataset_stats
+        )
+        self.unnormalize_action_output = Unnormalize(
+            {"action": config.action_feature},
+            config.normalization_mapping, dataset_stats
         )
 
         # queues are populated during rollout of the policy
         self._queues = None
+        self.state_dim = config.robot_state_feature.shape[0]
+        self.action_dim = config.action_feature.shape[0]
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
+
+        self.inv_dyn_model = MlpInvDynamic(
+            o_dim=self.state_dim,
+            a_dim=self.action_dim,
+            hidden_dim=config.inv_dyn_hidden_dim,  # Use config value
+            # Assuming Tanh activation for actions based on MlpInvDynamic default
+            out_activation=nn.Tanh()
+        )
+        self.critic_scorer = CriticScorer(
+            state_dim=self.state_dim,
+            # Critic likely scores state from diffusion
+            horizon=config.horizon,
+            hidden_dim=config.critic_hidden_dim
+        )
 
         self.reset()
 
@@ -332,78 +360,76 @@ class MyDiffusionModel(nn.Module):
         return img_features
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encodes observations and concatenates them into a flat global conditioning vector."""
-        # Use only the first n_obs_steps for conditioning
-        n_obs_steps = self.config.n_obs_steps
-        batch_size = batch[OBS_ROBOT].shape[0]  # Get batch size from state
-
-        global_cond_feats = []
-
-        # Slice robot state to get only the observation window
-        robot_state = batch[OBS_ROBOT][:, :n_obs_steps, :].flatten(start_dim=1)
-        global_cond_feats.append(robot_state)
-
+        """Encode image features and concatenate them all together along with the state vector."""
+        batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
+        global_cond_feats = [batch[OBS_ROBOT]]
+        # Extract image features.
         if self.config.image_features:
-            # Slice images to get only the observation window
-            images_obs = batch["observation.images"][:, :n_obs_steps, ...]
-            img_features = self._encode_images(
-                images_obs)  # Pass only obs images
-            global_cond_feats.append(img_features.flatten(start_dim=1))
+            if self.config.use_separate_rgb_encoder_per_camera:
+                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+                images_per_camera = einops.rearrange(
+                    batch["observation.images"], "b s n ... -> n (b s) ...")
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ]
+                )
+                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            else:
+                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
+                img_features = self.rgb_encoder(
+                    einops.rearrange(
+                        batch["observation.images"], "b s n ... -> (b s n) ...")
+                )
+                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
-            # Slice env state to get only the observation window
-            env_state = batch[OBS_ENV][:, :n_obs_steps, :].flatten(start_dim=1)
-            global_cond_feats.append(env_state)
+            global_cond_feats.append(batch[OBS_ENV])
 
-        return torch.cat(global_cond_feats, dim=-1)
+        # Concatenate features then flatten to (B, global_cond_dim).
+        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    @torch.no_grad()
+    # ========= inference  ============
     def conditional_sample(
-        self,
-        batch_size: int,
-        global_cond: Tensor,
-        num_samples: int = 1,
-        generator: torch.Generator | None = None,
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
     ) -> Tensor:
-        """Samples future sequences (states or actions) using the DDPM/DDIM reverse process."""
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        expanded_global_cond = global_cond.repeat_interleave(
-            num_samples, dim=0)
-        effective_batch_size = batch_size * num_samples
-
-        # Sample initial noise for future TARGETS (states or actions)
-        noisy_targets = torch.randn(
-            size=(effective_batch_size, self.config.horizon,
-                  self.diffusion_target_dim),  # Use the target dimension
-            dtype=dtype, device=device, generator=generator,
+        # Sample prior.
+        sample = torch.randn(
+            size=(batch_size, self.config.horizon,
+                  self.config.action_feature.shape[0]),
+            dtype=dtype,
+            device=device,
+            generator=generator,
         )
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            timesteps_batch = torch.full(
-                (effective_batch_size,), t, dtype=torch.long, device=device)
-
-            # Predict model output (noise or target sample)
-            model_output = self.transformer(
-                noisy_targets,  # Input noisy targets
-                timesteps_batch,
-                global_cond=expanded_global_cond,
+            # Predict model output.
+            model_output = self.unet(
+                sample,
+                torch.full(sample.shape[:1], t,
+                           dtype=torch.long, device=sample.device),
+                global_cond=global_cond,
             )
+            # Compute previous image: x_t -> x_t-1
+            sample = self.noise_scheduler.step(
+                model_output, t, sample, generator=generator).prev_sample
 
-            scheduler_output = self.noise_scheduler.step(
-                model_output, t, noisy_targets, generator=generator
-            )
-            noisy_targets = scheduler_output.prev_sample
-
-        # Reshape the output targets
-        # (B * num_samples, horizon, target_dim) -> (B, num_samples, horizon, target_dim)
-        predicted_targets = noisy_targets.view(
-            batch_size, num_samples, self.config.horizon, self.diffusion_target_dim
-        )
-        return predicted_targets
+        return sample
 
     @torch.no_grad()
     def generate_actions_via_inverse_dynamics(
@@ -425,92 +451,80 @@ class MyDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)
 
         # 1. Generate multiple future STATE samples:
-        # Shape: (B, num_samples, horizon, state_dim)
         predicted_states = self.conditional_sample(
             batch_size, global_cond=global_cond, num_samples=num_samples
-        )
+        )  # (B, num_samples, horizon, state_dim)
 
-        # 2. Infer action sequences using Inverse Dynamics Model
-        # Prepare state pairs for inverse dynamics model
-        # current_state: (B, state_dim) -> (B, num_samples, 1, state_dim)
-        s_t = current_state.unsqueeze(1).unsqueeze(
-            1).expand(-1, num_samples, 1, -1)
-        # predicted_states: (B, num_samples, horizon, state_dim)
-        # Concatenate current state at the beginning for pairs:
-        # Shape: (B, num_samples, horizon+1, state_dim)
-        all_states = torch.cat([s_t, predicted_states], dim=2)
-
-        # Get pairs (s_t, s_{t+1})
-        # s_t_pairs shape: (B, num_samples, horizon, state_dim)
-        s_t_pairs = all_states[:, :, :-1, :]
-        # s_tplus1_pairs shape: (B, num_samples, horizon, state_dim)
-        s_tplus1_pairs = all_states[:, :, 1:, :]
-
-        # Reshape for batch processing by inv_dyn_model:
-        # Shape: (B * num_samples * horizon, state_dim)
-        s_t_flat = einops.rearrange(s_t_pairs, 'b ns h d -> (b ns h) d')
-        s_tplus1_flat = einops.rearrange(
-            s_tplus1_pairs, 'b ns h d -> (b ns h) d')
-
-        # Predict actions: Shape: (B * num_samples * horizon, action_dim)
-        inferred_actions_flat = inv_dyn_model.predict(s_t_flat, s_tplus1_flat)
-
-        # Reshape back: (B, num_samples, horizon, action_dim)
-        inferred_actions = einops.rearrange(
-            inferred_actions_flat, '(b ns h) d -> b ns h d',
-            b=batch_size, ns=num_samples, h=self.config.horizon
-        )
-
-        # 3. Select best action sequence using Critic (if available)
+        # 2. (Optional) pick best state‐trajectory via critic
         if num_samples > 1 and critic_scorer is not None:
-            best_actions_horizon = []
+            best_states = []
             for i in range(batch_size):
-                # Get inferred action samples for the current batch item
-                # Shape: (num_samples, horizon, action_dim)
-                current_action_samples = inferred_actions[i]
-                # Score the action samples
+                # score each (horizon, state_dim) sample
                 scores = critic_scorer.score(
-                    current_action_samples)  # (num_samples,)
-                best_idx = torch.argmax(scores)
-                best_actions_horizon.append(current_action_samples[best_idx])
-            # Stack best actions: (B, horizon, action_dim)
-            final_actions_horizon = torch.stack(best_actions_horizon, dim=0)
+                    predicted_states[i])  # (num_samples,)
+                best_idx = torch.argmax(scores).item()
+                best_states.append(predicted_states[i, best_idx])
+            # selected_states: (B, horizon, state_dim)
+            selected_states = torch.stack(best_states, dim=0)
         else:
-            # If only one sample or no critic, take the first sample
-            # (B, horizon, action_dim)
-            final_actions_horizon = inferred_actions[:, 0]
+            # just take the first sample
+            selected_states = predicted_states[:, 0]
 
-        # 4. Extract the required `n_action_steps` for execution
-        # We need the first n_action_steps from the inferred sequence
+        # 3. Infer actions *only* for the selected trajectory
+        # Prepare pairs (s_t, s_{t+1}) across the horizon
+        # current_state: (B, state_dim) -> (B,1,state_dim)
+        s_t0 = current_state.unsqueeze(1)
+        # for t=0..h-2 use selected_states[:,t], last pair uses selected_states[:,h-1]
+        # (B,horizon,state_dim)
+        s_t_pairs = torch.cat([s_t0, selected_states[:, :-1]], dim=1)
+        # (B,horizon,state_dim)
+        s_tp1_pairs = selected_states
+
+        # flatten to (B*horizon, state_dim)
+        B, H, D = s_t_pairs.shape
+        s_t_flat = s_t_pairs.reshape(B * H, D)
+        s_tp1_flat = s_tp1_pairs.reshape(B * H, D)
+
+        # Predict actions: (B*horizon, action_dim)
+        actions_flat = inv_dyn_model.predict(s_t_flat, s_tp1_flat)
+
+        # reshape back to (B, horizon, action_dim)
+        final_actions_horizon = actions_flat.view(B, H, -1)
+
+        # 4. extract first n_action_steps
         actions_to_execute = final_actions_horizon[:,
-                                                   :self.config.n_action_steps]
+                                                   : self.config.n_action_steps]
 
-        return actions_to_execute  # (B, n_action_steps, action_dim)
+        return actions_to_execute
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        """Computes the diffusion loss for the configured target (state or action)."""
-        target_key = self.config.diffusion_target_key
-        normalized_target_key = f"normalized_{target_key}"
+        """
+        This function expects `batch` to have (at least):
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
 
-        # Ensure the normalized target key exists
-        required_keys = {"observation.state", normalized_target_key}
-        # Add padding mask key if needed
-        # if self.config.do_mask_loss_for_padding:
-        #     required_keys.add("target_is_pad") # Example key
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+
+            "action": (B, horizon, action_dim)
+            "action_is_pad": (B, horizon)
+        }
+        """
+
         assert set(batch).issuperset(
-            required_keys), f"Missing keys: {required_keys - set(batch)}"
-        assert self.config.image_features or self.config.env_state_feature
-
-        # Get target shape and check horizon
-        horizon = batch[normalized_target_key].shape[1]
-        assert horizon == self.config.horizon, f"Target horizon mismatch: expected {self.config.horizon}, got {horizon}"
+            {"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        n_obs_steps = batch["observation.state"].shape[1]
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
 
         # Prepare global conditioning using ONLY observation steps
         global_cond = self._prepare_global_conditioning(batch)
 
-        # Target is the sequence of clean future states or actions (already normalized)
-        # (B, horizon, target_dim)
-        clean_targets = batch[normalized_target_key]
+        # Forward diffusion.
+        clean_targets = batch["observation.state"]
         B = clean_targets.shape[0]
         device = clean_targets.device
 
@@ -542,14 +556,14 @@ class MyDiffusionModel(nn.Module):
         # (B, horizon, target_dim)
         loss = F.mse_loss(pred, target, reduction="none")
 
-        # Mask loss for padding if needed (adapt mask key/logic)
-        # if self.config.do_mask_loss_for_padding:
-        #     # Ensure the mask has the correct shape (B, horizon)
-        #     in_episode_mask = ~batch["target_is_pad"][:, :self.config.horizon] # Example mask slicing
-        #     loss = loss * in_episode_mask.unsqueeze(-1)
-        #     # Normalize by the number of unmasked elements
-        #     loss = loss.sum() / in_episode_mask.sum().clamp(min=1.0)
-        # else:
-        loss = loss.mean()  # Simple mean loss for now
+        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
+            in_episode_bound = ~batch["action_is_pad"]
+            loss = loss * in_episode_bound.unsqueeze(-1)
 
-        return loss
+        return loss.mean()

@@ -26,7 +26,6 @@ class CriticScorer:
 
     def __init__(
         self,
-        model_path: str,
         state_dim: int,
         horizon: int,
         hidden_dim: int = 128,
@@ -35,7 +34,7 @@ class CriticScorer:
         self.device = device
         input_dim = state_dim * horizon
         self.model = CriticMLP(input_dim, hidden_dim).to(device)
-        self.model.load_state_dict(torch.load(model_path, map_location=device))
+
         self.model.eval()
 
     def score(self, trajectories: torch.Tensor) -> torch.Tensor:
