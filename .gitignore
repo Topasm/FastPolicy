@@ -3,6 +3,7 @@ data/train.bin
 data/val.bin
 checkpoints/
 lerobot/
+outputs/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

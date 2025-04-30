@@ -25,8 +25,8 @@ import torch
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
 # from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
-from model.diffusion.modeling_diffusion import DiffusionPolicy
-from model.diffusion.configuration_diffusion import DiffusionConfig
+from model.diffusion.modeling_mymodel import MYDiffusionPolicy
+from model.diffusion.configuration_mymodel import DiffusionConfig
 # from model.diffusion.modeling_mymodel import DiffusionConfig as MyDiffusionConfig
 # from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.configs.types import FeatureType
@@ -34,7 +34,7 @@ from lerobot.configs.types import FeatureType
 
 def main():
     # Create a directory to store the training checkpoint.
-    output_directory = Path("outputs/train/example_pusht_diffusion")
+    output_directory = Path("outputs/train/dit_policy")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # # Select your device
@@ -62,7 +62,7 @@ def main():
                           output_features=output_features)
 
     # We can now instantiate our policy with this config and the dataset stats.
-    policy = DiffusionPolicy(cfg, dataset_stats=dataset_metadata.stats)
+    policy = MYDiffusionPolicy(cfg, dataset_stats=dataset_metadata.stats)
     policy.train()
     policy.to(device)
 
