@@ -266,6 +266,11 @@ class DiffusionConfig(PreTrainedConfig):
         return list(range(start_index, start_index + self.horizon))
 
     @property
+    def state_delta_indices(self) -> list:
+
+        return list(range(1 - self.n_obs_steps, self.n_obs_steps + self.horizon))
+
+    @property
     def reward_delta_indices(self) -> None:
         return None
 
