@@ -90,7 +90,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 16
+    horizon: int = 8
     n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -127,7 +127,7 @@ class DiffusionConfig(PreTrainedConfig):
     num_inference_steps: int | None = None
     num_inference_samples: int = 1
 
-    inv_dyn_loss_weight: float = 0.00001
+    inv_dyn_loss_weight: float = 0.1
     inv_dyn_hidden_dim: int = 512
     critic_model_path: Optional[str] = None
     critic_hidden_dim: int = 128

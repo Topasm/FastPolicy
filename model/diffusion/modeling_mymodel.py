@@ -87,8 +87,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         self.diffusion = MyDiffusionModel(config)
 
         self.inv_dyn_model = MlpInvDynamic(
-            o_dim=self.state_dim,
-            a_dim=self.action_dim,
+            o_dim=self.state_dim*config.horizon,
+            a_dim=self.action_dim*config.horizon,
             hidden_dim=config.inv_dyn_hidden_dim,  # Use config value
             # Assuming Tanh activation for actions based on MlpInvDynamic default
             out_activation=nn.Tanh()
@@ -102,9 +102,9 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         self.reset()
 
-    def get_optim_params(self) -> dict:
-        # Return parameters of the diffusion model for optimization
-        return self.diffusion.parameters()
+    def get_optim_params(self) -> list:
+        # Return parameters of both models for joint optimization
+        return list(self.diffusion_model.parameters()) + list(self.inv_dyn_model.parameters())
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -156,10 +156,10 @@ class MYDiffusionPolicy(PreTrainedPolicy):
                 model_input_batch,
                 current_state,
                 self.inv_dyn_model,
+                self.normalize_invdyn_state,
                 num_samples=num_samples,
                 critic_scorer=self.critic_scorer
             )
-            # actions = self.diffusion.generate_actions(model_input_batch)
 
             # Unnormalize actions
             actions = self.unnormalize_action_output(
@@ -186,8 +186,15 @@ class MYDiffusionPolicy(PreTrainedPolicy):
                 [batch[key] for key in self.config.image_features], dim=-4
             )
 
+        # diffusion loss needs diffusion‐normalized targets
         batch = self.normalize_diffusion_target(batch)
-        loss = self.diffusion.compute_loss(batch, self.inv_dyn_model)
+
+        # --- now also normalize for inverse‐dynamics ---
+        # (so s_t and true_actions live in the same space as inv_dyn_model was trained on)
+        inv_batch = self.normalize_invdyn_state(batch)
+        inv_batch = self.normalize_invdyn_action(inv_batch)
+
+        loss = self.diffusion.compute_loss(inv_batch, self.inv_dyn_model)
         # no output_dict so returning None
         return loss, None
 
@@ -363,6 +370,7 @@ class MyDiffusionModel(nn.Module):
         batch: dict[str, Tensor],
         current_state: Tensor,
         inv_dyn_model: MlpInvDynamic,
+        normalize_invdyn_state: Callable[[dict[str, Tensor]], dict[str, Tensor]],
         num_samples: int = 1,
         critic_scorer: Optional[CriticScorer] = None
     ) -> Tensor:
@@ -394,15 +402,18 @@ class MyDiffusionModel(nn.Module):
             selected_states = predicted_states[:, 0]
 
         s_t0 = current_state.unsqueeze(1)
-        s_t_pairs = torch.cat([s_t0, selected_states[:, :-1]], dim=1)
-        s_tp1_pairs = selected_states
+        s_t_pairs = torch.cat(
+            [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state)
 
-        B, H, D_state = s_t_pairs.shape
-        s_t_flat = s_t_pairs.reshape(B * H, D_state)
-        s_tp1_flat = s_tp1_pairs.reshape(B * H, D_state)
+        # --- normalize for inv‐dyn model! ---
+        s_t_norm = normalize_invdyn_state(
+            {"observation.state": s_t_pairs}
+        )["observation.state"]
 
-        actions_flat = inv_dyn_model.predict(s_t_flat, s_tp1_flat)
+        B, H, D_state = s_t_norm.shape
+        s_t_flat = s_t_norm.reshape(B, H * D_state)  # (B, H*D_state)
 
+        actions_flat = inv_dyn_model.predict(s_t_flat)  # (B, H * action_dim)
         final_actions_horizon = actions_flat.view(B, H, -1)
 
         actions_to_execute = final_actions_horizon[:,
@@ -495,40 +506,32 @@ class MyDiffusionModel(nn.Module):
 
         diffusion_loss = diffusion_loss.mean()
 
-        # --- Single-step inverse dynamics loss (using the first step of the horizon) ---
-        # s_t: state at t = n_obs_steps - 1
-        # s_tp1: state at t = n_obs_steps
+        # --- Inverse dynamics loss over the full horizon ---
         s_t = batch["observation.state"][
-            :, n_obs_steps - 1, :
-        ]  # (B, state_dim)
-        s_tp1 = batch["observation.state"][
-            :, n_obs_steps, :
-        ]  # (B, state_dim)
+            :, n_obs_steps: n_obs_steps + horizon, :
+        ]                              # (B, H, D_state)
+        B, H, D_state = s_t.shape
 
-        # predict action for the first transition (s_t, s_tp1)
-        pred_actions = inv_dyn_model.predict(s_t, s_tp1)  # (B, action_dim)
+        # flatten to (B*H, D_state)
+        s_t_flat = s_t.reshape(B, H*D_state)
 
-        # ground‐truth action for the first transition
-        # (B, action_dim)
-        true_actions = batch["action"][:, 0, :]  # Use action at index 0
+        # predict one action per time‐step
+        pred_flat = inv_dyn_model.predict(s_t_flat)  # (B*H, action_dim)
 
-        # Apply padding mask if configured (using the mask for the first step)
+        # reshape back to (B, H, action_dim)
+        pred_actions = pred_flat.view(B, H, self.action_dim)
+
+        # ground‐truth actions for all H steps
+        true_actions = batch["action"][:, :, :]  # (B, H, action_dim)
+
         if self.config.do_mask_loss_for_padding:
-            # Shape: (B,)
-            padding_mask_first_step = batch["action_is_pad"][:, 0]
-            in_episode_bound_first_step = ~padding_mask_first_step
-            # Calculate masked loss
-            inv_dyn_loss = F.mse_loss(
-                pred_actions, true_actions, reduction="none")  # (B, action_dim)
-            inv_dyn_loss = inv_dyn_loss * \
-                in_episode_bound_first_step.unsqueeze(-1)  # Apply mask
-            # Average over non-masked elements
-            inv_dyn_loss = inv_dyn_loss.sum() / (in_episode_bound_first_step.sum()
-                                                 * self.action_dim + 1e-8)
+            mask = ~batch["action_is_pad"]            # (B, H)
+            loss_e = F.mse_loss(pred_actions, true_actions, reduction="none")
+            loss_e = loss_e * mask.unsqueeze(-1)      # zero‐out padded
+            inv_dyn_loss = loss_e.sum() / (mask.sum() * self.action_dim + 1e-8)
         else:
             inv_dyn_loss = F.mse_loss(pred_actions, true_actions)
 
-        # total loss
         total_loss = diffusion_loss + self.config.inv_dyn_loss_weight * inv_dyn_loss
 
         return total_loss

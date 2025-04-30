@@ -50,9 +50,9 @@ class MlpInvDynamic(nn.Module):
         def _norm():
             return nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity()
 
-        # Define the network structure
+        # Now only take o_dim, not 2*o_dim
         self.net = nn.Sequential(
-            nn.Linear(2 * o_dim, hidden_dim),
+            nn.Linear(o_dim, hidden_dim),
             _norm(),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -63,7 +63,7 @@ class MlpInvDynamic(nn.Module):
             nn.Linear(hidden_dim, a_dim),
             out_activation,
         )
-        self._init_weights()  # Initialize weights
+        self._init_weights()
 
     def _init_weights(self):
         # Initialize weights similar to the workspace version
@@ -73,16 +73,14 @@ class MlpInvDynamic(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 nn.init.zeros_(m.bias)
 
-    def forward(self, o: torch.Tensor, o_next: torch.Tensor) -> torch.Tensor:
-        """Predicts action given current and next state."""
-        # Ensure inputs are float and concatenate
-        x = torch.cat([o.float(), o_next.float()], dim=-1)
-        return self.net(x)
+    def forward(self, o: torch.Tensor) -> torch.Tensor:
+        """Predict action from current state only."""
+        return self.net(o.float())
 
     @torch.no_grad()
-    def predict(self, o: torch.Tensor, o_next: torch.Tensor) -> torch.Tensor:
-        """Alias for forward, used during inference."""
-        self.eval()  # Ensure model is in eval mode for prediction
-        pred = self.forward(o, o_next)
-        self.train()  # Return to train mode if needed elsewhere
-        return pred
+    def predict(self, o: torch.Tensor) -> torch.Tensor:
+        """Inference entrypoint."""
+        self.eval()
+        out = self.forward(o)
+        self.train()
+        return out
