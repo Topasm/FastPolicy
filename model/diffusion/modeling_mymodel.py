@@ -162,7 +162,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             # actions = self.diffusion.generate_actions(model_input_batch)
 
             # Unnormalize actions
-            actions = self.unnormalize_outputs({"action": actions})["action"]
+            actions = self.unnormalize_action_output(
+                {"action": actions})["action"]
 
             # Add generated actions to the queue
             self._queues["action"].extend(actions.squeeze(0))
@@ -176,84 +177,18 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         Run the batch through the model and compute the loss.
         Always returns a Tensor (possibly zero) so train.py never sees None.
         """
-        # handy device and dummy‐loss creator
-        device = next(self.parameters()).device
 
-        def _dummy():
-            return torch.tensor(0.0, device=device, requires_grad=True), None
-
-        # 1) normalize all inputs and build the model_batch
-        normalized = self.normalize_inputs(batch)
-        model_batch: dict[str, Tensor] = {}
-        for key in self.config.input_features:
-            if key not in normalized:
-                continue
-            x = normalized[key]
-            if key.startswith("observation."):
-                # ensure we only take the first n_obs_steps
-                if x.ndim > 1 and x.shape[1] < self.config.n_obs_steps:
-                    print(
-                        f"Warning: Input '{key}' has {x.shape[1]} time steps < {self.config.n_obs_steps}. Skipping batch."
-                    )
-                    return _dummy()
-                # slice time dimension if it’s longer than needed
-                model_batch[key] = x if x.ndim == 1 else x[:,
-                                                           : self.config.n_obs_steps]
-            else:
-                model_batch[key] = x
-
-        # 2) image‑stacking checks …
+        batch = self.normalize_inputs(batch)
         if self.config.image_features:
-            # Stack images if needed (using potentially normalized images)
-            image_keys_present = [
-                k for k in self.config.image_features if k in model_batch]
-            if image_keys_present:
-                # Stack only the observation steps
-                # Ensure the image tensor also has enough time steps
-                min_img_len = min(model_batch[key].shape[1]
-                                  for key in image_keys_present)
-                if min_img_len < self.config.n_obs_steps:
-                    print(
-                        f"Warning: Image data has insufficient time steps ({min_img_len} < {self.config.n_obs_steps}). Skipping batch.")
-                    return _dummy()
-                model_batch["observation.images"] = torch.stack(
-                    [model_batch[key][:, :self.config.n_obs_steps] for key in image_keys_present], dim=-4
-                )
+            # shallow copy so that adding a key doesn't modify the original
+            batch = dict(batch)
+            batch["observation.images"] = torch.stack(
+                [batch[key] for key in self.config.image_features], dim=-4
+            )
 
-        # 3) target checks …
-        target_key = self.config.diffusion_target_key
-        if target_key in batch:
-            required_len = self.config.n_obs_steps + self.config.horizon
-            if batch[target_key].ndim <= 1 or batch[target_key].shape[1] < required_len:
-                print(
-                    f"Warning: Target '{target_key}' has shape {batch[target_key].shape}, need at least length {required_len}. Skipping batch.")
-                return _dummy()  # Skip batch
-
-            if self.config.predict_state:
-                # Target is future states: slice the original observation.state tensor
-                target_data_slice = batch[target_key][:,
-                                                      self.config.n_obs_steps: required_len]
-            else:
-                # Target is action
-                # Check if action length matches horizon if predicting actions
-                if batch[target_key].shape[1] < self.config.horizon:
-                    print(
-                        f"Warning: Action data length ({batch[target_key].shape[1]}) is less than horizon ({self.config.horizon}). Skipping batch.")
-                    return _dummy()  # Skip if action length is insufficient
-                # Assuming action target matches horizon length
-                target_data_slice = batch[target_key][:, :self.config.horizon]
-
-            # Normalize the target slice
-            target_data_to_norm = {target_key: target_data_slice}
-            normalized_target = self.normalize_targets(target_data_to_norm)
-            model_batch[f"normalized_{target_key}"] = normalized_target[target_key]
-        else:
-            print(
-                f"Warning: Target key '{target_key}' not found in batch. Skipping batch.")
-            return _dummy()  # Skip if target key is missing
-
-        # 4) compute real loss
-        loss = self.diffusion.compute_loss(model_batch)
+        batch = self.normalize_diffusion_target(batch)
+        loss = self.diffusion.compute_loss(batch)
+        # no output_dict so returning None
         return loss, None
 
 
@@ -518,7 +453,6 @@ class MyDiffusionModel(nn.Module):
         n_obs_steps = batch["observation.state"].shape[1]
         horizon = batch["action"].shape[1]
         assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
 
         # Prepare global conditioning using ONLY observation steps
         global_cond = self._prepare_global_conditioning(batch)

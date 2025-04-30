@@ -91,7 +91,7 @@ def main():
     delta_timestamps = {
         # Input observations (past/present)
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
+        "observation.state": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
         "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices]
     }
     # If not predicting state, the action key might need different indices if they differ from target_delta_indices
