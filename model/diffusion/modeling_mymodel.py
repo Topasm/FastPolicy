@@ -197,7 +197,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         if target_key in batch:
             required_len = self.config.n_obs_steps + self.config.horizon
             if batch[target_key].ndim <= 1 or batch[target_key].shape[1] < required_len:
-                # If data is too short for the full target horizon, skip this batch
+                print(
+                    f"Warning: Target '{target_key}' has shape {batch[target_key].shape}, need at least length {required_len}. Skipping batch.")
                 return _dummy()  # Skip batch
 
             if self.config.predict_state:

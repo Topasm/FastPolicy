@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class Mlp(nn.Module):
-    """Simple MLP backbone for inverse dynamics"""
+    """Simple MLP backbone."""
 
     def __init__(self, in_dim, hidden_dims, out_dim, hidden_act, out_act):
         super().__init__()
@@ -21,31 +22,14 @@ class Mlp(nn.Module):
         return self.net(x)
 
 
-class MlpInvDynamic:
-    """ Simple MLP-based inverse dynamics model. The model is a 3-layer MLP with ReLU activation.
+class MlpInvDynamic(nn.Module):
+    """ Simple MLP-based inverse dynamics model. Predicts action from state pair.
 
     Args:
-        o_dim: int,
-            Dimension of observation space.
-        a_dim: int,
-            Dimension of action space.
-        hidden_dim: int,
-            Dimension of hidden layers. Default: 512.
-        out_activation: nn.Module,
-            Activation function for output layer. Default: nn.Tanh().
-        optim_params: dict,
-            Optimizer parameters. Default: {}.
-        device: str,
-            Device for the model. Default: "cpu".
-
-    Examples:
-        >>> invdyn = MlpInvDynamic(3, 2)
-        >>> invdyn.train()
-        >>> batch = ...
-        >>> obs, act, obs_next = batch
-        >>> loss = invdyn.update(obs, act, obs_next)
-        >>> invdyn.eval()
-        >>> pred_act = invdyn.predict(obs, obs_next)
+        o_dim: int, Dimension of observation/state space.
+        a_dim: int, Dimension of action space.
+        hidden_dim: int, Dimension of hidden layers. Default: 512.
+        out_activation: nn.Module, Activation function for output layer. Default: nn.Tanh().
     """
 
     def __init__(
@@ -54,53 +38,37 @@ class MlpInvDynamic:
             a_dim: int,
             hidden_dim: int = 512,
             out_activation: nn.Module = nn.Tanh(),
-            optim_params: dict = {},
-            device: str = "cpu",
     ):
-        self.device = device
+        super().__init__()
         self.o_dim, self.a_dim, self.hidden_dim = o_dim, a_dim, hidden_dim
         self.out_activation = out_activation
-        self.optim_params = optim_params
-        params = {"lr": 5e-4}
-        params.update(optim_params)
+
         self.mlp = Mlp(
             2 * o_dim, [hidden_dim, hidden_dim], a_dim,
-            nn.ReLU(), out_activation).to(device)
-        self.optim = torch.optim.Adam(self.mlp.parameters(), **optim_params)
+            nn.ReLU(), out_activation)
         self._init_weights()
 
     def _init_weights(self):
         for m in self.mlp.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def forward(self, o, o_next):
-        return self.mlp(torch.cat([o, o_next], dim=-1))
+    def forward(self, o: torch.Tensor, o_next: torch.Tensor) -> torch.Tensor:
+        """Predicts action given current and next state.
 
-    def update(self, o, a, o_next):
-        self.optim.zero_grad()
-        a_pred = self.forward(o, o_next)
-        loss = ((a_pred - a) ** 2).mean()
-        loss.backward()
-        self.optim.step()
-        return {"loss": loss.item()}
+        Args:
+            o: Tensor (B, ..., o_dim), current state(s).
+            o_next: Tensor (B, ..., o_dim), next state(s).
+
+        Returns:
+            Tensor (B, ..., a_dim), predicted action(s).
+        """
+        o = o.float()
+        o_next = o_next.float()
+        input_features = torch.cat([o, o_next], dim=-1)
+        return self.mlp(input_features)
 
     @torch.no_grad()
-    def predict(self, o, o_next):
+    def predict(self, o: torch.Tensor, o_next: torch.Tensor) -> torch.Tensor:
+        """Alias for forward, used for clarity during inference."""
         return self.forward(o, o_next)
-
-    def __call__(self, o, o_next):
-        return self.predict(o, o_next)
-
-    def train(self):
-        self.mlp.train()
-
-    def eval(self):
-        self.mlp.eval()
-
-    def save(self, path):
-        torch.save(self.mlp.state_dict(), path)
-
-    def load(self, path):
-        self.mlp.load_state_dict(torch.load(path, self.device))

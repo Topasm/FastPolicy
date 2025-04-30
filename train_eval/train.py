@@ -24,11 +24,9 @@ import torch
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
-# from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
 from model.diffusion.modeling_mymodel import MYDiffusionPolicy
 from model.diffusion.configuration_mymodel import DiffusionConfig
-# from model.diffusion.modeling_mymodel import DiffusionConfig as MyDiffusionConfig
-# from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+
 from lerobot.configs.types import FeatureType
 
 
@@ -80,8 +78,6 @@ def main():
         input_features=input_features,
         output_features=output_features,
         predict_state=predict_state_flag,  # Use the flag here
-        # Ensure inv_dyn_model_path is set if needed for inference later
-        # inv_dyn_model_path="path/to/your/inv_dyn_model.pt",
     )
 
     # We can now instantiate our policy with this config and the dataset stats.
@@ -96,10 +92,7 @@ def main():
         # Input observations (past/present)
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
         "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        # Target (future states or actions)
-        # Use the diffusion_target_key (which will be 'observation.state' if predict_state=True)
-        # and target_delta_indices for future timestamps
-        cfg.diffusion_target_key: [i / dataset_metadata.fps for i in cfg.target_delta_indices],
+        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices]
     }
     # If not predicting state, the action key might need different indices if they differ from target_delta_indices
     if not predict_state_flag:
@@ -107,17 +100,6 @@ def main():
         # If action_delta_indices is the same as target_delta_indices, this line is redundant but harmless
         delta_timestamps["action"] = [
             i / dataset_metadata.fps for i in cfg.action_delta_indices]
-
-    # Example delta_timestamps for state prediction (adjust based on your config):
-    # Assuming n_obs_steps=2, horizon=6 (matching your example comment)
-    # observation_delta_indices = [-1, 0]
-    # target_delta_indices = [1, 2, 3, 4, 5, 6]
-    # diffusion_target_key = "observation.state"
-    # delta_timestamps = {
-    #     "observation.image": [-0.1, 0.0],
-    #     "observation.state": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6], # Includes past and future
-    # }
-    # Note: LeRobotDataset handles loading the correct slices based on these timestamps.
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
     dataset = LeRobotDataset(
