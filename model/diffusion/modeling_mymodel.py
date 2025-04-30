@@ -24,6 +24,7 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     populate_queues,
 )
+from model.critic.critic_model import CriticScorer  # Import CriticScorer
 
 
 class MYDiffusionPolicy(PreTrainedPolicy):
@@ -257,14 +258,27 @@ class MyDiffusionModel(nn.Module):
 
     @torch.no_grad()
     def conditional_sample(
-        self, batch_size: int, global_cond: Tensor, generator: torch.Generator | None = None
+        self,
+        batch_size: int,
+        global_cond: Tensor,
+        num_samples: int = 1,  # Add num_samples parameter
+        generator: torch.Generator | None = None,
     ) -> Tensor:
-        """Samples actions using the DDPM/DDIM reverse process."""
+        """Samples actions using the DDPM/DDIM reverse process.
+           Generates `num_samples` candidates per batch item.
+        """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
+        # Expand global condition to match num_samples
+        # (B, D_cond) -> (B * num_samples, D_cond)
+        expanded_global_cond = global_cond.repeat_interleave(
+            num_samples, dim=0)
+        effective_batch_size = batch_size * num_samples
+
+        # Sample initial noise for all samples
         noisy_actions = torch.randn(
-            size=(batch_size, self.config.horizon,
+            size=(effective_batch_size, self.config.horizon,
                   self.config.action_feature.shape[0]),
             dtype=dtype,
             device=device,
@@ -274,37 +288,78 @@ class MyDiffusionModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
+            # Prepare timestep tensor for the expanded batch
             timesteps_batch = torch.full(
-                (batch_size,), t, dtype=torch.long, device=device)
+                (effective_batch_size,), t, dtype=torch.long, device=device)
 
+            # Predict model output for the expanded batch
             model_output = self.transformer(
                 noisy_actions,
                 timesteps_batch,
-                global_cond=global_cond,
+                global_cond=expanded_global_cond,  # Use expanded condition
             )
 
+            # Scheduler step
             scheduler_output = self.noise_scheduler.step(
                 model_output, t, noisy_actions, generator=generator
             )
             noisy_actions = scheduler_output.prev_sample
 
-        return noisy_actions
+        # Reshape the output to group samples per batch item
+        # (B * num_samples, horizon, action_dim) -> (B, num_samples, horizon, action_dim)
+        actions = noisy_actions.view(
+            batch_size, num_samples, self.config.horizon, self.config.action_feature.shape[0]
+        )
+
+        return actions  # Return samples grouped by batch item
 
     @torch.no_grad()
-    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+    def generate_actions(
+        self,
+        batch: dict[str, Tensor],
+        num_samples: int = 1,  # Add num_samples
+        critic_scorer: Optional[CriticScorer] = None  # Add critic scorer
+    ) -> Tensor:
         """
         Generates a sequence of actions based on the input observations.
+        Optionally generates multiple samples and selects the best using a critic.
         """
         batch_size = batch["observation.state"].shape[0]
         n_obs_steps = batch["observation.state"].shape[1]
-        assert n_obs_steps == self.config.n_obs_steps
+        assert n_obs_steps == self.config.n_obs_steps, \
+            f"Expected {self.config.n_obs_steps} obs steps, got {n_obs_steps}"
 
-        global_cond = self._prepare_global_conditioning(batch)
+        global_cond = self._prepare_global_conditioning(
+            batch)  # (B, global_cond_dim)
 
-        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+        # Generate multiple action samples: (B, num_samples, horizon, action_dim)
+        action_samples = self.conditional_sample(
+            batch_size, global_cond=global_cond, num_samples=num_samples
+        )
 
+        # Select best action using critic if provided and num_samples > 1
+        if num_samples > 1 and critic_scorer is not None:
+            best_actions = []
+            for i in range(batch_size):
+                # Get samples for the current batch item: (num_samples, horizon, action_dim)
+                current_samples = action_samples[i]
+                # Score the samples using the critic
+                # Assuming critic scores action sequences directly
+                scores = critic_scorer.score(current_samples)  # (num_samples,)
+                # Find the index of the best score
+                best_idx = torch.argmax(scores)
+                # Select the best action sequence
+                best_actions.append(current_samples[best_idx])
+            # Stack best actions for the batch: (B, horizon, action_dim)
+            actions = torch.stack(best_actions, dim=0)
+        else:
+            # If only one sample or no critic, just take the first (or only) sample
+            actions = action_samples[:, 0]  # (B, horizon, action_dim)
+
+        # Extract the required `n_action_steps` for execution
         start = self.config.n_obs_steps - 1
         end = start + self.config.n_action_steps
+        # (B, n_action_steps, action_dim)
         actions_to_execute = actions[:, start:end]
 
         return actions_to_execute
