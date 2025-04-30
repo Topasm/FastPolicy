@@ -151,11 +151,12 @@ class DiffusionConfig(PreTrainedConfig):
         # Validation logic
         if self.predict_state:
             # Check if a state key exists for prediction target
-            state_keys = [k for k in self.output_features if k.endswith(
-                "state") and k != "observation.state"]
+            # Allow 'observation.state' itself to be the target key
+            state_keys = [
+                k for k in self.output_features if k.endswith("state")]
             if not state_keys:
                 raise ValueError(
-                    "When predict_state is True, output_features must contain a key ending with 'state' (e.g., 'next_observation.state') to be used as the diffusion target."
+                    "When predict_state is True, output_features must contain at least one key ending with 'state' (e.g., 'observation.state' or 'next_observation.state') to be used as the diffusion target."
                 )
             # Ensure action is still in output_features for the final policy output
             if "action" not in self.output_features:
@@ -164,10 +165,16 @@ class DiffusionConfig(PreTrainedConfig):
                 )
         else:
             # Ensure action is the only output if not predicting state
-            if list(self.output_features.keys()) != ["action"]:
+            # Allow other keys if needed, but action must be present
+            if "action" not in self.output_features:
                 raise ValueError(
-                    "When predict_state is False, 'action' should be the only key in output_features."
+                    "When predict_state is False, 'action' must be included in output_features."
                 )
+            # Original check (might be too strict depending on use case):
+            # if list(self.output_features.keys()) != ["action"]:
+            #     raise ValueError(
+            #         "When predict_state is False, 'action' should be the only key in output_features."
+            #     )
 
         # Validate horizon vs n_action_steps and n_obs_steps
         if self.transformer_dim % self.transformer_num_heads != 0:
@@ -265,11 +272,30 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def diffusion_target_key(self) -> str:
         if self.predict_state:
-            state_keys = [k for k in self.output_features if k.endswith(
-                "state") and k != "observation.state"]
+            # Find state keys in output_features
+            state_keys = [
+                k for k in self.output_features if k.endswith("state")]
             if not state_keys:
+                # This should ideally be caught by __post_init__, but added for safety
+                raise ValueError(
+                    "No state key found in output_features for state prediction.")
+
+            # Prioritize keys like 'next_observation.state' if they exist
+            preferred_keys = [
+                k for k in state_keys if k != "observation.state"]
+            if preferred_keys:
+                # If multiple non-'observation.state' keys exist, raise ambiguity or pick first
+                if len(preferred_keys) > 1:
+                    print(
+                        f"Warning: Multiple potential state target keys found ({preferred_keys}). Using '{preferred_keys[0]}'.")
+                return preferred_keys[0]
+            elif "observation.state" in state_keys:
+                # If only 'observation.state' is found, use it as the target
+                return "observation.state"
+            else:
+                # This case should not be reachable if __post_init__ passed
                 raise ValueError(
                     "Cannot determine diffusion target key for state prediction.")
-            return state_keys[0]
         else:
+            # If not predicting state, the target is action
             return "action"

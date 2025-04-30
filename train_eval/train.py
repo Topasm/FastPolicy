@@ -51,17 +51,35 @@ def main():
     #   - dataset stats: for normalization and denormalization of input/outputs
     dataset_metadata = LeRobotDatasetMetadata("lerobot/pusht")
     features = dataset_to_policy_features(dataset_metadata.features)
-    output_features = {key: ft for key,
-                       ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key,
-                      ft in features.items() if key not in output_features}
+
+    # Determine input and output features based on prediction mode
+    predict_state_flag = True  # Set this based on your desired mode
+
+    if predict_state_flag:
+        # Diffusion model predicts future observation.state, policy outputs action
+        target_state_key = "observation.state"  # Use observation.state as the target
+
+        output_features = {
+            # Target for diffusion
+            target_state_key: features[target_state_key],
+            "action": features["action"]  # Final output of the policy
+        }
+        # Input features will include observation.state (for past steps) and potentially images/env_state
+        input_features = {key: ft for key,
+                          ft in features.items() if key != "action"}
+    else:
+        # Diffusion model predicts action, policy outputs action
+        output_features = {
+            key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+        input_features = {key: ft for key,
+                          ft in features.items() if key not in output_features}
 
     # Policies are initialized with a configuration class, in this case `DiffusionConfig`. For this example,
     # we'll just use the defaults and so no arguments other than input/output features need to be passed.
     cfg = DiffusionConfig(
         input_features=input_features,
         output_features=output_features,
-        predict_state=True,  # Set to predict states
+        predict_state=predict_state_flag,  # Use the flag here
         # Ensure inv_dyn_model_path is set if needed for inference later
         # inv_dyn_model_path="path/to/your/inv_dyn_model.pt",
     )
@@ -75,23 +93,31 @@ def main():
     # which can differ for inputs, outputs and rewards (if there are some).
     # Use the config properties to define the required timestamps
     delta_timestamps = {
+        # Input observations (past/present)
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
         "observation.state": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
-        # Use the target_delta_indices for the state prediction target
+        # Target (future states or actions)
+        # Use the diffusion_target_key (which will be 'observation.state' if predict_state=True)
+        # and target_delta_indices for future timestamps
         cfg.diffusion_target_key: [i / dataset_metadata.fps for i in cfg.target_delta_indices],
-        # Include action timestamps if needed by the inverse dynamics model during training or for other purposes
-        # "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices], # Assuming action_delta_indices exists or is defined
     }
+    # If not predicting state, the action key might need different indices if they differ from target_delta_indices
+    if not predict_state_flag:
+        # Assuming action uses action_delta_indices if different from target_delta_indices
+        # If action_delta_indices is the same as target_delta_indices, this line is redundant but harmless
+        delta_timestamps["action"] = [
+            i / dataset_metadata.fps for i in cfg.action_delta_indices]
 
     # Example delta_timestamps for state prediction (adjust based on your config):
     # Assuming n_obs_steps=2, horizon=6 (matching your example comment)
     # observation_delta_indices = [-1, 0]
     # target_delta_indices = [1, 2, 3, 4, 5, 6]
+    # diffusion_target_key = "observation.state"
     # delta_timestamps = {
     #     "observation.image": [-0.1, 0.0],
-    #     "observation.state": [-0.1, 0.0],
-    #     "next_observation.state": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], # Target future states
+    #     "observation.state": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6], # Includes past and future
     # }
+    # Note: LeRobotDataset handles loading the correct slices based on these timestamps.
 
     # We can then instantiate the dataset with these delta_timestamps configuration.
     dataset = LeRobotDataset(

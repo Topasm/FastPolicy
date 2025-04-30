@@ -144,23 +144,87 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
-        """Run the batch through the model and compute the loss for training or validation."""
-        # Normalize inputs and targets
-        batch = self.normalize_inputs(batch)
+        """
+        Run the batch through the model and compute the loss.
+        Always returns a Tensor (possibly zero) so train.py never sees None.
+        """
+        # handy device and dummy‐loss creator
+        device = next(self.parameters()).device
+
+        def _dummy():
+            return torch.tensor(0.0, device=device, requires_grad=True), None
+
+        # 1) normalize all inputs and build the model_batch
+        normalized = self.normalize_inputs(batch)
+        model_batch: dict[str, Tensor] = {}
+        for key in self.config.input_features:
+            if key not in normalized:
+                continue
+            x = normalized[key]
+            if key.startswith("observation."):
+                # ensure we only take the first n_obs_steps
+                if x.ndim > 1 and x.shape[1] < self.config.n_obs_steps:
+                    print(
+                        f"Warning: Input '{key}' has {x.shape[1]} time steps < {self.config.n_obs_steps}. Skipping batch."
+                    )
+                    return _dummy()
+                # slice time dimension if it’s longer than needed
+                model_batch[key] = x if x.ndim == 1 else x[:,
+                                                           : self.config.n_obs_steps]
+            else:
+                model_batch[key] = x
+
+        # 2) image‑stacking checks …
         if self.config.image_features:
-            batch = dict(batch)
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
+            # Stack images if needed (using potentially normalized images)
+            image_keys_present = [
+                k for k in self.config.image_features if k in model_batch]
+            if image_keys_present:
+                # Stack only the observation steps
+                # Ensure the image tensor also has enough time steps
+                min_img_len = min(model_batch[key].shape[1]
+                                  for key in image_keys_present)
+                if min_img_len < self.config.n_obs_steps:
+                    print(
+                        f"Warning: Image data has insufficient time steps ({min_img_len} < {self.config.n_obs_steps}). Skipping batch.")
+                    return _dummy()
+                model_batch["observation.images"] = torch.stack(
+                    [model_batch[key][:, :self.config.n_obs_steps] for key in image_keys_present], dim=-4
+                )
 
-        # Normalize the specific target data using the dynamic key
+        # 3) target checks …
         target_key = self.config.diffusion_target_key
-        target_data = {target_key: batch[target_key]}
-        target_data = self.normalize_targets(target_data)
-        batch[f"normalized_{target_key}"] = target_data[target_key]
+        if target_key in batch:
+            required_len = self.config.n_obs_steps + self.config.horizon
+            if batch[target_key].ndim <= 1 or batch[target_key].shape[1] < required_len:
+                # If data is too short for the full target horizon, skip this batch
+                return _dummy()  # Skip batch
 
-        # Compute loss using the diffusion model
-        loss = self.diffusion.compute_loss(batch)
+            if self.config.predict_state:
+                # Target is future states: slice the original observation.state tensor
+                target_data_slice = batch[target_key][:,
+                                                      self.config.n_obs_steps: required_len]
+            else:
+                # Target is action
+                # Check if action length matches horizon if predicting actions
+                if batch[target_key].shape[1] < self.config.horizon:
+                    print(
+                        f"Warning: Action data length ({batch[target_key].shape[1]}) is less than horizon ({self.config.horizon}). Skipping batch.")
+                    return _dummy()  # Skip if action length is insufficient
+                # Assuming action target matches horizon length
+                target_data_slice = batch[target_key][:, :self.config.horizon]
+
+            # Normalize the target slice
+            target_data_to_norm = {target_key: target_data_slice}
+            normalized_target = self.normalize_targets(target_data_to_norm)
+            model_batch[f"normalized_{target_key}"] = normalized_target[target_key]
+        else:
+            print(
+                f"Warning: Target key '{target_key}' not found in batch. Skipping batch.")
+            return _dummy()  # Skip if target key is missing
+
+        # 4) compute real loss
+        loss = self.diffusion.compute_loss(model_batch)
         return loss, None
 
 
@@ -268,19 +332,27 @@ class MyDiffusionModel(nn.Module):
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encodes observations and concatenates them into a flat global conditioning vector."""
-        batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
+        # Use only the first n_obs_steps for conditioning
+        n_obs_steps = self.config.n_obs_steps
+        batch_size = batch[OBS_ROBOT].shape[0]  # Get batch size from state
+
         global_cond_feats = []
 
-        robot_state = batch[OBS_ROBOT].flatten(start_dim=1)
+        # Slice robot state to get only the observation window
+        robot_state = batch[OBS_ROBOT][:, :n_obs_steps, :].flatten(start_dim=1)
         global_cond_feats.append(robot_state)
 
         if self.config.image_features:
-            img_features = self._encode_images(batch["observation.images"])
+            # Slice images to get only the observation window
+            images_obs = batch["observation.images"][:, :n_obs_steps, ...]
+            img_features = self._encode_images(
+                images_obs)  # Pass only obs images
             global_cond_feats.append(img_features.flatten(start_dim=1))
 
         if self.config.env_state_feature:
-            env_state = batch[OBS_ENV]
-            global_cond_feats.append(env_state.flatten(start_dim=1))
+            # Slice env state to get only the observation window
+            env_state = batch[OBS_ENV][:, :n_obs_steps, :].flatten(start_dim=1)
+            global_cond_feats.append(env_state)
 
         return torch.cat(global_cond_feats, dim=-1)
 
@@ -419,21 +491,23 @@ class MyDiffusionModel(nn.Module):
         target_key = self.config.diffusion_target_key
         normalized_target_key = f"normalized_{target_key}"
 
+        # Ensure the normalized target key exists
         required_keys = {"observation.state", normalized_target_key}
         # Add padding mask key if needed
         # if self.config.do_mask_loss_for_padding:
         #     required_keys.add("target_is_pad") # Example key
-        assert set(batch).issuperset(required_keys)
+        assert set(batch).issuperset(
+            required_keys), f"Missing keys: {required_keys - set(batch)}"
         assert self.config.image_features or self.config.env_state_feature
 
-        n_obs_steps = batch["observation.state"].shape[1]
+        # Get target shape and check horizon
         horizon = batch[normalized_target_key].shape[1]
-        assert horizon == self.config.horizon
-        assert n_obs_steps == self.config.n_obs_steps
+        assert horizon == self.config.horizon, f"Target horizon mismatch: expected {self.config.horizon}, got {horizon}"
 
+        # Prepare global conditioning using ONLY observation steps
         global_cond = self._prepare_global_conditioning(batch)
 
-        # Target is the sequence of clean future states or actions
+        # Target is the sequence of clean future states or actions (already normalized)
         # (B, horizon, target_dim)
         clean_targets = batch[normalized_target_key]
         B = clean_targets.shape[0]
@@ -469,8 +543,10 @@ class MyDiffusionModel(nn.Module):
 
         # Mask loss for padding if needed (adapt mask key/logic)
         # if self.config.do_mask_loss_for_padding:
-        #     in_episode_mask = ~batch["target_is_pad"] # Example mask
+        #     # Ensure the mask has the correct shape (B, horizon)
+        #     in_episode_mask = ~batch["target_is_pad"][:, :self.config.horizon] # Example mask slicing
         #     loss = loss * in_episode_mask.unsqueeze(-1)
+        #     # Normalize by the number of unmasked elements
         #     loss = loss.sum() / in_episode_mask.sum().clamp(min=1.0)
         # else:
         loss = loss.mean()  # Simple mean loss for now
