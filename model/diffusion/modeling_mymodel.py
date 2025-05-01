@@ -27,7 +27,7 @@ from lerobot.common.policies.utils import (
 )
 from model.critic.critic_model import CriticScorer  # Import CriticScorer
 # Import your inverse dynamics model
-from model.invdynamics.invdyn import MlpInvDynamic
+from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic, TemporalUNetInvDynamic
 
 
 class MYDiffusionPolicy(PreTrainedPolicy):
@@ -85,13 +85,28 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
+        # self.inv_dyn_model = SeqInvDynamic(
+        #     state_dim=self.state_dim*config.horizon,
+        #     action_dim=self.action_dim*config.horizon,
+        #     hidden_dim=self.config.inv_dyn_hidden_dim,  # e.g. 128
+        #     n_layers=1,
+        #     dropout=0.1,
+        # )
+        # switch to MLP inverse dynamics for testing:
 
-        self.inv_dyn_model = MlpInvDynamic(
-            o_dim=self.state_dim*config.horizon,
-            a_dim=self.action_dim*config.horizon,
-            hidden_dim=config.inv_dyn_hidden_dim,  # Use config value
-            # Assuming Tanh activation for actions based on MlpInvDynamic default
-            out_activation=nn.Tanh()
+        # switch to MLP inverse dynamics for testing:
+        # self.inv_dyn_model = MlpInvDynamic(
+        #     o_dim=self.state_dim * config.horizon,
+        #     a_dim=self.action_dim * config.horizon,
+        #     hidden_dim=self.config.inv_dyn_hidden_dim,
+        #     dropout=0.1,
+        #     use_layernorm=True,
+        #     out_activation=nn.Tanh(),
+        # )
+        self.inv_dyn_model = TemporalUNetInvDynamic(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            hidden_dim=self.config.inv_dyn_hidden_dim,
         )
         self.critic_scorer = CriticScorer(
             state_dim=self.state_dim,
@@ -104,7 +119,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
     def get_optim_params(self) -> list:
         # Return parameters of both models for joint optimization
-        return list(self.diffusion_model.parameters()) + list(self.inv_dyn_model.parameters())
+        # Ensure parameters from all relevant submodules are included
+        return list(self.diffusion.parameters()) + list(self.inv_dyn_model.parameters()) + list(self.critic_scorer.parameters())
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -149,7 +165,9 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
             # Generate action sequence using the diffusion model
 
-            current_state = model_input_batch["observation.state"][:, -1, :]
+            # Get the very last state
+            current_state = model_input_batch["observation.state"][:,
+                                                                   self.config.n_obs_steps-1, :]
             num_samples = getattr(self.config, "num_inference_samples", 1)
 
             actions = self.diffusion.generate_actions_via_inverse_dynamics(
@@ -158,7 +176,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
                 self.inv_dyn_model,
                 self.normalize_invdyn_state,
                 num_samples=num_samples,
-                critic_scorer=self.critic_scorer
             )
 
             # Unnormalize actions
@@ -166,7 +183,15 @@ class MYDiffusionPolicy(PreTrainedPolicy):
                 {"action": actions})["action"]
 
             # Add generated actions to the queue
-            self._queues["action"].extend(actions.squeeze(0))
+            # Need to handle batch dimension if present
+            if actions.dim() == 3:  # (B, n_action_steps, action_dim)
+                # Assuming B=1 during inference
+                actions_list = [a for a in actions.squeeze(0)]
+            elif actions.dim() == 2:  # (n_action_steps, action_dim)
+                actions_list = [a for a in actions]
+            else:
+                raise ValueError(f"Unexpected actions shape: {actions.shape}")
+            self._queues["action"].extend(actions_list)
 
         # Pop the next action from the queue
         action = self._queues["action"].popleft()
@@ -369,10 +394,9 @@ class MyDiffusionModel(nn.Module):
         self,
         batch: dict[str, Tensor],
         current_state: Tensor,
-        inv_dyn_model: MlpInvDynamic,
+        inv_dyn_model: TemporalUNetInvDynamic,
         normalize_invdyn_state: Callable[[dict[str, Tensor]], dict[str, Tensor]],
         num_samples: int = 1,
-        critic_scorer: Optional[CriticScorer] = None
     ) -> Tensor:
         batch_size = current_state.shape[0]
         n_obs_steps = self.config.n_obs_steps
@@ -382,46 +406,43 @@ class MyDiffusionModel(nn.Module):
 
         global_cond = self._prepare_global_conditioning(batch)
 
+        # Repeat global_cond if num_samples > 1
+        if num_samples > 1:
+            global_cond = global_cond.repeat_interleave(num_samples, dim=0)
+
         predicted_states_flat = self.conditional_sample(
-            batch_size * num_samples, global_cond=global_cond.repeat_interleave(num_samples, dim=0)
+            batch_size * num_samples, global_cond=global_cond
         )
 
         predicted_states = einops.rearrange(
             predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
         )
 
-        if num_samples > 1 and critic_scorer is not None:
-            best_states = []
-            for i in range(batch_size):
-                scores = critic_scorer.score(
-                    predicted_states[i])
-                best_idx = torch.argmax(scores).item()
-                best_states.append(predicted_states[i, best_idx])
-            selected_states = torch.stack(best_states, dim=0)
-        else:
-            selected_states = predicted_states[:, 0]
+        # Always select the first sample if multiple are generated
+        selected_states = predicted_states[:, 0]  # (B, H, D_state)
 
-        s_t0 = current_state.unsqueeze(1)
+        # Prepare state pairs for inverse dynamics model
+        # s_t_pairs = (s_current, s_pred_1, s_pred_2, ..., s_pred_{H-1})
+        s_t0 = current_state.unsqueeze(1)  # (B, 1, D_state)
+        # Concatenate current state with the first H-1 predicted states
         s_t_pairs = torch.cat(
             [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state)
 
         # --- normalize for inv‐dyn model! ---
         s_t_norm = normalize_invdyn_state(
             {"observation.state": s_t_pairs}
-        )["observation.state"]
+        )["observation.state"]  # (B, H, D_state)
 
-        B, H, D_state = s_t_norm.shape
-        s_t_flat = s_t_norm.reshape(B, H * D_state)  # (B, H*D_state)
+        # Predict actions for the sequence of state pairs
+        pred_actions = inv_dyn_model.predict(s_t_norm)  # (B, H, action_dim)
 
-        actions_flat = inv_dyn_model.predict(s_t_flat)  # (B, H * action_dim)
-        final_actions_horizon = actions_flat.view(B, H, -1)
-
-        actions_to_execute = final_actions_horizon[:,
-                                                   : self.config.n_action_steps]
+        # Select the first n_action_steps for execution
+        actions_to_execute = pred_actions[:,
+                                          : self.config.n_action_steps]  # (B, n_action_steps, action_dim)
 
         return actions_to_execute
 
-    def compute_loss(self, batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
         """
         Computes the diffusion loss and the inverse dynamics loss.
         """
@@ -431,12 +452,7 @@ class MyDiffusionModel(nn.Module):
 
         # The state sequence must contain n_obs_steps for conditioning
         # PLUS horizon steps for the target prediction.
-        expected_min_len = n_obs_steps + horizon
-        if state_seq_len < expected_min_len:
-            raise ValueError(
-                f"observation.state sequence length ({state_seq_len}) is too short. "
-                f"Need at least {expected_min_len} steps ({n_obs_steps} obs steps + {horizon} prediction horizon)."
-            )
+
         if self.config.image_features:
             assert batch["observation.images"].shape[1] == n_obs_steps, \
                 f"Image sequence length ({batch['observation.images'].shape[1]}) must match n_obs_steps ({n_obs_steps})"
@@ -463,14 +479,7 @@ class MyDiffusionModel(nn.Module):
         # Extract target states: sequence of length `horizon` starting after `n_obs_steps`
         # Shape: (B, horizon, state_dim)
         clean_targets = batch["observation.state"][:,
-                                                   n_obs_steps:n_obs_steps + horizon, :]
-
-        # Ensure clean_targets has the expected horizon length after slicing
-        if clean_targets.shape[1] != horizon:
-            raise ValueError(
-                f"Sliced clean_targets sequence length ({clean_targets.shape[1]}) does not match horizon ({horizon}). "
-                f"Check original state_seq_len ({state_seq_len}) and slicing logic."
-            )
+                                                   0:horizon, :]
 
         B = clean_targets.shape[0]
         device = clean_targets.device
@@ -508,18 +517,11 @@ class MyDiffusionModel(nn.Module):
 
         # --- Inverse dynamics loss over the full horizon ---
         s_t = batch["observation.state"][
-            :, n_obs_steps: n_obs_steps + horizon, :
+            :, :horizon, :
         ]                              # (B, H, D_state)
         B, H, D_state = s_t.shape
 
-        # flatten to (B*H, D_state)
-        s_t_flat = s_t.reshape(B, H*D_state)
-
-        # predict one action per time‐step
-        pred_flat = inv_dyn_model.predict(s_t_flat)  # (B*H, action_dim)
-
-        # reshape back to (B, H, action_dim)
-        pred_actions = pred_flat.view(B, H, self.action_dim)
+        pred_actions = inv_dyn_model.predict(s_t)  # (B, H, action_dim)
 
         # ground‐truth actions for all H steps
         true_actions = batch["action"][:, :, :]  # (B, H, action_dim)

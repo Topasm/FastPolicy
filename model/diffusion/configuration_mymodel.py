@@ -90,7 +90,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 8
+    horizon: int = 16
     n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -267,7 +267,9 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def state_delta_indices(self) -> list:
 
-        return list(range(1 - self.n_obs_steps, self.n_obs_steps + self.horizon))
+        start_index = 0
+
+        return list(range(1 - self.n_obs_steps, start_index + self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:

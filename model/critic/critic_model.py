@@ -2,48 +2,41 @@ import torch
 import torch.nn as nn
 
 
-class CriticMLP(nn.Module):
-    """
-    Simple MLP to score flattened trajectories.
-    """
+class CriticScorer(nn.Module):  # <-- Make sure it inherits from nn.Module
+    def __init__(self, state_dim: int, horizon: int, hidden_dim: int = 256):
+        super().__init__()  # <-- Add super().__init__() call
+        self.horizon = horizon
+        self.state_dim = state_dim
 
-    def __init__(self, input_dim: int, hidden_dim: int = 128):
-        super().__init__()
+        # Example MLP structure - adjust as needed
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(state_dim * horizon, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)  # Output a single score
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class CriticScorer:
-    """
-    Loads a trained critic model and scores candidate trajectories.
-    """
-
-    def __init__(
-        self,
-        state_dim: int,
-        horizon: int,
-        hidden_dim: int = 128,
-        device: str = "cpu"
-    ):
-        self.device = device
-        input_dim = state_dim * horizon
-        self.model = CriticMLP(input_dim, hidden_dim).to(device)
-
-        self.model.eval()
-
-    def score(self, trajectories: torch.Tensor) -> torch.Tensor:
+    def score(self, state_sequence: torch.Tensor) -> torch.Tensor:
         """
-        trajectories: [N, horizon, state_dim]
-        returns: [N] critic scores
+        Scores a sequence of predicted states.
+
+        Args:
+            state_sequence: Tensor of shape (num_samples, horizon, state_dim)
+
+        Returns:
+            Tensor of shape (num_samples,) containing scores for each sequence.
         """
-        N = trajectories.shape[0]
-        flat = trajectories.view(N, -1).to(self.device)
-        with torch.no_grad():
-            vals = self.model(flat).squeeze(-1)
-        return vals
+        num_samples, horizon, state_dim = state_sequence.shape
+        assert horizon == self.horizon
+        assert state_dim == self.state_dim
+
+        # Flatten the sequence for the MLP
+        flat_sequence = state_sequence.view(num_samples, -1)
+        # Remove the last dimension
+        scores = self.net(flat_sequence).squeeze(-1)
+        return scores
+
+    # Add a forward method for consistency, although score is used directly
+    def forward(self, state_sequence: torch.Tensor) -> torch.Tensor:
+        return self.score(state_sequence)
