@@ -97,8 +97,10 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         )
 
         # Determine and store the device
-        self.device = get_device_from_parameters(
-            self.diffusion)
+        self.diffusion.to(config.device)
+        self.inv_dyn_model.to(config.device)
+        self.critic_scorer.to(config.device)
+        self.device = get_device_from_parameters(self.diffusion)
 
         self.reset()
 
@@ -124,6 +126,10 @@ class MYDiffusionPolicy(PreTrainedPolicy):
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
+        # Ensure input batch tensors are on the correct device
+        batch = {k: v.to(self.device) if isinstance(
+            v, torch.Tensor) else v for k, v in batch.items()}
+
         # Normalize inputs
         norm_batch = self.normalize_inputs(batch)
 
