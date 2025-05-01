@@ -26,7 +26,6 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from model.critic.critic_model import CriticScorer  # Import CriticScorer
-# Import your inverse dynamics model
 from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic, TemporalUNetInvDynamic
 
 
@@ -58,7 +57,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         # Normalizers/Unnormalizers
         self.normalize_inputs = Normalize(
             config.input_features, config.normalization_mapping, dataset_stats)
-        # Diffusion normalizes states
+        # Diffusion normalizes states (diffusion target)
         self.normalize_diffusion_target = Normalize(
             {config.diffusion_target_key:
                 config.output_features[config.diffusion_target_key]},
@@ -74,7 +73,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             config.normalization_mapping, dataset_stats
         )
         self.unnormalize_action_output = Unnormalize(
-            {"action": config.action_feature},
+            {"action": config.action_feature},  # Only unnormalize action
             config.normalization_mapping, dataset_stats
         )
 
@@ -85,24 +84,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
-        # self.inv_dyn_model = SeqInvDynamic(
-        #     state_dim=self.state_dim*config.horizon,
-        #     action_dim=self.action_dim*config.horizon,
-        #     hidden_dim=self.config.inv_dyn_hidden_dim,  # e.g. 128
-        #     n_layers=1,
-        #     dropout=0.1,
-        # )
-        # switch to MLP inverse dynamics for testing:
-
-        # switch to MLP inverse dynamics for testing:
-        # self.inv_dyn_model = MlpInvDynamic(
-        #     o_dim=self.state_dim * config.horizon,
-        #     a_dim=self.action_dim * config.horizon,
-        #     hidden_dim=self.config.inv_dyn_hidden_dim,
-        #     dropout=0.1,
-        #     use_layernorm=True,
-        #     out_activation=nn.Tanh(),
-        # )
         self.inv_dyn_model = TemporalUNetInvDynamic(
             state_dim=self.state_dim,
             action_dim=self.action_dim,
@@ -114,6 +95,10 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             horizon=config.horizon,
             hidden_dim=config.critic_hidden_dim
         )
+
+        # Determine and store the device
+        self.device = get_device_from_parameters(
+            self.diffusion)
 
         self.reset()
 
@@ -140,57 +125,59 @@ class MYDiffusionPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
         # Normalize inputs
-        batch = self.normalize_inputs(batch)
+        norm_batch = self.normalize_inputs(batch)
 
         # Stack multiple camera views if necessary
         if self.config.image_features:
             # Create a temporary dict to avoid modifying the original input batch
-            processed_batch = dict(batch)
+            processed_batch = dict(norm_batch)
             processed_batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
+                [norm_batch[key] for key in self.config.image_features], dim=-4
             )
         else:
-            processed_batch = batch
+            processed_batch = norm_batch  # Use the normalized batch
 
-        # Populate queues with the latest observation
+        # Populate queues with the latest *normalized* observation
         self._queues = populate_queues(self._queues, processed_batch)
 
         # Generate new action plan only when the action queue is empty
         if len(self._queues["action"]) == 0:
-            # Prepare batch for the model by stacking history from queues
+            # Prepare batch for the model by stacking history from queues (already normalized)
             model_input_batch = {}
             for key, queue in self._queues.items():
                 if key.startswith("observation"):
-                    model_input_batch[key] = torch.stack(list(queue), dim=1)
+                    # Ensure tensors are on the correct device before stacking if needed
+                    queue_list = [item.to(self.device) if isinstance(
+                        item, torch.Tensor) else item for item in queue]
+                    model_input_batch[key] = torch.stack(queue_list, dim=1)
 
-            # Generate action sequence using the diffusion model
-
-            # Get the very last state
+            # Get the very last state (already normalized)
             current_state = model_input_batch["observation.state"][:,
                                                                    self.config.n_obs_steps-1, :]
             num_samples = getattr(self.config, "num_inference_samples", 1)
 
+            # Pass normalized batch and state to generation function
             actions = self.diffusion.generate_actions_via_inverse_dynamics(
-                model_input_batch,
-                current_state,
+                model_input_batch,  # Pass normalized batch
+                current_state,     # Pass normalized state
                 self.inv_dyn_model,
-                self.normalize_invdyn_state,
                 num_samples=num_samples,
-            )
+            )  # Returns normalized actions
 
             # Unnormalize actions
-            actions = self.unnormalize_action_output(
+            actions_unnormalized = self.unnormalize_action_output(
                 {"action": actions})["action"]
 
-            # Add generated actions to the queue
+            # Add generated *unnormalized* actions to the queue
             # Need to handle batch dimension if present
-            if actions.dim() == 3:  # (B, n_action_steps, action_dim)
+            if actions_unnormalized.dim() == 3:  # (B, n_action_steps, action_dim)
                 # Assuming B=1 during inference
-                actions_list = [a for a in actions.squeeze(0)]
-            elif actions.dim() == 2:  # (n_action_steps, action_dim)
-                actions_list = [a for a in actions]
+                actions_list = [a for a in actions_unnormalized.squeeze(0)]
+            elif actions_unnormalized.dim() == 2:  # (n_action_steps, action_dim)
+                actions_list = [a for a in actions_unnormalized]
             else:
-                raise ValueError(f"Unexpected actions shape: {actions.shape}")
+                raise ValueError(
+                    f"Unexpected actions shape: {actions_unnormalized.shape}")
             self._queues["action"].extend(actions_list)
 
         # Pop the next action from the queue
@@ -202,24 +189,35 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         Run the batch through the model and compute the loss.
         Always returns a Tensor (possibly zero) so train.py never sees None.
         """
+        raw_batch = batch  # Keep original batch for inv dyn normalization
 
-        batch = self.normalize_inputs(batch)
+        # 1. Normalize inputs
+        norm_batch = self.normalize_inputs(batch)
+
+        # 2. Stack images if necessary (using normalized batch)
         if self.config.image_features:
-            # shallow copy so that adding a key doesn't modify the original
-            batch = dict(batch)
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
+            norm_batch = dict(norm_batch)  # shallow copy
+            norm_batch["observation.images"] = torch.stack(
+                [norm_batch[key] for key in self.config.image_features], dim=-4
             )
 
-        # diffusion loss needs diffusion‐normalized targets
-        batch = self.normalize_diffusion_target(batch)
+        # 3. Normalize diffusion target (using input-normalized batch)
+        diffusion_batch = self.normalize_diffusion_target(norm_batch)
 
-        # --- now also normalize for inverse‐dynamics ---
-        # (so s_t and true_actions live in the same space as inv_dyn_model was trained on)
-        inv_batch = self.normalize_invdyn_state(batch)
-        inv_batch = self.normalize_invdyn_action(inv_batch)
+        # 4. Separately normalize state and action for inverse dynamics (using raw batch)
+        invdyn_batch = self.normalize_invdyn_state(raw_batch)
+        invdyn_batch = self.normalize_invdyn_action(invdyn_batch)
+        # Ensure invdyn_batch has necessary keys if they were modified/missing in raw_batch processing
+        # This assumes raw_batch contains 'observation.state' and 'action' with correct sequence lengths
+        # Copy padding mask
+        invdyn_batch['action_is_pad'] = raw_batch['action_is_pad']
 
-        loss = self.diffusion.compute_loss(inv_batch, self.inv_dyn_model)
+        # 5. Compute loss using appropriately normalized batches
+        loss = self.diffusion.compute_loss(
+            diffusion_batch=diffusion_batch,
+            invdyn_batch=invdyn_batch,
+            inv_dyn_model=self.inv_dyn_model
+        )
         # no output_dict so returning None
         return loss, None
 
@@ -330,7 +328,9 @@ class MyDiffusionModel(nn.Module):
         return img_features
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode image features and concatenate them all together along with the state vector."""
+        """Encode image features and concatenate them all together along with the state vector.
+           Expects batch to have normalized 'observation.state' and potentially 'observation.images'.
+        """
         batch_size = batch["observation.state"].shape[0]
         n_obs_steps = self.config.n_obs_steps
 
@@ -392,107 +392,105 @@ class MyDiffusionModel(nn.Module):
     @torch.no_grad()
     def generate_actions_via_inverse_dynamics(
         self,
-        batch: dict[str, Tensor],
-        current_state: Tensor,
+        norm_batch: dict[str, Tensor],  # Expects normalized batch
+        norm_current_state: Tensor,    # Expects normalized state
         inv_dyn_model: TemporalUNetInvDynamic,
-        normalize_invdyn_state: Callable[[dict[str, Tensor]], dict[str, Tensor]],
         num_samples: int = 1,
     ) -> Tensor:
-        batch_size = current_state.shape[0]
+        """Generates actions using diffusion for states and then inverse dynamics.
+           Expects inputs (batch, current_state) to be already normalized.
+           Returns normalized actions.
+        """
+        batch_size = norm_current_state.shape[0]
         n_obs_steps = self.config.n_obs_steps
-        assert batch["observation.state"].shape[1] == n_obs_steps
+        assert norm_batch["observation.state"].shape[1] == n_obs_steps
         if self.config.image_features:
-            assert batch["observation.images"].shape[1] == n_obs_steps
+            assert norm_batch["observation.images"].shape[1] == n_obs_steps
 
-        global_cond = self._prepare_global_conditioning(batch)
+        # Prepare conditioning from the normalized batch
+        global_cond = self._prepare_global_conditioning(norm_batch)
 
         # Repeat global_cond if num_samples > 1
         if num_samples > 1:
             global_cond = global_cond.repeat_interleave(num_samples, dim=0)
 
+        # Sample normalized future states
         predicted_states_flat = self.conditional_sample(
             batch_size * num_samples, global_cond=global_cond
-        )
+        )  # Output is normalized states
 
         predicted_states = einops.rearrange(
             predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
         )
 
         # Always select the first sample if multiple are generated
-        selected_states = predicted_states[:, 0]  # (B, H, D_state)
+        # (B, H, D_state) - Normalized
+        selected_states = predicted_states[:, 0]
 
-        # Prepare state pairs for inverse dynamics model
-        # s_t_pairs = (s_current, s_pred_1, s_pred_2, ..., s_pred_{H-1})
-        s_t0 = current_state.unsqueeze(1)  # (B, 1, D_state)
+        # Prepare state pairs for inverse dynamics model (using normalized states)
+        s_t0 = norm_current_state.unsqueeze(1)  # (B, 1, D_state) - Normalized
         # Concatenate current state with the first H-1 predicted states
         s_t_pairs = torch.cat(
-            [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state)
+            [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state) - Normalized
 
-        # --- normalize for inv‐dyn model! ---
-        s_t_norm = normalize_invdyn_state(
-            {"observation.state": s_t_pairs}
-        )["observation.state"]  # (B, H, D_state)
-
-        # Predict actions for the sequence of state pairs
-        pred_actions = inv_dyn_model.predict(s_t_norm)  # (B, H, action_dim)
+        # Predict actions for the sequence of *normalized* state pairs
+        pred_actions = inv_dyn_model.predict(
+            s_t_pairs)  # (B, H, action_dim) - Normalized actions
 
         # Select the first n_action_steps for execution
         actions_to_execute = pred_actions[:,
                                           : self.config.n_action_steps]  # (B, n_action_steps, action_dim)
 
-        return actions_to_execute
+        return actions_to_execute  # Return normalized actions
 
-    def compute_loss(self, batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
+    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
         """
         Computes the diffusion loss and the inverse dynamics loss.
+        Expects diffusion_batch to be normalized for diffusion inputs and targets.
+        Expects invdyn_batch to be normalized for inverse dynamics inputs (state) and targets (action).
         """
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
-        state_seq_len = batch["observation.state"].shape[1]
 
-        # The state sequence must contain n_obs_steps for conditioning
-        # PLUS horizon steps for the target prediction.
-
+        # --- Diffusion Loss Part (uses diffusion_batch) ---
         if self.config.image_features:
-            assert batch["observation.images"].shape[1] == n_obs_steps, \
-                f"Image sequence length ({batch['observation.images'].shape[1]}) must match n_obs_steps ({n_obs_steps})"
-        assert "action_is_pad" in batch, "Need 'action_is_pad' to mask loss for state prediction horizon."
-        assert batch["action_is_pad"].shape[1] == horizon, \
-            f"action_is_pad length ({batch['action_is_pad'].shape[1]}) must match prediction horizon ({horizon})"
+            assert diffusion_batch["observation.images"].shape[1] == n_obs_steps, \
+                f"Image sequence length ({diffusion_batch['observation.images'].shape[1]}) must match n_obs_steps ({n_obs_steps})"
+        # Padding mask should be consistent across batches, get from invdyn_batch as it was copied from raw
+        assert "action_is_pad" in invdyn_batch, "Need 'action_is_pad' to mask loss."
+        assert invdyn_batch["action_is_pad"].shape[1] == horizon, \
+            f"action_is_pad length ({invdyn_batch['action_is_pad'].shape[1]}) must match prediction horizon ({horizon})"
 
-        # Prepare global conditioning
+        # Prepare global conditioning using diffusion_batch (already normalized inputs)
         cond_batch = {
-            "observation.state": batch["observation.state"][:, :n_obs_steps],
+            "observation.state": diffusion_batch["observation.state"][:, :n_obs_steps],
         }
         if self.config.image_features:
-            cond_batch["observation.images"] = batch["observation.images"]
+            cond_batch["observation.images"] = diffusion_batch["observation.images"]
         if self.config.env_state_feature:
-            if batch[OBS_ENV].shape[1] < n_obs_steps:
-                raise ValueError(
-                    f"{OBS_ENV} sequence length ({batch[OBS_ENV].shape[1]}) "
-                    f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
-                )
-            cond_batch[OBS_ENV] = batch[OBS_ENV][:, :n_obs_steps]
+            # Assuming env_state is part of diffusion_batch if needed
+            if diffusion_batch[OBS_ENV].shape[1] < n_obs_steps:
+                raise ValueError(f"{OBS_ENV} sequence length issue.")
+            cond_batch[OBS_ENV] = diffusion_batch[OBS_ENV][:, :n_obs_steps]
 
         global_cond = self._prepare_global_conditioning(cond_batch)
 
-        # Extract target states: sequence of length `horizon` starting after `n_obs_steps`
+        # Extract target states from diffusion_batch (already normalized target)
         # Shape: (B, horizon, state_dim)
-        clean_targets = batch["observation.state"][:,
-                                                   0:horizon, :]
+        # Use the specific target key
+        clean_targets = diffusion_batch[self.config.diffusion_target_key][:, 0:horizon, :]
 
         B = clean_targets.shape[0]
         device = clean_targets.device
 
-        # Diffusion loss
+        # Diffusion loss calculation (remains the same logic)
         noise = torch.randn(clean_targets.shape, device=device)
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps,
             size=(B,), device=device,
         ).long()
         noisy_targets = self.noise_scheduler.add_noise(
-            clean_targets, noise, timesteps)  # Shape: (B, horizon, state_dim)
-        # Output: (B, horizon, state_dim)
+            clean_targets, noise, timesteps)
         pred = self.transformer(noisy_targets, timesteps,
                                 global_cond=global_cond)
 
@@ -504,30 +502,34 @@ class MyDiffusionModel(nn.Module):
             raise ValueError(
                 f"Unsupported prediction type {self.config.prediction_type}")
 
-        # Shape: (B, horizon, state_dim)
         diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
         if self.config.do_mask_loss_for_padding:
-            padding_mask = batch["action_is_pad"]  # Shape: (B, horizon)
+            padding_mask = invdyn_batch["action_is_pad"]  # Shape: (B, horizon)
             in_episode_bound = ~padding_mask
             diffusion_loss = diffusion_loss * \
-                in_episode_bound.unsqueeze(-1)  # Apply mask
+                in_episode_bound.unsqueeze(-1)
 
         diffusion_loss = diffusion_loss.mean()
 
-        # --- Inverse dynamics loss over the full horizon ---
-        s_t = batch["observation.state"][
+        # --- Inverse Dynamics Loss Part (uses invdyn_batch) ---
+        # Extract states normalized for inv dyn model
+        s_t = invdyn_batch["observation.state"][
             :, :horizon, :
-        ]                              # (B, H, D_state)
+        ]                              # (B, H, D_state) - Normalized for InvDyn
         B, H, D_state = s_t.shape
 
-        pred_actions = inv_dyn_model.predict(s_t)  # (B, H, action_dim)
+        # Predict actions using inv dyn model with appropriately normalized states
+        pred_actions = inv_dyn_model.predict(
+            s_t)  # (B, H, action_dim) - Normalized actions
 
-        # ground‐truth actions for all H steps
-        true_actions = batch["action"][:, :, :]  # (B, H, action_dim)
+        # Ground‐truth actions normalized for inv dyn model
+        # (B, H, action_dim) - Normalized for InvDyn
+        true_actions = invdyn_batch["action"][:, :horizon, :]
 
+        # Inverse dynamics loss calculation (remains the same logic)
         if self.config.do_mask_loss_for_padding:
-            mask = ~batch["action_is_pad"]            # (B, H)
+            mask = ~invdyn_batch["action_is_pad"]            # (B, H)
             loss_e = F.mse_loss(pred_actions, true_actions, reduction="none")
             loss_e = loss_e * mask.unsqueeze(-1)      # zero‐out padded
             inv_dyn_loss = loss_e.sum() / (mask.sum() * self.action_dim + 1e-8)
@@ -541,6 +543,7 @@ class MyDiffusionModel(nn.Module):
     def conditional_sample(
         self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
     ) -> Tensor:
+        """ Samples normalized states """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -564,4 +567,4 @@ class MyDiffusionModel(nn.Module):
             sample = self.noise_scheduler.step(
                 model_output, t, sample, generator=generator).prev_sample
 
-        return sample
+        return sample  # Returns normalized states
