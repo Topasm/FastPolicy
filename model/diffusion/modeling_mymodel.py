@@ -72,27 +72,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             config.normalization_mapping, dataset_stats
         )
 
-        # # --- Debug Print Stats Start ---
-        # if dataset_stats is not None and "observation.state" in dataset_stats:
-        #     state_stats = dataset_stats["observation.state"]
-        #     if "min" in state_stats and "max" in state_stats:
-        #         state_min = state_stats["min"]
-        #         state_max = state_stats["max"]
-        #         print(f"DEBUG __init__: Normalization stats for 'observation.state':")
-        #         # Use tolist() for cleaner printing
-        #         print(f"  min: {state_min.tolist()}")
-        #         print(f"  max: {state_max.tolist()}")
-        #         # Specifically print y-axis stats if state_dim > 1
-        #         if len(state_min) > 1:
-        #             print(
-        #                 f"  y-axis min: {state_min[1].item():.4f}, y-axis max: {state_max[1].item():.4f}")
-        #     else:
-        #         print(
-        #             "DEBUG __init__: 'min' or 'max' not found in dataset_stats for 'observation.state'")
-        # else:
-        #     print("DEBUG __init__: dataset_stats is None or missing 'observation.state'")
-        # # --- Debug Print Stats End ---
-
         # queues are populated during rollout of the policy
         self._queues = None
         self.state_dim = config.robot_state_feature.shape[0]
@@ -168,6 +147,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, processed_batch)
 
         # Generate new action plan only when the action queue is empty
+
         if len(self._queues["action"]) == 0:
             # Prepare batch for the model by stacking history from queues (already normalized)
             model_input_batch = {}
@@ -180,7 +160,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
             # Get the very last state (already normalized)
             current_state = model_input_batch["observation.state"][:,
-                                                                   self.config.n_obs_steps-1, :]
+                                                                   0, :]
             num_samples = getattr(self.config, "num_inference_samples", 1)
 
             # Pass normalized batch and state to generation function
@@ -195,17 +175,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             actions_unnormalized = self.unnormalize_action_output(
                 {"action": actions})["action"]
 
-            # Add generated *unnormalized* actions to the queue
-            # Need to handle batch dimension if present
-            if actions_unnormalized.dim() == 3:  # (B, n_action_steps, action_dim)
-                # Assuming B=1 during inference
-                actions_list = [a for a in actions_unnormalized.squeeze(0)]
-            elif actions_unnormalized.dim() == 2:  # (n_action_steps, action_dim)
-                actions_list = [a for a in actions_unnormalized]
-            else:
-                raise ValueError(
-                    f"Unexpected actions shape: {actions_unnormalized.shape}")
-            self._queues["action"].extend(actions_list)
+            self._queues["action"].extend(actions_unnormalized.transpose(0, 1))
 
         # Pop the next action from the queue
         action = self._queues["action"].popleft()
@@ -492,13 +462,38 @@ class MyDiffusionModel(nn.Module):
         pred_actions = pred_actions_flat.view(
             B, H, self.action_dim)  # (B, H, action_dim)
 
-        # Select the first n_action_steps for execution
-        actions_to_execute = pred_actions[:,
-                                          : self.config.n_action_steps]  # (B, n_action_steps, action_dim)
+        # --- Apply the slicing logic from the provided example ---
+        # Select actions using start = n_obs_steps - 1
+        start = self.config.n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        # Ensure the slice indices are within the bounds of the predicted horizon (H)
+        if end > H:
+            print(
+                f"Warning: Slicing end index ({end}) exceeds prediction horizon ({H}). Adjusting end index.")
+            end = H
+        if start >= H:
+            raise ValueError(
+                f"Slicing start index ({start}) is out of bounds for prediction horizon ({H}). Check n_obs_steps and horizon.")
+
+        # (B, n_action_steps_effective, action_dim)
+        actions_to_execute = pred_actions[:, start:end]
+        # --- End of applied slicing logic ---
+
+        # Pad if the slice is shorter than n_action_steps (e.g., if end was adjusted)
+        actual_steps = actions_to_execute.shape[1]
+        if actual_steps < self.config.n_action_steps:
+            print(
+                f"Warning: Only {actual_steps} actions could be sliced. Padding the rest.")
+            padding_needed = self.config.n_action_steps - actual_steps
+            # Pad with the last valid action
+            # Keep dimension B, 1, D
+            last_action = actions_to_execute[:, -1:, :]
+            padding = last_action.repeat(1, padding_needed, 1)
+            actions_to_execute = torch.cat(
+                [actions_to_execute, padding], dim=1)
 
         return actions_to_execute  # Return normalized actions
 
-    # Updated type hint
     def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
         """
         Computes the diffusion loss and the inverse dynamics loss.
@@ -535,28 +530,6 @@ class MyDiffusionModel(nn.Module):
         # Shape: (B, horizon, state_dim)
         # Use the specific target key
         clean_targets = diffusion_batch["observation.state"][:, 0:horizon, :]
-
-        # --- Debug Print Start ---
-        # Check the range of normalized ground truth states periodically
-        # Use a simple check like checking if the process ID is 0 for distributed training if needed
-        # Assumes the second dimension (index 1) is the y-axis
-        # if os.environ.get("LOCAL_RANK", "0") == "0":  # Basic check for multi-gpu
-        #     if clean_targets.shape[-1] > 1:
-        #         y_min = torch.min(clean_targets[..., 1])
-        #         y_max = torch.max(clean_targets[..., 1])
-        #         # Print only if min/max are found to avoid clutter if state dim is 1
-        #         if y_min is not None and y_max is not None:
-        #             print(
-        #                 f"DEBUG compute_loss: Normalized clean_targets y-axis range: [{y_min.item():.4f}, {y_max.item():.4f}]")
-        #     else:
-        #         # Handle case where state dimension might be 1
-        #         s_min = torch.min(clean_targets)
-        #         s_max = torch.max(clean_targets)
-        #         if s_min is not None and s_max is not None:
-        #             print(
-        #                 f"DEBUG compute_loss: Normalized clean_targets range (dim=1): [{s_min.item():.4f}, {s_max.item():.4f}]")
-
-        # # --- Debug Print End ---
 
         B = clean_targets.shape[0]
         device = clean_targets.device
