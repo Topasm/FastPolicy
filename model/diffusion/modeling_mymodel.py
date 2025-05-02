@@ -79,15 +79,11 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
-        # Switch back to MlpInvDynamic
-        self.inv_dyn_model = MlpInvDynamic(
-            o_dim=self.state_dim * config.horizon,  # MLP expects flattened state sequence
-            # MLP predicts flattened action sequence
-            a_dim=self.action_dim * config.horizon,
-            hidden_dim=self.config.inv_dyn_hidden_dim,
-            dropout=0.1,  # Example dropout, adjust if needed
-            use_layernorm=True,  # Example, adjust if needed
-            out_activation=nn.Tanh(),  # Keep Tanh for normalized actions
+        # Switch back to TemporalUNetInvDynamic
+        self.inv_dyn_model = TemporalUNetInvDynamic(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            hidden_dim=self.config.inv_dyn_hidden_dim,  # Use the same hidden_dim config
         )
         self.critic_scorer = CriticScorer(
             state_dim=self.state_dim,
@@ -411,7 +407,7 @@ class MyDiffusionModel(nn.Module):
         self,
         norm_batch: dict[str, Tensor],  # Expects normalized batch
         norm_current_state: Tensor,    # Expects normalized state
-        inv_dyn_model: MlpInvDynamic,  # Updated type hint
+        inv_dyn_model: TemporalUNetInvDynamic,  # Updated type hint
         num_samples: int = 1,
     ) -> Tensor:
         """Generates actions using diffusion for states and then inverse dynamics.
@@ -450,23 +446,17 @@ class MyDiffusionModel(nn.Module):
         s_t_pairs = torch.cat(
             [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state) - Normalized
 
-        # Flatten the state sequence for MLP input
-        B, H, D_state = s_t_pairs.shape
-        s_t_pairs_flat = s_t_pairs.view(B, -1)  # (B, H * D_state)
-
         # Predict actions for the sequence of *normalized* state pairs
-        pred_actions_flat = inv_dyn_model.predict(
-            s_t_pairs_flat)  # (B, H * action_dim) - Normalized actions
-
-        # Reshape predicted actions back to sequence format
-        pred_actions = pred_actions_flat.view(
-            B, H, self.action_dim)  # (B, H, action_dim)
+        # U-Net expects (B, H, D_state)
+        pred_actions = inv_dyn_model.predict(
+            s_t_pairs)  # (B, H, action_dim) - Normalized actions
 
         # --- Apply the slicing logic from the provided example ---
         # Select actions using start = n_obs_steps - 1
         start = self.config.n_obs_steps - 1
         end = start + self.config.n_action_steps
         # Ensure the slice indices are within the bounds of the predicted horizon (H)
+        H = pred_actions.shape[1]  # Get horizon from prediction
         if end > H:
             print(
                 f"Warning: Slicing end index ({end}) exceeds prediction horizon ({H}). Adjusting end index.")
@@ -494,7 +484,7 @@ class MyDiffusionModel(nn.Module):
 
         return actions_to_execute  # Return normalized actions
 
-    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
+    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
         """
         Computes the diffusion loss and the inverse dynamics loss.
         Expects diffusion_batch to be normalized for diffusion inputs and targets.
@@ -570,16 +560,10 @@ class MyDiffusionModel(nn.Module):
         ]                              # (B, H, D_state) - Normalized for InvDyn
         B, H, D_state = s_t.shape
 
-        # Flatten the state sequence for MLP input
-        s_t_flat = s_t.view(B, -1)  # (B, H * D_state)
-
         # Predict actions using inv dyn model with appropriately normalized states
-        pred_actions_flat = inv_dyn_model(  # Use forward during training
-            s_t_flat)  # (B, H * action_dim) - Normalized actions
-
-        # Reshape predicted actions back to sequence format
-        pred_actions = pred_actions_flat.view(
-            B, H, self.action_dim)  # (B, H, action_dim)
+        # U-Net expects (B, H, D_state)
+        pred_actions = inv_dyn_model(  # Use forward during training
+            s_t)  # (B, H, action_dim) - Normalized actions
 
         # Ground‐truth actions normalized for inv dyn model
         # (B, H, action_dim) - Normalized for InvDyn
