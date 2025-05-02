@@ -57,12 +57,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         # Normalizers/Unnormalizers
         self.normalize_inputs = Normalize(
             config.input_features, config.normalization_mapping, dataset_stats)
-        # Diffusion normalizes states (diffusion target)
-        self.normalize_diffusion_target = Normalize(
-            {config.diffusion_target_key:
-                config.output_features[config.diffusion_target_key]},
-            config.normalization_mapping, dataset_stats
-        )
+
         # Inverse dynamics normalizes states and actions
         self.normalize_invdyn_state = Normalize(
             {"observation.state": config.robot_state_feature},
@@ -77,6 +72,27 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             config.normalization_mapping, dataset_stats
         )
 
+        # # --- Debug Print Stats Start ---
+        # if dataset_stats is not None and "observation.state" in dataset_stats:
+        #     state_stats = dataset_stats["observation.state"]
+        #     if "min" in state_stats and "max" in state_stats:
+        #         state_min = state_stats["min"]
+        #         state_max = state_stats["max"]
+        #         print(f"DEBUG __init__: Normalization stats for 'observation.state':")
+        #         # Use tolist() for cleaner printing
+        #         print(f"  min: {state_min.tolist()}")
+        #         print(f"  max: {state_max.tolist()}")
+        #         # Specifically print y-axis stats if state_dim > 1
+        #         if len(state_min) > 1:
+        #             print(
+        #                 f"  y-axis min: {state_min[1].item():.4f}, y-axis max: {state_max[1].item():.4f}")
+        #     else:
+        #         print(
+        #             "DEBUG __init__: 'min' or 'max' not found in dataset_stats for 'observation.state'")
+        # else:
+        #     print("DEBUG __init__: dataset_stats is None or missing 'observation.state'")
+        # # --- Debug Print Stats End ---
+
         # queues are populated during rollout of the policy
         self._queues = None
         self.state_dim = config.robot_state_feature.shape[0]
@@ -84,10 +100,15 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
-        self.inv_dyn_model = TemporalUNetInvDynamic(
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
+        # Switch back to MlpInvDynamic
+        self.inv_dyn_model = MlpInvDynamic(
+            o_dim=self.state_dim * config.horizon,  # MLP expects flattened state sequence
+            # MLP predicts flattened action sequence
+            a_dim=self.action_dim * config.horizon,
             hidden_dim=self.config.inv_dyn_hidden_dim,
+            dropout=0.1,  # Example dropout, adjust if needed
+            use_layernorm=True,  # Example, adjust if needed
+            out_activation=nn.Tanh(),  # Keep Tanh for normalized actions
         )
         self.critic_scorer = CriticScorer(
             state_dim=self.state_dim,
@@ -197,6 +218,29 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         """
         raw_batch = batch  # Keep original batch for inv dyn normalization
 
+        # # --- Debug Print Raw Data Range Start ---
+        # target_key = self.config.diffusion_target_key
+        # if target_key in raw_batch:
+        #     raw_targets = raw_batch[target_key][:, 0:self.config.horizon, :]
+        #     if os.environ.get("LOCAL_RANK", "0") == "0":  # Basic check for multi-gpu
+        #         if raw_targets.shape[-1] > 1:
+        #             raw_y_min = torch.min(raw_targets[..., 1])
+        #             raw_y_max = torch.max(raw_targets[..., 1])
+        #             if raw_y_min is not None and raw_y_max is not None:
+        #                 print(
+        #                     f"DEBUG forward: Raw target y-axis range: [{raw_y_min.item():.4f}, {raw_y_max.item():.4f}]")
+        #         else:
+        #             raw_s_min = torch.min(raw_targets)
+        #             raw_s_max = torch.max(raw_targets)
+        #             if raw_s_min is not None and raw_s_max is not None:
+        #                 print(
+        #                     f"DEBUG forward: Raw target range (dim=1): [{raw_s_min.item():.4f}, {raw_s_max.item():.4f}]")
+        # else:
+        #     if os.environ.get("LOCAL_RANK", "0") == "0":
+        #         print(
+        #             f"DEBUG forward: Target key '{target_key}' not found in raw_batch.")
+        # # --- Debug Print Raw Data Range End ---
+
         # 1. Normalize inputs
         norm_batch = self.normalize_inputs(batch)
 
@@ -206,9 +250,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             norm_batch["observation.images"] = torch.stack(
                 [norm_batch[key] for key in self.config.image_features], dim=-4
             )
-
-        # 3. Normalize diffusion target (using input-normalized batch)
-        diffusion_batch = self.normalize_diffusion_target(norm_batch)
 
         # 4. Separately normalize state and action for inverse dynamics (using raw batch)
         invdyn_batch = self.normalize_invdyn_state(raw_batch)
@@ -220,7 +261,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # 5. Compute loss using appropriately normalized batches
         loss = self.diffusion.compute_loss(
-            diffusion_batch=diffusion_batch,
+            diffusion_batch=norm_batch,
             invdyn_batch=invdyn_batch,
             inv_dyn_model=self.inv_dyn_model
         )
@@ -400,7 +441,7 @@ class MyDiffusionModel(nn.Module):
         self,
         norm_batch: dict[str, Tensor],  # Expects normalized batch
         norm_current_state: Tensor,    # Expects normalized state
-        inv_dyn_model: TemporalUNetInvDynamic,
+        inv_dyn_model: MlpInvDynamic,  # Updated type hint
         num_samples: int = 1,
     ) -> Tensor:
         """Generates actions using diffusion for states and then inverse dynamics.
@@ -439,9 +480,17 @@ class MyDiffusionModel(nn.Module):
         s_t_pairs = torch.cat(
             [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state) - Normalized
 
+        # Flatten the state sequence for MLP input
+        B, H, D_state = s_t_pairs.shape
+        s_t_pairs_flat = s_t_pairs.view(B, -1)  # (B, H * D_state)
+
         # Predict actions for the sequence of *normalized* state pairs
-        pred_actions = inv_dyn_model.predict(
-            s_t_pairs)  # (B, H, action_dim) - Normalized actions
+        pred_actions_flat = inv_dyn_model.predict(
+            s_t_pairs_flat)  # (B, H * action_dim) - Normalized actions
+
+        # Reshape predicted actions back to sequence format
+        pred_actions = pred_actions_flat.view(
+            B, H, self.action_dim)  # (B, H, action_dim)
 
         # Select the first n_action_steps for execution
         actions_to_execute = pred_actions[:,
@@ -449,7 +498,8 @@ class MyDiffusionModel(nn.Module):
 
         return actions_to_execute  # Return normalized actions
 
-    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
+    # Updated type hint
+    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
         """
         Computes the diffusion loss and the inverse dynamics loss.
         Expects diffusion_batch to be normalized for diffusion inputs and targets.
@@ -484,7 +534,29 @@ class MyDiffusionModel(nn.Module):
         # Extract target states from diffusion_batch (already normalized target)
         # Shape: (B, horizon, state_dim)
         # Use the specific target key
-        clean_targets = diffusion_batch[self.config.diffusion_target_key][:, 0:horizon, :]
+        clean_targets = diffusion_batch["observation.state"][:, 0:horizon, :]
+
+        # --- Debug Print Start ---
+        # Check the range of normalized ground truth states periodically
+        # Use a simple check like checking if the process ID is 0 for distributed training if needed
+        # Assumes the second dimension (index 1) is the y-axis
+        # if os.environ.get("LOCAL_RANK", "0") == "0":  # Basic check for multi-gpu
+        #     if clean_targets.shape[-1] > 1:
+        #         y_min = torch.min(clean_targets[..., 1])
+        #         y_max = torch.max(clean_targets[..., 1])
+        #         # Print only if min/max are found to avoid clutter if state dim is 1
+        #         if y_min is not None and y_max is not None:
+        #             print(
+        #                 f"DEBUG compute_loss: Normalized clean_targets y-axis range: [{y_min.item():.4f}, {y_max.item():.4f}]")
+        #     else:
+        #         # Handle case where state dimension might be 1
+        #         s_min = torch.min(clean_targets)
+        #         s_max = torch.max(clean_targets)
+        #         if s_min is not None and s_max is not None:
+        #             print(
+        #                 f"DEBUG compute_loss: Normalized clean_targets range (dim=1): [{s_min.item():.4f}, {s_max.item():.4f}]")
+
+        # # --- Debug Print End ---
 
         B = clean_targets.shape[0]
         device = clean_targets.device
@@ -525,9 +597,16 @@ class MyDiffusionModel(nn.Module):
         ]                              # (B, H, D_state) - Normalized for InvDyn
         B, H, D_state = s_t.shape
 
+        # Flatten the state sequence for MLP input
+        s_t_flat = s_t.view(B, -1)  # (B, H * D_state)
+
         # Predict actions using inv dyn model with appropriately normalized states
-        pred_actions = inv_dyn_model.predict(
-            s_t)  # (B, H, action_dim) - Normalized actions
+        pred_actions_flat = inv_dyn_model(  # Use forward during training
+            s_t_flat)  # (B, H * action_dim) - Normalized actions
+
+        # Reshape predicted actions back to sequence format
+        pred_actions = pred_actions_flat.view(
+            B, H, self.action_dim)  # (B, H, action_dim)
 
         # Ground‐truth actions normalized for inv dyn model
         # (B, H, action_dim) - Normalized for InvDyn

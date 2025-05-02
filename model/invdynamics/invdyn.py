@@ -60,12 +60,6 @@ class MlpInvDynamic(nn.Module):
             _norm(),
             nn.GELU(),
             nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            _norm(),
-            nn.GELU(),
-            nn.Dropout(dropout),
-
             nn.Linear(hidden_dim, hidden_dim),
             _norm(),
             nn.GELU(),
@@ -190,15 +184,22 @@ class TemporalUNetInvDynamic(nn.Module):
             # Output shape: (B, A, H, 1)
         )
 
+        # Add Tanh activation layer
+        self.final_activation = nn.Tanh()
+
         # Fallback for 2D input (B, D)
-        self.step_head = nn.Linear(state_dim, action_dim)
-        nn.init.kaiming_normal_(self.step_head.weight, nonlinearity="relu")
-        nn.init.zeros_(self.step_head.bias)
+        self.step_head = nn.Sequential(
+            nn.Linear(state_dim, action_dim),
+            nn.Tanh()  # Also add Tanh here for consistency
+        )
+        # Initialize linear layer
+        nn.init.kaiming_normal_(self.step_head[0].weight, nonlinearity="relu")
+        nn.init.zeros_(self.step_head[0].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
             # Handle single step input (B, D)
-            return self.step_head(x)
+            return self.step_head(x)  # step_head now includes Tanh
         elif x.dim() == 3:
             # Handle sequence input (B, H, D)
             B, H, D = x.shape
@@ -234,6 +235,9 @@ class TemporalUNetInvDynamic(nn.Module):
 
         out = out.squeeze(-1)       # (B, A, H)
         out = out.permute(0, 2, 1)  # (B, H, A) - Match desired output shape
+
+        # Apply final activation
+        out = self.final_activation(out)
 
         return out
 
