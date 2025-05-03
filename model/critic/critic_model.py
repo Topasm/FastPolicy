@@ -1,42 +1,59 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class CriticScorer(nn.Module):  # <-- Make sure it inherits from nn.Module
-    def __init__(self, state_dim: int, horizon: int, hidden_dim: int = 256):
-        super().__init__()  # <-- Add super().__init__() call
-        self.horizon = horizon
+class CriticScorer(nn.Module):
+    """
+    Scores a sequence of states using an MLP.
+    Input: (B, H, D_state)
+    Output: (B, 1) score per sequence
+    """
+
+    def __init__(self, state_dim: int, horizon: int, hidden_dim: int = 128):
+        super().__init__()
         self.state_dim = state_dim
+        self.horizon = horizon
+        input_dim = state_dim * horizon
 
-        # Example MLP structure - adjust as needed
         self.net = nn.Sequential(
-            nn.Linear(state_dim * horizon, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, 1)  # Output a single score
         )
+        self._init_weights()
 
-    def score(self, state_sequence: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self):
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+
+    def forward(self, state_seq: torch.Tensor) -> torch.Tensor:
         """
-        Scores a sequence of predicted states.
-
         Args:
-            state_sequence: Tensor of shape (num_samples, horizon, state_dim)
-
+            state_seq: (B, H, D_state) tensor of state sequences.
         Returns:
-            Tensor of shape (num_samples,) containing scores for each sequence.
+            (B, 1) tensor of scores.
         """
-        num_samples, horizon, state_dim = state_sequence.shape
-        assert horizon == self.horizon
-        assert state_dim == self.state_dim
+        B, H, D = state_seq.shape
+        if H != self.horizon or D != self.state_dim:
+            raise ValueError(
+                f"Input shape mismatch. Expected (B, {self.horizon}, {self.state_dim}), got {(B, H, D)}")
 
-        # Flatten the sequence for the MLP
-        flat_sequence = state_sequence.view(num_samples, -1)
-        # Remove the last dimension
-        scores = self.net(flat_sequence).squeeze(-1)
-        return scores
+        # Flatten sequence: (B, H * D_state)
+        state_flat = state_seq.view(B, -1)
+        score = self.net(state_flat.float())
+        return score
 
-    # Add a forward method for consistency, although score is used directly
-    def forward(self, state_sequence: torch.Tensor) -> torch.Tensor:
-        return self.score(state_sequence)
+    @torch.no_grad()
+    def score(self, state_seq: torch.Tensor) -> torch.Tensor:
+        """Inference entrypoint."""
+        self.eval()
+        out = self.forward(state_seq)
+        self.train()
+        return out

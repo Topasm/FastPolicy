@@ -37,14 +37,17 @@ output_directory = Path("outputs/eval/dit_plan_policy")
 output_directory.mkdir(parents=True, exist_ok=True)
 
 # Select your device
-device = "cuda"
+device = "cuda"  # Note: The device will be set by the policy's config during loading
 
-# Provide the [hugging face repo id](https://huggingface.co/lerobot/diffusion_pusht):
-pretrained_policy_path = "outputs/train/dit_plan_policy"
-# OR a path to a local outputs/train folder.
-# pretrained_policy_path = Path("outputs/train/example_pusht_diffusion")
+# --- Point to the directory containing assembled components ---
+# This directory should contain config.json, stats.safetensors,
+# diffusion.pth, invdyn.pth, critic.pth (optional)
+pretrained_policy_path = "outputs/train/dit_plan_policy_assembled"  # ADJUST THIS PATH
 
+# --- Load policy using the overridden from_pretrained ---
 policy = MYDiffusionPolicy.from_pretrained(pretrained_policy_path)
+# policy.eval() # Already set in from_pretrained
+# Device is also set within from_pretrained based on config
 
 # Initialize evaluation environment to render two observation types:
 # an image of the scene and state/position of the agent. The environment
@@ -90,9 +93,9 @@ while not done:
     image = image.to(torch.float32) / 255
     image = image.permute(2, 0, 1)
 
-    # Send data tensors from CPU to GPU
-    state = state.to(device, non_blocking=True)
-    image = image.to(device, non_blocking=True)
+    # Send data tensors from CPU to GPU (use policy.device)
+    state = state.to(policy.device, non_blocking=True)
+    image = image.to(policy.device, non_blocking=True)
 
     # Add extra (empty) batch dimension, required to forward the policy
     state = state.unsqueeze(0)

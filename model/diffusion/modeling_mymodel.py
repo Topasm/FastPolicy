@@ -11,6 +11,8 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
+from pathlib import Path
+import safetensors
 
 from lerobot.common.constants import OBS_ENV, OBS_ROBOT
 from model.diffusion.configuration_mymodel import DiffusionConfig
@@ -79,24 +81,23 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
-        # Switch to MlpInvDynamic
+        # Instantiate MlpInvDynamic
         self.inv_dyn_model = MlpInvDynamic(
-            # Input: state pair (s_t, s_{t+1}) flattened
             o_dim=self.state_dim * 2,
-            a_dim=self.action_dim,    # Output: single action a_t
+            a_dim=self.action_dim,
             hidden_dim=self.config.inv_dyn_hidden_dim,
             dropout=0.1,
             use_layernorm=True,
             out_activation=nn.Tanh(),
         )
+        # Instantiate CriticScorer
         self.critic_scorer = CriticScorer(
             state_dim=self.state_dim,
-            # Critic likely scores state from diffusion
             horizon=config.horizon,
             hidden_dim=config.critic_hidden_dim
         )
 
-        # Determine and store the device
+        # Determine and store the device AFTER loading weights
         self.diffusion.to(config.device)
         self.inv_dyn_model.to(config.device)
         self.critic_scorer.to(config.device)
@@ -104,10 +105,77 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         self.reset()
 
-    def get_optim_params(self) -> list:
-        # Return parameters of both models for joint optimization
-        # Ensure parameters from all relevant submodules are included
-        return list(self.diffusion.parameters()) + list(self.inv_dyn_model.parameters()) + list(self.critic_scorer.parameters())
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs):
+        """
+        Instantiate a policy from a pretrained checkpoint directory.
+        Overrides the base method to load individual component checkpoints.
+
+        Expects directory structure:
+        - config.json
+        - stats.safetensors
+        - diffusion.pth (state_dict for MyDiffusionModel)
+        - invdyn.pth (state_dict for MlpInvDynamic)
+        - critic.pth (state_dict for CriticScorer, optional)
+        """
+        pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
+
+        # 1. Load config
+        config_path = pretrained_model_name_or_path / "config.json"
+        if not config_path.is_file():
+            raise OSError(
+                f"config.json not found in {pretrained_model_name_or_path}")
+        config = cls.config_class.from_json_file(config_path)
+
+        # 2. Load dataset stats
+        stats_path = pretrained_model_name_or_path / "stats.safetensors"
+        if not stats_path.is_file():
+            raise OSError(
+                f"stats.safetensors not found in {pretrained_model_name_or_path}")
+        with safetensors.safe_open(stats_path, framework="pt", device="cpu") as f:
+            dataset_stats = {k: f.get_tensor(k) for k in f.keys()}
+
+        # 3. Instantiate the policy
+        policy = cls(config, dataset_stats)
+        policy.eval()  # Set to eval mode by default after loading
+
+        # 4. Load individual component state dicts
+        device = config.device  # Use device from config
+
+        diffusion_ckpt_path = pretrained_model_name_or_path / "diffusion.pth"
+        if diffusion_ckpt_path.is_file():
+            print(f"Loading diffusion state dict from: {diffusion_ckpt_path}")
+            diff_state_dict = torch.load(
+                diffusion_ckpt_path, map_location="cpu")
+            policy.diffusion.load_state_dict(diff_state_dict)
+        else:
+            print(
+                f"Warning: diffusion.pth not found in {pretrained_model_name_or_path}. Diffusion model not loaded.")
+
+        invdyn_ckpt_path = pretrained_model_name_or_path / "invdyn.pth"
+        if invdyn_ckpt_path.is_file():
+            print(f"Loading invdyn state dict from: {invdyn_ckpt_path}")
+            inv_state_dict = torch.load(invdyn_ckpt_path, map_location="cpu")
+            policy.inv_dyn_model.load_state_dict(inv_state_dict)
+        else:
+            print(
+                f"Warning: invdyn.pth not found in {pretrained_model_name_or_path}. Inverse dynamics model not loaded.")
+
+        critic_ckpt_path = pretrained_model_name_or_path / "critic.pth"
+        if critic_ckpt_path.is_file():
+            print(f"Loading critic state dict from: {critic_ckpt_path}")
+            crit_state_dict = torch.load(critic_ckpt_path, map_location="cpu")
+            policy.critic_scorer.load_state_dict(crit_state_dict)
+        else:
+            # Critic might be optional
+            print(
+                f"Info: critic.pth not found in {pretrained_model_name_or_path}. Critic model not loaded.")
+
+        # Move policy to the correct device AFTER loading state dicts
+        policy.to(device)
+        policy.device = device  # Update device attribute
+
+        return policy
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -180,40 +248,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         # Pop the next action from the queue
         action = self._queues["action"].popleft()
         return action
-
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
-        """
-        Run the batch through the model and compute the loss.
-        Always returns a Tensor (possibly zero) so train.py never sees None.
-        """
-        raw_batch = batch  # Keep original batch for inv dyn normalization
-
-        # 1. Normalize inputs
-        norm_batch = self.normalize_inputs(batch)
-
-        # 2. Stack images if necessary (using normalized batch)
-        if self.config.image_features:
-            norm_batch = dict(norm_batch)  # shallow copy
-            norm_batch["observation.images"] = torch.stack(
-                [norm_batch[key] for key in self.config.image_features], dim=-4
-            )
-
-        # 4. Separately normalize state and action for inverse dynamics (using raw batch)
-        invdyn_batch = self.normalize_invdyn_state(raw_batch)
-        invdyn_batch = self.normalize_invdyn_action(invdyn_batch)
-        # Ensure invdyn_batch has necessary keys if they were modified/missing in raw_batch processing
-        # This assumes raw_batch contains 'observation.state' and 'action' with correct sequence lengths
-        # Copy padding mask
-        invdyn_batch['action_is_pad'] = raw_batch['action_is_pad']
-
-        # 5. Compute loss using appropriately normalized batches
-        loss = self.diffusion.compute_loss(
-            diffusion_batch=norm_batch,
-            invdyn_batch=invdyn_batch,
-            inv_dyn_model=self.inv_dyn_model
-        )
-        # no output_dict so returning None
-        return loss, None
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -442,27 +476,21 @@ class MyDiffusionModel(nn.Module):
 
         return actions_to_execute  # Return normalized actions
 
-    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
-        """
-        Computes the diffusion loss (over 16 states) and the iterative inverse dynamics loss (over 16 steps).
-        """
+    def compute_diffusion_loss(self, diffusion_batch: dict[str, Tensor]) -> Tensor:
+        """Computes only the diffusion loss."""
         n_obs_steps = self.config.n_obs_steps
-        horizon = self.config.horizon  # This is 16
-
-        # --- Diffusion Loss Part (uses diffusion_batch, horizon=16) ---
-        if self.config.image_features:
-            assert diffusion_batch["observation.images"].shape[1] == n_obs_steps, \
-                f"Image sequence length ({diffusion_batch['observation.images'].shape[1]}) must match n_obs_steps ({n_obs_steps})"
-        assert "action_is_pad" in invdyn_batch, "Need 'action_is_pad' to mask loss."
-        assert invdyn_batch["action_is_pad"].shape[1] == horizon, \
-            f"action_is_pad length ({invdyn_batch['action_is_pad'].shape[1]}) must match prediction horizon ({horizon})"
+        horizon = self.config.horizon
 
         # Prepare global conditioning using diffusion_batch (already normalized inputs)
         cond_batch = {
             "observation.state": diffusion_batch["observation.state"][:, :n_obs_steps],
         }
         if self.config.image_features:
-            cond_batch["observation.images"] = diffusion_batch["observation.images"]
+            if diffusion_batch["observation.images"].shape[1] != n_obs_steps:
+                raise ValueError(
+                    "Image sequence length mismatch in diffusion_batch")
+            # Ensure correct slicing
+            cond_batch["observation.images"] = diffusion_batch["observation.images"][:, :n_obs_steps]
         if self.config.env_state_feature:
             if diffusion_batch[OBS_ENV].shape[1] < n_obs_steps:
                 raise ValueError(f"{OBS_ENV} sequence length issue.")
@@ -496,61 +524,65 @@ class MyDiffusionModel(nn.Module):
 
         diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
-        if self.config.do_mask_loss_for_padding:
-            padding_mask = invdyn_batch["action_is_pad"]
-            in_episode_bound = ~padding_mask
-            diffusion_loss = diffusion_loss * \
-                in_episode_bound.unsqueeze(-1)
-
         diffusion_loss = diffusion_loss.mean()
+        return diffusion_loss
 
-        # --- Inverse Dynamics Loss Part (Vectorized over horizon=16) ---
-        state_start_idx = n_obs_steps - 1
-        state_end_idx = state_start_idx + horizon + 1  # Slice includes s_H
+    def compute_invdyn_loss(self, invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
+        """Computes only the inverse dynamics loss. Moved here for consistency."""
+        n_obs_steps = self.config.n_obs_steps
+        horizon = self.config.horizon
 
+        # We need states s_{-1} through s_{H} for pairs (s_t, s_{t+1}) where t= -1..H-1
+        # The state_delta_indices property loads states from t=1-n_obs to t=n_obs+H-1
+        # e.g., n_obs=2, H=16 -> indices -1..17. Length = 19.
+        # Correct expected length
+        expected_len = len(self.config.state_delta_indices)
         loaded_state_len = invdyn_batch["observation.state"].shape[1]
-        if state_end_idx > loaded_state_len:
+
+        if loaded_state_len != expected_len:
             raise ValueError(
-                f"Trying to slice state sequence up to index {state_end_idx} (for s_H), "
-                f"but loaded sequence only has length {loaded_state_len}. "
-                f"Ensure state_delta_indices includes horizon+1 steps."
+                f"Loaded state tensor for invdyn has unexpected length {loaded_state_len}. "
+                # Updated error message
+                f"Expected {expected_len} based on config.state_delta_indices."
             )
 
-        # Extract states s_0 through s_H
-        all_states = invdyn_batch["observation.state"][
-            :, state_start_idx:state_end_idx, :
-        ]  # Shape: (B, H+1, D_state)
+        # Extract states s_{-1} through s_{H} (or s_{n_obs+H-1})
+        # Shape: (B, expected_len, D)
+        all_states = invdyn_batch["observation.state"]
 
-        # Create current and next states for pairs
-        # s_0 to s_{H-1}. Shape: (B, H, D_state)
-        s_current = all_states[:, :-1, :]
-        s_next = all_states[:, 1:, :]   # s_1 to s_H. Shape: (B, H, D_state)
+        # Create previous and current states for pairs
+        # s_prev: s_{-1} to s_{H-1} (or s_{n_obs+H-2}). Shape: (B, expected_len-1, D_state)
+        s_prev = all_states[:, :-1, :]
+        # s_curr: s_{0} to s_{H} (or s_{n_obs+H-1}). Shape: (B, expected_len-1, D_state)
+        s_curr = all_states[:, 1:, :]
 
-        # Create state pairs (s_t, s_{t+1})
+        # Shape: (B, expected_len-1, D_state * 2)
+        state_pairs = torch.cat([s_prev, s_curr], dim=-1)
+
+        # We only need the first H pairs corresponding to t=0..H-1 for loss calculation
+        # These are pairs (s_0, s_1) ... (s_{H-1}, s_H)
+        # The index for t=0 in state_pairs is n_obs_steps - 1
+        start_pair_idx = n_obs_steps - 1
+        end_pair_idx = start_pair_idx + horizon
         # Shape: (B, H, D_state * 2)
-        state_pairs = torch.cat([s_current, s_next], dim=-1)
+        state_pairs_for_loss = state_pairs[:, start_pair_idx:end_pair_idx, :]
 
-        B, H, D_pair = state_pairs.shape  # H is 16
+        B, H, D_pair = state_pairs_for_loss.shape
+        if H != horizon:
+            raise ValueError(
+                f"Sliced state_pairs_for_loss has wrong horizon {H}, expected {horizon}")
 
-        # Flatten for MLP input
-        state_pairs_flat = state_pairs.view(
-            B * H, D_pair)  # Shape: (B*H, D_state * 2)
-
-        # Predict actions a_0 to a_{H-1}
+        state_pairs_flat = state_pairs_for_loss.reshape(
+            B * H, D_pair)  # Use reshape instead of view
         pred_actions_flat = inv_dyn_model(
-            state_pairs_flat)  # Shape: (B*H, action_dim)
-
-        # Reshape predicted actions
+            state_pairs_flat)  # Use the passed model
         pred_actions = pred_actions_flat.view(
-            B, H, self.action_dim)  # Shape: (B, H, action_dim)
+            B, H, self.action_dim)  # Shape: (B, H, A)
 
-        # Ground‐truth actions a_0 to a_{H-1}
         true_actions = invdyn_batch["action"][:,
-                                              :horizon, :]  # Shape: (B, H, action_dim)
+                                              :horizon, :]  # Shape: (B, H, A)
 
-        # Inverse dynamics loss calculation (over horizon H=16)
         if self.config.do_mask_loss_for_padding:
-            # Use the full padding mask over H=16 steps
             mask = ~invdyn_batch["action_is_pad"][:, :horizon]  # Shape: (B, H)
             loss_e = F.mse_loss(pred_actions, true_actions,
                                 reduction="none")  # Shape: (B, H, A)
@@ -559,9 +591,7 @@ class MyDiffusionModel(nn.Module):
         else:
             inv_dyn_loss = F.mse_loss(pred_actions, true_actions)
 
-        total_loss = diffusion_loss + self.config.inv_dyn_loss_weight * inv_dyn_loss
-
-        return total_loss
+        return inv_dyn_loss
 
     def conditional_sample(
         self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None

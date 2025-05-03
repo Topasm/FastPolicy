@@ -1,0 +1,133 @@
+import torch
+from pathlib import Path
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.common.datasets.utils import dataset_to_policy_features
+from lerobot.common.policies.normalize import Normalize
+# Import the diffusion model directly
+from model.diffusion.modeling_mymodel import MyDiffusionModel
+from model.diffusion.configuration_mymodel import DiffusionConfig
+from lerobot.configs.types import FeatureType
+
+
+def main():
+    output_directory = Path("outputs/train/diffusion_only")
+    output_directory.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda")
+    training_steps = 5000  # Adjust as needed
+    log_freq = 10
+    save_freq = 500  # Frequency to save checkpoints
+
+    # --- Dataset and Config Setup ---
+    dataset_repo_id = "lerobot/pusht"
+    dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
+    features = dataset_to_policy_features(dataset_metadata.features)
+
+    # Features needed for diffusion model conditioning and target
+    input_features = {
+        "observation.state": features["observation.state"],
+        # Add image/env features if used by the config
+        "observation.image": features["observation.image"],
+    }
+    # Diffusion target is state
+    output_features = {"observation.state": features["observation.state"]}
+
+    cfg = DiffusionConfig(
+        input_features=input_features,
+        # Config expects output_features, even if only state is used internally
+        output_features=output_features,
+        predict_state=True,  # Must be true for state prediction
+    )
+
+    # --- Model ---
+    diffusion_model = MyDiffusionModel(cfg)
+    diffusion_model.train()
+    diffusion_model.to(device)
+
+    # --- Normalization ---
+    # Normalize inputs (obs history) and targets (future states) using the same stats
+    normalize_inputs = Normalize(
+        cfg.input_features, cfg.normalization_mapping, dataset_metadata.stats)
+    normalize_targets = Normalize(
+        {"observation.state": cfg.output_features["observation.state"]}, cfg.normalization_mapping, dataset_metadata.stats)
+
+    # --- Dataset ---
+    # Need obs history (n_obs_steps) and future states (horizon)
+    # state_delta_indices loads from 1-n_obs up to H-1. We need up to H for the target.
+    # Let's define specific timestamps needed.
+    # -1 to 16 for n_obs=2, H=16
+    diffusion_state_indices = list(range(1 - cfg.n_obs_steps, cfg.horizon + 1))
+    delta_timestamps = {
+        # -1, 0
+        "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
+        # -1 to 16
+        "observation.state": [i / dataset_metadata.fps for i in diffusion_state_indices],
+        # Action not strictly needed, but include for padding mask if used
+        # 0 to 15
+        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
+    }
+    dataset = LeRobotDataset(
+        dataset_repo_id, delta_timestamps=delta_timestamps)
+
+    # --- Optimizer & Dataloader ---
+    optimizer = torch.optim.AdamW(
+        diffusion_model.parameters(), lr=cfg.optimizer_lr)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
+    )
+
+    # --- Training Loop ---
+    step = 0
+    done = False
+    print("Starting Diffusion Model Training...")
+    while not done:
+        for batch in dataloader:
+            # Prepare normalized batch for diffusion loss (on CPU)
+            # Input part (history)
+            norm_input_batch = normalize_inputs(batch)
+            # Target part (future states)
+            norm_target_batch = normalize_targets(batch)
+
+            # Combine relevant parts for the loss function (still on CPU)
+            diffusion_loss_batch = {
+                "observation.state": torch.cat(
+                    [norm_input_batch["observation.state"],
+                        norm_target_batch["observation.state"][:, cfg.n_obs_steps:]], dim=1
+                ),
+                "observation.images": norm_input_batch.get("observation.images"),
+                # Get original padding mask
+                "action_is_pad": batch.get("action_is_pad")
+            }
+            diffusion_loss_batch = {
+                k: v for k, v in diffusion_loss_batch.items() if v is not None}
+
+            # Now move the combined batch to GPU
+            diffusion_loss_batch = {k: v.to(device) if isinstance(
+                v, torch.Tensor) else v for k, v in diffusion_loss_batch.items()}
+
+            loss = diffusion_model.compute_diffusion_loss(diffusion_loss_batch)
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if step % log_freq == 0:
+                print(f"Step: {step}/{training_steps} Loss: {loss.item():.4f}")
+
+            if step % save_freq == 0 and step > 0:
+                ckpt_path = output_directory / f"diffusion_step_{step}.pth"
+                torch.save(diffusion_model.state_dict(), ckpt_path)
+                print(f"Saved checkpoint: {ckpt_path}")
+
+            step += 1
+            if step >= training_steps:
+                done = True
+                break
+
+    # --- Save Final Model ---
+    final_path = output_directory / "diffusion_final.pth"
+    torch.save(diffusion_model.state_dict(), final_path)
+    print(f"Training finished. Final diffusion model saved to: {final_path}")
+
+
+if __name__ == "__main__":
+    main()
