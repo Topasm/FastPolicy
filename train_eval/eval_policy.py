@@ -52,7 +52,7 @@ policy = MYDiffusionPolicy.from_pretrained(pretrained_policy_path)
 env = gym.make(
     "gym_pusht/PushT-v0",
     obs_type="pixels_agent_pos",
-    max_episode_steps=300,
+    max_episode_steps=1000,
 )
 
 # We can verify that the shapes of the features expected by the policy match the ones from the observations

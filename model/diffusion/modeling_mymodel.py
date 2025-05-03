@@ -79,11 +79,15 @@ class MYDiffusionPolicy(PreTrainedPolicy):
 
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
-        # Switch back to TemporalUNetInvDynamic
-        self.inv_dyn_model = TemporalUNetInvDynamic(
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            hidden_dim=self.config.inv_dyn_hidden_dim,  # Use the same hidden_dim config
+        # Switch to MlpInvDynamic
+        self.inv_dyn_model = MlpInvDynamic(
+            # Input: state pair (s_t, s_{t+1}) flattened
+            o_dim=self.state_dim * 2,
+            a_dim=self.action_dim,    # Output: single action a_t
+            hidden_dim=self.config.inv_dyn_hidden_dim,
+            dropout=0.1,
+            use_layernorm=True,
+            out_activation=nn.Tanh(),
         )
         self.critic_scorer = CriticScorer(
             state_dim=self.state_dim,
@@ -183,29 +187,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         Always returns a Tensor (possibly zero) so train.py never sees None.
         """
         raw_batch = batch  # Keep original batch for inv dyn normalization
-
-        # # --- Debug Print Raw Data Range Start ---
-        # target_key = self.config.diffusion_target_key
-        # if target_key in raw_batch:
-        #     raw_targets = raw_batch[target_key][:, 0:self.config.horizon, :]
-        #     if os.environ.get("LOCAL_RANK", "0") == "0":  # Basic check for multi-gpu
-        #         if raw_targets.shape[-1] > 1:
-        #             raw_y_min = torch.min(raw_targets[..., 1])
-        #             raw_y_max = torch.max(raw_targets[..., 1])
-        #             if raw_y_min is not None and raw_y_max is not None:
-        #                 print(
-        #                     f"DEBUG forward: Raw target y-axis range: [{raw_y_min.item():.4f}, {raw_y_max.item():.4f}]")
-        #         else:
-        #             raw_s_min = torch.min(raw_targets)
-        #             raw_s_max = torch.max(raw_targets)
-        #             if raw_s_min is not None and raw_s_max is not None:
-        #                 print(
-        #                     f"DEBUG forward: Raw target range (dim=1): [{raw_s_min.item():.4f}, {raw_s_max.item():.4f}]")
-        # else:
-        #     if os.environ.get("LOCAL_RANK", "0") == "0":
-        #         print(
-        #             f"DEBUG forward: Target key '{target_key}' not found in raw_batch.")
-        # # --- Debug Print Raw Data Range End ---
 
         # 1. Normalize inputs
         norm_batch = self.normalize_inputs(batch)
@@ -407,18 +388,16 @@ class MyDiffusionModel(nn.Module):
         self,
         norm_batch: dict[str, Tensor],  # Expects normalized batch
         norm_current_state: Tensor,    # Expects normalized state
-        inv_dyn_model: TemporalUNetInvDynamic,  # Updated type hint
+        inv_dyn_model: MlpInvDynamic,
         num_samples: int = 1,
     ) -> Tensor:
-        """Generates actions using diffusion for states and then inverse dynamics.
-           Expects inputs (batch, current_state) to be already normalized.
-           Returns normalized actions.
+        """Generates actions using diffusion for states and then iteratively applying
+           an inverse dynamics model predicting a_t from (s_t, s_{t+1}).
+           Returns `n_action_steps` (4) normalized actions.
         """
         batch_size = norm_current_state.shape[0]
         n_obs_steps = self.config.n_obs_steps
-        assert norm_batch["observation.state"].shape[1] == n_obs_steps
-        if self.config.image_features:
-            assert norm_batch["observation.images"].shape[1] == n_obs_steps
+        n_action_steps = self.config.n_action_steps  # This is 4
 
         # Prepare conditioning from the normalized batch
         global_cond = self._prepare_global_conditioning(norm_batch)
@@ -427,77 +406,53 @@ class MyDiffusionModel(nn.Module):
         if num_samples > 1:
             global_cond = global_cond.repeat_interleave(num_samples, dim=0)
 
-        # Sample normalized future states
+        # Sample normalized future states (Horizon=16)
         predicted_states_flat = self.conditional_sample(
             batch_size * num_samples, global_cond=global_cond
-        )  # Output is normalized states
+        )  # Output: (B*N, 16, D_state)
 
         predicted_states = einops.rearrange(
             predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
         )
 
         # Always select the first sample if multiple are generated
-        # (B, H, D_state) - Normalized
-        selected_states = predicted_states[:, 0]
+        selected_states = predicted_states[:, 0]  # (B, 16, D_state)
 
-        # Prepare state pairs for inverse dynamics model (using normalized states)
-        s_t0 = norm_current_state.unsqueeze(1)  # (B, 1, D_state) - Normalized
-        # Concatenate current state with the first H-1 predicted states
-        s_t_pairs = torch.cat(
-            [s_t0, selected_states[:, :-1]], dim=1)  # (B, H, D_state) - Normalized
+        # Iteratively predict actions
+        predicted_actions = []
+        current_s = norm_current_state  # s_0
+        for i in range(n_action_steps):  # Iterate 4 times (i=0, 1, 2, 3)
+            next_s = selected_states[:, i]  # s_1, s_2, s_3, s_4
 
-        # Predict actions for the sequence of *normalized* state pairs
-        # U-Net expects (B, H, D_state)
-        pred_actions = inv_dyn_model.predict(
-            s_t_pairs)  # (B, H, action_dim) - Normalized actions
+            # Create state pair (s_i, s_{i+1})
+            # Shape: (B, D_state * 2)
+            state_pair = torch.cat([current_s, next_s], dim=-1)
 
-        # --- Apply the slicing logic from the provided example ---
-        # Select actions using start = n_obs_steps - 1
-        start = self.config.n_obs_steps - 1
-        end = start + self.config.n_action_steps
-        # Ensure the slice indices are within the bounds of the predicted horizon (H)
-        H = pred_actions.shape[1]  # Get horizon from prediction
-        if end > H:
-            print(
-                f"Warning: Slicing end index ({end}) exceeds prediction horizon ({H}). Adjusting end index.")
-            end = H
-        if start >= H:
-            raise ValueError(
-                f"Slicing start index ({start}) is out of bounds for prediction horizon ({H}). Check n_obs_steps and horizon.")
+            # Predict action a_i
+            action_i = inv_dyn_model.predict(
+                state_pair)  # Shape: (B, action_dim)
+            predicted_actions.append(action_i)
 
-        # (B, n_action_steps_effective, action_dim)
-        actions_to_execute = pred_actions[:, start:end]
-        # --- End of applied slicing logic ---
+            # Update current state for next iteration
+            current_s = next_s
 
-        # Pad if the slice is shorter than n_action_steps (e.g., if end was adjusted)
-        actual_steps = actions_to_execute.shape[1]
-        if actual_steps < self.config.n_action_steps:
-            print(
-                f"Warning: Only {actual_steps} actions could be sliced. Padding the rest.")
-            padding_needed = self.config.n_action_steps - actual_steps
-            # Pad with the last valid action
-            # Keep dimension B, 1, D
-            last_action = actions_to_execute[:, -1:, :]
-            padding = last_action.repeat(1, padding_needed, 1)
-            actions_to_execute = torch.cat(
-                [actions_to_execute, padding], dim=1)
+        # Stack the predicted actions
+        actions_to_execute = torch.stack(
+            predicted_actions, dim=1)  # Shape: (B, 4, action_dim)
 
         return actions_to_execute  # Return normalized actions
 
-    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: TemporalUNetInvDynamic) -> Tensor:
+    def compute_loss(self, diffusion_batch: dict[str, Tensor], invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
         """
-        Computes the diffusion loss and the inverse dynamics loss.
-        Expects diffusion_batch to be normalized for diffusion inputs and targets.
-        Expects invdyn_batch to be normalized for inverse dynamics inputs (state) and targets (action).
+        Computes the diffusion loss (over 16 states) and the iterative inverse dynamics loss (over 16 steps).
         """
         n_obs_steps = self.config.n_obs_steps
-        horizon = self.config.horizon
+        horizon = self.config.horizon  # This is 16
 
-        # --- Diffusion Loss Part (uses diffusion_batch) ---
+        # --- Diffusion Loss Part (uses diffusion_batch, horizon=16) ---
         if self.config.image_features:
             assert diffusion_batch["observation.images"].shape[1] == n_obs_steps, \
                 f"Image sequence length ({diffusion_batch['observation.images'].shape[1]}) must match n_obs_steps ({n_obs_steps})"
-        # Padding mask should be consistent across batches, get from invdyn_batch as it was copied from raw
         assert "action_is_pad" in invdyn_batch, "Need 'action_is_pad' to mask loss."
         assert invdyn_batch["action_is_pad"].shape[1] == horizon, \
             f"action_is_pad length ({invdyn_batch['action_is_pad'].shape[1]}) must match prediction horizon ({horizon})"
@@ -509,7 +464,6 @@ class MyDiffusionModel(nn.Module):
         if self.config.image_features:
             cond_batch["observation.images"] = diffusion_batch["observation.images"]
         if self.config.env_state_feature:
-            # Assuming env_state is part of diffusion_batch if needed
             if diffusion_batch[OBS_ENV].shape[1] < n_obs_steps:
                 raise ValueError(f"{OBS_ENV} sequence length issue.")
             cond_batch[OBS_ENV] = diffusion_batch[OBS_ENV][:, :n_obs_steps]
@@ -517,14 +471,11 @@ class MyDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(cond_batch)
 
         # Extract target states from diffusion_batch (already normalized target)
-        # Shape: (B, horizon, state_dim)
-        # Use the specific target key
         clean_targets = diffusion_batch["observation.state"][:, 0:horizon, :]
 
         B = clean_targets.shape[0]
         device = clean_targets.device
 
-        # Diffusion loss calculation (remains the same logic)
         noise = torch.randn(clean_targets.shape, device=device)
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps,
@@ -546,34 +497,64 @@ class MyDiffusionModel(nn.Module):
         diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
         if self.config.do_mask_loss_for_padding:
-            padding_mask = invdyn_batch["action_is_pad"]  # Shape: (B, horizon)
+            padding_mask = invdyn_batch["action_is_pad"]
             in_episode_bound = ~padding_mask
             diffusion_loss = diffusion_loss * \
                 in_episode_bound.unsqueeze(-1)
 
         diffusion_loss = diffusion_loss.mean()
 
-        # --- Inverse Dynamics Loss Part (uses invdyn_batch) ---
-        # Extract states normalized for inv dyn model
-        s_t = invdyn_batch["observation.state"][
-            :, :horizon, :
-        ]                              # (B, H, D_state) - Normalized for InvDyn
-        B, H, D_state = s_t.shape
+        # --- Inverse Dynamics Loss Part (Vectorized over horizon=16) ---
+        state_start_idx = n_obs_steps - 1
+        state_end_idx = state_start_idx + horizon + 1  # Slice includes s_H
 
-        # Predict actions using inv dyn model with appropriately normalized states
-        # U-Net expects (B, H, D_state)
-        pred_actions = inv_dyn_model(  # Use forward during training
-            s_t)  # (B, H, action_dim) - Normalized actions
+        loaded_state_len = invdyn_batch["observation.state"].shape[1]
+        if state_end_idx > loaded_state_len:
+            raise ValueError(
+                f"Trying to slice state sequence up to index {state_end_idx} (for s_H), "
+                f"but loaded sequence only has length {loaded_state_len}. "
+                f"Ensure state_delta_indices includes horizon+1 steps."
+            )
 
-        # Ground‐truth actions normalized for inv dyn model
-        # (B, H, action_dim) - Normalized for InvDyn
-        true_actions = invdyn_batch["action"][:, :horizon, :]
+        # Extract states s_0 through s_H
+        all_states = invdyn_batch["observation.state"][
+            :, state_start_idx:state_end_idx, :
+        ]  # Shape: (B, H+1, D_state)
 
-        # Inverse dynamics loss calculation (remains the same logic)
+        # Create current and next states for pairs
+        # s_0 to s_{H-1}. Shape: (B, H, D_state)
+        s_current = all_states[:, :-1, :]
+        s_next = all_states[:, 1:, :]   # s_1 to s_H. Shape: (B, H, D_state)
+
+        # Create state pairs (s_t, s_{t+1})
+        # Shape: (B, H, D_state * 2)
+        state_pairs = torch.cat([s_current, s_next], dim=-1)
+
+        B, H, D_pair = state_pairs.shape  # H is 16
+
+        # Flatten for MLP input
+        state_pairs_flat = state_pairs.view(
+            B * H, D_pair)  # Shape: (B*H, D_state * 2)
+
+        # Predict actions a_0 to a_{H-1}
+        pred_actions_flat = inv_dyn_model(
+            state_pairs_flat)  # Shape: (B*H, action_dim)
+
+        # Reshape predicted actions
+        pred_actions = pred_actions_flat.view(
+            B, H, self.action_dim)  # Shape: (B, H, action_dim)
+
+        # Ground‐truth actions a_0 to a_{H-1}
+        true_actions = invdyn_batch["action"][:,
+                                              :horizon, :]  # Shape: (B, H, action_dim)
+
+        # Inverse dynamics loss calculation (over horizon H=16)
         if self.config.do_mask_loss_for_padding:
-            mask = ~invdyn_batch["action_is_pad"]            # (B, H)
-            loss_e = F.mse_loss(pred_actions, true_actions, reduction="none")
-            loss_e = loss_e * mask.unsqueeze(-1)      # zero‐out padded
+            # Use the full padding mask over H=16 steps
+            mask = ~invdyn_batch["action_is_pad"][:, :horizon]  # Shape: (B, H)
+            loss_e = F.mse_loss(pred_actions, true_actions,
+                                reduction="none")  # Shape: (B, H, A)
+            loss_e = loss_e * mask.unsqueeze(-1)
             inv_dyn_loss = loss_e.sum() / (mask.sum() * self.action_dim + 1e-8)
         else:
             inv_dyn_loss = F.mse_loss(pred_actions, true_actions)

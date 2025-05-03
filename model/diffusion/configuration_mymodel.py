@@ -266,10 +266,18 @@ class DiffusionConfig(PreTrainedConfig):
 
     @property
     def state_delta_indices(self) -> list:
-
-        start_index = 0
-
-        return list(range(1 - self.n_obs_steps, start_index + self.horizon))
+        """Indices relative to the start of the observation window for the state sequence.
+        Loads states from 1-n_obs_steps up to H (inclusive) for inverse dynamics loss calculation.
+        e.g., n_obs=2, H=16 -> range(-1, 17) -> indices -1, 0, ..., 16. Length H + n_obs = 18.
+        """
+        start_index = 1 - self.n_obs_steps  # e.g., -1
+        # End index needs to include state H relative to time 0.
+        # Time 0 is at index n_obs_steps-1 in the loaded tensor.
+        # Time H is at index n_obs_steps-1 + H.
+        # So the range needs to go up to n_obs_steps + H.
+        end_index = self.n_obs_steps + self.horizon  # e.g., 2 + 16 = 18
+        # e.g., range(-1, 18) -> -1..17
+        return list(range(start_index, end_index))
 
     @property
     def reward_delta_indices(self) -> None:
