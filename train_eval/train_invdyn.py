@@ -1,5 +1,6 @@
 import torch
 from pathlib import Path
+import safetensors.torch  # Import safetensors for saving stats
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize
@@ -15,9 +16,9 @@ def main():
     output_directory = Path("outputs/train/invdyn_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 5000  # Adjust as needed
+    training_steps = 500  # Adjust as needed
     log_freq = 10
-    save_freq = 500  # Frequency to save checkpoints
+    save_freq = 100  # Frequency to save checkpoints
 
     # --- Dataset and Config Setup ---
     dataset_repo_id = "lerobot/pusht"
@@ -116,6 +117,16 @@ def main():
     torch.save(invdyn_model.state_dict(), final_path)
     print(
         f"Training finished. Final inverse dynamics model saved to: {final_path}")
+
+    # --- Save Config and Stats ---
+    # Save the config used (even if it's DiffusionConfig for parameters)
+    cfg.save_pretrained(output_directory)
+    # Filter stats to include only tensors
+    stats_to_save = {
+        k: v for k, v in dataset_metadata.stats.items() if isinstance(v, torch.Tensor)}
+    safetensors.torch.save_file(
+        stats_to_save, output_directory / "stats.safetensors")
+    print(f"Config and stats saved to: {output_directory}")
 
 
 if __name__ == "__main__":
