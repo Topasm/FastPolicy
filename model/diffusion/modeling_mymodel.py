@@ -185,7 +185,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         }
         if self.config.image_features:
             # Use a single key for stacked images in the queue
-            self._queues["observation.images"] = deque(
+            self._queues["observation.image"] = deque(
                 maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(
@@ -205,7 +205,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         if self.config.image_features:
             # Create a temporary dict to avoid modifying the original input batch
             processed_batch = dict(norm_batch)
-            processed_batch["observation.images"] = torch.stack(
+            processed_batch["observation.image"] = torch.stack(
                 [norm_batch[key] for key in self.config.image_features], dim=-4
             )
         else:
@@ -357,8 +357,13 @@ class MyDiffusionModel(nn.Module):
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector.
-           Expects batch to have normalized 'observation.state' and potentially 'observation.images'.
+           Expects batch to have normalized 'observation.state' and potentially 'observation.image'.
         """
+        # Check required keys exist
+        if "observation.state" not in batch:
+            raise KeyError(
+                "Missing 'observation.state' in batch for _prepare_global_conditioning")
+
         batch_size = batch["observation.state"].shape[0]
         n_obs_steps = self.config.n_obs_steps
 
@@ -370,9 +375,11 @@ class MyDiffusionModel(nn.Module):
         cond_state = batch["observation.state"][:, :n_obs_steps, :]
         global_cond_feats = [cond_state]
 
-        if self.config.image_features:
-            images = batch["observation.images"]
-            _B, n_img_steps, n_cam = images.shape[:3]
+        # Check if images are configured AND present in the batch before processing
+        if self.config.image_features and "observation.image" in batch:
+            images = batch["observation.image"]
+            _B, n_img_steps = images.shape[:2]
+            n_cam = 1  # Assuming single camera for "observation.image" key
 
             if n_img_steps != n_obs_steps:
                 raise ValueError(
@@ -382,29 +389,20 @@ class MyDiffusionModel(nn.Module):
                 )
             assert _B == batch_size
 
-            if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(
-                    images, "b s n ... -> n (b s) ...", s=n_obs_steps)
-                img_features_list = torch.cat(
-                    [
-                        encoder(imgs)
-                        for encoder, imgs in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                images_reshaped = einops.rearrange(
-                    images, "b s n ... -> (b s n) ...", s=n_obs_steps
-                )
-                img_features = self.rgb_encoder(images_reshaped)
-                img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps, n=n_cam
-                )
+            images_reshaped = einops.rearrange(
+                images, "b t c h w -> (b t) c h w")
+            img_features = self.rgb_encoder(images_reshaped)
+            img_features = einops.rearrange(
+                img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
+            )
             global_cond_feats.append(img_features)
+        elif self.config.image_features and "observation.image" not in batch:
+            # If images configured but not provided in this specific batch, print warning
+            print("Warning: image_features configured but 'observation.image' not found in batch for _prepare_global_conditioning.")
+            # Continue without image features for this batch
 
-        if self.config.env_state_feature:
+        # Check if env state is configured AND present
+        if self.config.env_state_feature and OBS_ENV in batch:
             if batch[OBS_ENV].shape[1] < n_obs_steps:
                 raise ValueError(
                     f"{OBS_ENV} sequence length ({batch[OBS_ENV].shape[1]}) "
@@ -412,6 +410,10 @@ class MyDiffusionModel(nn.Module):
                 )
             cond_env_state = batch[OBS_ENV][:, :n_obs_steps, :]
             global_cond_feats.append(cond_env_state)
+        elif self.config.env_state_feature and OBS_ENV not in batch:
+            print(
+                f"Warning: env_state_feature configured but '{OBS_ENV}' not found in batch for _prepare_global_conditioning.")
+            # Continue without env state features for this batch
 
         concatenated_features = torch.cat(global_cond_feats, dim=-1)
         global_cond = concatenated_features.flatten(start_dim=1)
@@ -476,34 +478,90 @@ class MyDiffusionModel(nn.Module):
 
         return actions_to_execute  # Return normalized actions
 
-    def compute_diffusion_loss(self, diffusion_batch: dict[str, Tensor]) -> Tensor:
-        """Computes only the diffusion loss."""
+    def compute_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
+        """Computes the diffusion loss.
+        Expects norm_batch to be a fully normalized batch containing all keys
+        loaded by the dataset (state seq, image history, padding mask).
+        Handles internal slicing for conditioning and target.
+        """
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
 
-        # Prepare global conditioning using diffusion_batch (already normalized inputs)
-        cond_batch = {
-            "observation.state": diffusion_batch["observation.state"][:, :n_obs_steps],
-        }
-        if self.config.image_features:
-            if diffusion_batch["observation.images"].shape[1] != n_obs_steps:
-                raise ValueError(
-                    "Image sequence length mismatch in diffusion_batch")
-            # Ensure correct slicing
-            cond_batch["observation.images"] = diffusion_batch["observation.images"][:, :n_obs_steps]
-        if self.config.env_state_feature:
-            if diffusion_batch[OBS_ENV].shape[1] < n_obs_steps:
-                raise ValueError(f"{OBS_ENV} sequence length issue.")
-            cond_batch[OBS_ENV] = diffusion_batch[OBS_ENV][:, :n_obs_steps]
+        # --- Prepare Conditioning Data (History) ---
+        if "observation.state" not in norm_batch:
+            raise KeyError(
+                "Missing 'observation.state' in norm_batch for compute_diffusion_loss")
 
+        full_state_sequence = norm_batch["observation.state"]
+        # Ensure sequence is long enough for history
+        if full_state_sequence.shape[1] < n_obs_steps:
+            raise ValueError(
+                f"Full state sequence too short for history. Need {n_obs_steps}, got {full_state_sequence.shape[1]}")
+        # Shape (B, n_obs, D)
+        history_state = full_state_sequence[:, :n_obs_steps]
+
+        cond_batch = {"observation.state": history_state}
+
+        # Check for image history
+        if self.config.image_features:
+            if "observation.image" in norm_batch:
+                image_history = norm_batch["observation.image"]
+                # Check if image sequence length matches n_obs_steps
+                if image_history.shape[1] != n_obs_steps:
+                    # If dataset loaded more images than needed (e.g., full sequence), slice here
+                    if image_history.shape[1] > n_obs_steps:
+                        print(
+                            f"Warning: Image sequence longer than n_obs_steps ({image_history.shape[1]} > {n_obs_steps}). Slicing.")
+                        cond_batch["observation.image"] = image_history[:,
+                                                                        :n_obs_steps]
+                    else:  # If shorter, it's an error
+                        raise ValueError(
+                            f"Image history length mismatch. Expected {n_obs_steps}, got {image_history.shape[1]}")
+                else:  # Length matches
+                    cond_batch["observation.image"] = image_history
+            else:
+                # If images configured but not in batch, print warning. global_cond will be smaller.
+                print(
+                    "Warning: image_features configured but 'observation.image' not found in norm_batch.")
+
+        # Add env state history if configured and present
+        if self.config.env_state_feature:
+            if OBS_ENV in norm_batch:
+                full_env_state = norm_batch[OBS_ENV]
+                if full_env_state.shape[1] < n_obs_steps:
+                    raise ValueError(
+                        f"Env state sequence too short for history. Need {n_obs_steps}, got {full_env_state.shape[1]}")
+                cond_batch[OBS_ENV] = full_env_state[:, :n_obs_steps]
+            else:
+                print(
+                    f"Warning: env_state_feature configured but '{OBS_ENV}' not found in norm_batch.")
+
+        # Calculate global_cond based on available history features in cond_batch
+        # This tensor's dimension MUST match the expected input dim of cond_embed layer
         global_cond = self._prepare_global_conditioning(cond_batch)
 
-        # Extract target states from diffusion_batch (already normalized target)
-        clean_targets = diffusion_batch["observation.state"][:, 0:horizon, :]
+        # --- Prepare Target Data (Future States) ---
+        # Assuming state prediction target is always this key
+        target_key = "observation.state"
+        # Ensure sequence is long enough for target horizon starting after history
+        expected_target_end_idx = n_obs_steps + horizon
+        if full_state_sequence.shape[1] < expected_target_end_idx:
+            raise ValueError(
+                f"Full state sequence too short for target. Need length {expected_target_end_idx}, got {full_state_sequence.shape[1]}")
+        # Target states are s_1...s_H, which are at indices n_obs_steps to n_obs_steps+horizon-1
+        # Shape (B, H, D)
+        clean_targets = full_state_sequence[:,
+                                            n_obs_steps:expected_target_end_idx, :]
+
+        if clean_targets.shape[1] != horizon:
+            # This check should be redundant if the length check above passes, but good for safety
+            raise ValueError(
+                f"Target state slicing failed. Expected horizon {horizon}, got {clean_targets.shape[1]}")
 
         B = clean_targets.shape[0]
         device = clean_targets.device
 
+        # --- Diffusion Process ---
         noise = torch.randn(clean_targets.shape, device=device)
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps,
@@ -511,9 +569,13 @@ class MyDiffusionModel(nn.Module):
         ).long()
         noisy_targets = self.noise_scheduler.add_noise(
             clean_targets, noise, timesteps)
+
+        # --- Transformer Prediction ---
+        # This is the likely point of failure if global_cond dimension is wrong
         pred = self.transformer(noisy_targets, timesteps,
                                 global_cond=global_cond)
 
+        # --- Loss Calculation ---
         if self.config.prediction_type == "epsilon":
             target = noise
         elif self.config.prediction_type == "sample":
@@ -524,7 +586,22 @@ class MyDiffusionModel(nn.Module):
 
         diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
-        diffusion_loss = diffusion_loss.mean()
+        # Optional: Mask loss based on padding
+        if self.config.do_mask_loss_for_padding and "action_is_pad" in norm_batch:
+            padding_mask = norm_batch["action_is_pad"]
+            # Ensure padding mask has at least horizon length
+            if padding_mask.shape[1] < horizon:
+                raise ValueError(
+                    f"Padding mask too short. Expected {horizon}, got {padding_mask.shape[1]}")
+            # Select the part of the mask corresponding to the target horizon
+            mask = ~padding_mask[:, :horizon]  # Shape (B, H)
+            mask_expanded = mask.unsqueeze(-1).expand_as(diffusion_loss)
+            diffusion_loss = diffusion_loss * mask_expanded
+            # Normalize loss by number of unmasked elements
+            diffusion_loss = diffusion_loss.sum() / (mask_expanded.sum() + 1e-8)
+        else:
+            diffusion_loss = diffusion_loss.mean()  # Original mean loss
+
         return diffusion_loss
 
     def compute_invdyn_loss(self, invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:

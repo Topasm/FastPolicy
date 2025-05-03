@@ -28,12 +28,15 @@ def main():
         # Add image/env features if used by the config
         "observation.image": features["observation.image"],
     }
-    # Diffusion target is state
-    output_features = {"observation.state": features["observation.state"]}
+    # Diffusion target is state, but config needs action in output_features too
+    output_features = {
+        "observation.state": features["observation.state"],
+        "action": features["action"]  # Add action feature here
+    }
 
     cfg = DiffusionConfig(
         input_features=input_features,
-        # Config expects output_features, even if only state is used internally
+        # Pass the updated output_features
         output_features=output_features,
         predict_state=True,  # Must be true for state prediction
     )
@@ -80,31 +83,24 @@ def main():
     done = False
     print("Starting Diffusion Model Training...")
     while not done:
+        # batch contains state (-1..16), image (-1, 0), action (0..15)
         for batch in dataloader:
-            # Prepare normalized batch for diffusion loss (on CPU)
-            # Input part (history)
-            norm_input_batch = normalize_inputs(batch)
-            # Target part (future states)
-            norm_target_batch = normalize_targets(batch)
 
-            # Combine relevant parts for the loss function (still on CPU)
-            diffusion_loss_batch = {
-                "observation.state": torch.cat(
-                    [norm_input_batch["observation.state"],
-                        norm_target_batch["observation.state"][:, cfg.n_obs_steps:]], dim=1
-                ),
-                "observation.images": norm_input_batch.get("observation.images"),
-                # Get original padding mask
-                "action_is_pad": batch.get("action_is_pad")
-            }
-            diffusion_loss_batch = {
-                k: v for k, v in diffusion_loss_batch.items() if v is not None}
+            # --- Normalize the batch (on CPU) ---
+            # Use normalize_inputs, assuming it handles all relevant keys based on cfg.input_features
+            norm_batch = normalize_inputs(batch)
 
-            # Now move the combined batch to GPU
-            diffusion_loss_batch = {k: v.to(device) if isinstance(
-                v, torch.Tensor) else v for k, v in diffusion_loss_batch.items()}
+            # Add padding mask back if it exists in the original batch
+            if "action_is_pad" in batch:
+                norm_batch["action_is_pad"] = batch["action_is_pad"]
 
-            loss = diffusion_model.compute_diffusion_loss(diffusion_loss_batch)
+            # --- Move normalized batch to GPU ---
+            norm_batch = {k: v.to(device) if isinstance(
+                v, torch.Tensor) else v for k, v in norm_batch.items()}
+
+            # --- Compute Loss ---
+            # Pass the entire normalized batch. compute_diffusion_loss will handle slicing.
+            loss = diffusion_model.compute_diffusion_loss(norm_batch)
 
             loss.backward()
             optimizer.step()
