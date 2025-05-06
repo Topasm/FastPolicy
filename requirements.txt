@@ -3,5 +3,6 @@ diffusers
 transformers
 PyYAML
 gym-aloha
+hf_xet
 # Add other dependencies as needed, e.g., for specific ViT backbones (timm), data loading, etc.
 # timm
