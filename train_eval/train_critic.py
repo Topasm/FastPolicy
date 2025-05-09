@@ -101,30 +101,8 @@ def main():
     }
     print("Initializing dataset...")
 
-    # Create a custom subclass of LeRobotDataset to handle string data
-    class CustomLeRobotDataset(LeRobotDataset):
-        def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
-            result = {}
-            for key, q_idx in query_indices.items():
-                if key in self.meta.video_keys:
-                    # Handle video keys as in the parent class
-                    continue  # Let parent class handle video keys
-                else:
-                    selected_values = self.hf_dataset.select(q_idx)[key]
-                    if any(key.startswith(prefix) for prefix in ["language_instruction", "task_category"]):
-                        # Handle language instructions and other string values without stacking
-                        result[key] = selected_values
-                    else:
-                        # Handle numeric values with stacking
-                        try:
-                            result[key] = torch.stack(selected_values)
-                        except Exception:
-                            # Fallback for any unexpected data types
-                            result[key] = selected_values
-            return result
-
     # Try a smaller range of episodes that's likely to be within bounds
-    dataset = CustomLeRobotDataset(
+    dataset = LeRobotDataset(
         dataset_repo_id, root="/media/ahrilab/data/droid_1.0.1/", delta_timestamps=delta_timestamps, episodes=list(range(0, 200)))
 
     # --- Optimizer & Dataloader ---
