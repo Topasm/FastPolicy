@@ -99,16 +99,6 @@ class MultimodalTrajectoryScorer(nn.Module):
         context_dim = config.context_hidden_dim
         use_bias = False  # ModernBERT: No bias in linear layers
 
-        # 0. Debug helper (can be imported or defined in a utils file)
-        def check_tensor_health(tensor, name: str):
-            if tensor is None:
-                return
-            if torch.isnan(tensor).any():
-                print(f"!!!!!! MODEL ALERT: {name} contains NaNs !!!!!!")
-            if torch.isinf(tensor).any():
-                print(f"!!!!!! MODEL ALERT: {name} contains Infs !!!!!!")
-        self.check_tensor_health = check_tensor_health
-
         # 1. Tokenizer & Language Embedding/Projection
         self.tokenizer = tiktoken.get_encoding(config.tokenizer_name)
         vocab_size = self.tokenizer.n_vocab
@@ -215,23 +205,16 @@ class MultimodalTrajectoryScorer(nn.Module):
                     seq, dtype=torch.long, device=device)
             lang_attn_mask[i, len(seq):] = True
 
-        self.check_tensor_health(
-            padded_tokens, "padded_lang_tokens_in_encode_context")
-
         lang_emb = self.lang_embed(padded_tokens)  # (B, T_lang, D_lang_embed)
-        self.check_tensor_health(lang_emb, "lang_emb_raw_in_encode_context")
+
         lang_emb = lang_emb + self.lang_pos_embed[:, :max_len, :]
-        self.check_tensor_health(lang_emb, "lang_emb_pos_in_encode_context")
 
         # Use Attention Pooling for language context
         lang_context = self.lang_pool(
             lang_emb, mask=lang_attn_mask)  # (B, D_context)
-        self.check_tensor_health(
-            lang_context, "lang_context_in_encode_context")
 
         # --- Encode Image ---
         image_emb = self.image_proj(image_features)  # (B, T_image, D_context)
-        self.check_tensor_health(image_emb, "image_emb_raw_in_encode_context")
         if image_padding_mask is not None:
             image_emb = image_emb.masked_fill(
                 image_padding_mask.unsqueeze(-1), 0.0)
@@ -240,12 +223,10 @@ class MultimodalTrajectoryScorer(nn.Module):
                 dim=1) / num_unmasked.clamp(min=1)  # Added clamp for safety
         else:
             image_context = image_emb.mean(dim=1)
-        self.check_tensor_health(
-            image_context, "image_context_in_encode_context")
 
         # --- Combine Context ---
         context = lang_context + image_context  # (B, D_context)
-        self.check_tensor_health(context, "combined_context_in_encode_context")
+
         return context
 
     def encode_state_sequence(
@@ -259,14 +240,11 @@ class MultimodalTrajectoryScorer(nn.Module):
         device = state_sequence.device
 
         state_emb = self.state_proj(state_sequence)
-        self.check_tensor_health(state_emb, "state_emb_proj_in_encode_state")
+
         state_emb = state_emb + self.state_pos_embed[:, :T_state, :]
-        self.check_tensor_health(state_emb, "state_emb_pos_in_encode_state")
 
         cls_token = self.state_cls_token.expand(BN, -1, -1)
         state_emb_with_cls = torch.cat([cls_token, state_emb], dim=1)
-        self.check_tensor_health(
-            state_emb_with_cls, "state_emb_cls_in_encode_state")
 
         if state_padding_mask is None:
             state_padding_mask = torch.zeros(
@@ -279,12 +257,9 @@ class MultimodalTrajectoryScorer(nn.Module):
             state_emb_with_cls,
             src_key_padding_mask=combined_attn_mask
         )
-        self.check_tensor_health(
-            transformer_output, "transformer_output_in_encode_state")
 
         state_encoding = transformer_output[:, 0, :]  # CLS token output
-        self.check_tensor_health(
-            state_encoding, "state_encoding_cls_in_encode_state")
+
         return state_encoding
 
     def forward(
@@ -303,15 +278,8 @@ class MultimodalTrajectoryScorer(nn.Module):
         """
         B, N_seq, T_state, _ = state_sequences.shape
 
-        self.check_tensor_health(
-            state_sequences, "state_sequences_input_forward")
-        self.check_tensor_health(
-            image_features, "image_features_input_forward")
-
         context_encoding = self.encode_context(
             image_features, lang_instruction, image_padding_mask)
-        self.check_tensor_health(
-            context_encoding, "context_encoding_output_forward")
 
         state_sequences_flat = einops.rearrange(
             state_sequences, 'b n t d -> (b n) t d')
@@ -322,8 +290,6 @@ class MultimodalTrajectoryScorer(nn.Module):
 
         state_encoding_flat = self.encode_state_sequence(
             state_sequences_flat, state_padding_mask_flat)
-        self.check_tensor_health(
-            state_encoding_flat, "state_encoding_flat_output_forward")
 
         context_encoding_repeated = einops.repeat(
             context_encoding, 'b d -> b n d', n=N_seq)
@@ -332,17 +298,12 @@ class MultimodalTrajectoryScorer(nn.Module):
 
         combined_features = torch.cat(
             [context_encoding_repeated, state_encoding], dim=-1)
-        self.check_tensor_health(
-            combined_features, "combined_features_before_head_forward")
 
         combined_features_flat = einops.rearrange(
             combined_features, 'b n d -> (b n) d')
         scores_flat = self.output_head(combined_features_flat)
-        self.check_tensor_health(
-            scores_flat, "scores_flat_output_head_forward")
 
         scores = einops.rearrange(scores_flat, '(b n) 1 -> b n', n=N_seq)
-        self.check_tensor_health(scores, "scores_final_rearranged_forward")
 
         return scores
 
