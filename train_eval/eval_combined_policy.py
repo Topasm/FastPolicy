@@ -31,7 +31,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.invdynamics.invdyn import MlpInvDynamic
-from model.critic.critic_model import CriticScorer
+from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import populate_queues
@@ -121,7 +121,7 @@ def main():
         "critic_final.pth"  # Use final checkpoint name
     if use_critic and critic_ckpt_path.is_file():
         print(f"Loading critic state dict from: {critic_ckpt_path}")
-        critic_model = CriticScorer(
+        critic_model = MultimodalTrajectoryScorer(
             state_dim=cfg.robot_state_feature.shape[0],
             horizon=cfg.horizon,
             hidden_dim=cfg.critic_hidden_dim

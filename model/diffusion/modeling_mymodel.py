@@ -27,7 +27,8 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     populate_queues,
 )
-from model.critic.critic_model import CriticScorer  # Import CriticScorer
+
+from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
 from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic, TemporalUNetInvDynamic
 
 
@@ -90,8 +91,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             use_layernorm=True,
             out_activation=nn.Tanh(),
         )
-        # Instantiate CriticScorer
-        self.critic_scorer = CriticScorer(
+        # Instantiate MultimodalTrajectoryScorer
+        self.critic_scorer = MultimodalTrajectoryScorer(
             state_dim=self.state_dim,
             horizon=config.horizon,
             hidden_dim=config.critic_hidden_dim
@@ -116,7 +117,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         - stats.safetensors
         - diffusion.pth (state_dict for MyDiffusionModel)
         - invdyn.pth (state_dict for MlpInvDynamic)
-        - critic.pth (state_dict for CriticScorer, optional)
+        - critic.pth (state_dict for MultimodalTrajectoryScorer, optional)
         """
         pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
 
@@ -457,7 +458,7 @@ class MyDiffusionModel(nn.Module):
         predicted_actions = []
         current_s = norm_current_state  # s_0
         for i in range(n_action_steps):  # Iterate 4 times (i=0, 1, 2, 3)
-            next_s = selected_states[:, i]  # s_1, s_2, s_3, s_4
+            next_s = selected_states[:, i+1]  # s_1, s_2, s_3, s_4
 
             # Create state pair (s_i, s_{i+1})
             # Shape: (B, D_state * 2)
@@ -697,3 +698,21 @@ class MyDiffusionModel(nn.Module):
                 model_output, t, sample, generator=generator).prev_sample
 
         return sample  # Returns normalized states
+
+
+def generate_actions_via_diffusion_and_invdyn(
+    diffusion_model: MyDiffusionModel,
+    inv_dyn_model: MlpInvDynamic,
+    model_input_batch: dict[str, torch.Tensor],
+    num_samples: int = 1,
+) -> torch.Tensor:
+    """
+    1) Diffusion → predicted future states
+    2) Inverse‐dynamics → actions
+    Returns normalized actions of shape (B, n_action_steps, A).
+    """
+    # grab the most recent state from your history
+    current_state = model_input_batch["observation.state"][:, -1, :]
+    return diffusion_model.generate_actions_via_inverse_dynamics(
+        model_input_batch, current_state, inv_dyn_model, num_samples=num_samples
+    )
