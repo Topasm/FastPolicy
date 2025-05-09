@@ -12,9 +12,31 @@ from model.critic.multimodal_scorer import MultimodalTrajectoryScorer, Multimoda
 # Import diffusion components to get image encoder and config details
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.diffusion_modules import DiffusionRgbEncoder
+import json  # For loading task mappings
+
+# Helper function to debug tensor issues
+
+
+def check_tensor_health(tensor, name: str):
+    if tensor is None:
+        print(f"DEBUG: {name} is None")
+        return
+    print(
+        f"DEBUG: {name} - Device: {tensor.device}, Shape: {tensor.shape}, Dtype: {tensor.dtype}")
+    if torch.isnan(tensor).any():
+        print(f"!!!!!! ALERT: {name} contains NaNs !!!!!!")
+    if torch.isinf(tensor).any():
+        print(f"!!!!!! ALERT: {name} contains Infs !!!!!!")
 
 
 def main():
+    # Set TensorFloat32 precision for better performance and potential stability
+    if torch.cuda.is_available():
+        # Major version for Volta is 7, Ampere is 8. TF32 is generally supported.
+        if torch.cuda.get_device_capability()[0] >= 7:
+            torch.set_float32_matmul_precision('high')
+            print("Set torch.set_float32_matmul_precision('high')")
+
     output_directory = Path(
         "outputs/train/multimodal_critic_droid")  # New output dir
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -28,7 +50,8 @@ def main():
     # Use the DROID dataset
     dataset_repo_id = "cadene/droid_1.0.1"
     print(f"Loading dataset metadata for: {dataset_repo_id}")
-    dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
+    dataset_metadata = LeRobotDatasetMetadata(
+        dataset_repo_id, root="/media/ahrilab/data/droid_1.0.1/")
     features = dataset_to_policy_features(dataset_metadata.features)
     print("Dataset metadata loaded.")
 
@@ -75,17 +98,7 @@ def main():
     critic_model.train()
     critic_model.to(device)
 
-    # --- Compile Model (PyTorch 2.x+) ---
-    try:
-        # Check if torch.compile is available (PyTorch 2.0+)
-        if hasattr(torch, "compile"):
-            print("Compiling the critic model...")
-            critic_model = torch.compile(critic_model, mode="reduce-overhead")
-            print("Model compiled.")
-        else:
-            print("torch.compile not available. Skipping model compilation.")
-    except Exception as e:
-        print(f"Model compilation failed: {e}")
+    print("Skipping torch.compile for now to check CUDA graph warnings.")
 
     # --- Normalization ---
     # Use stats from the DROID dataset
@@ -103,15 +116,39 @@ def main():
         image_key: [i / dataset_metadata.fps for i in image_indices],
         # Load future state sequence
         "observation.state": [i / dataset_metadata.fps for i in state_indices],
-        # Load language instruction (assuming it's constant for the relevant window)
-        "language_instruction": [lang_instruction_idx / dataset_metadata.fps],
+        # Load task_index (assuming it's constant for the relevant window, using 0-th frame's index)
+        "task_index": [lang_instruction_idx / dataset_metadata.fps],
         # Load actions corresponding to the state sequence for padding mask
         "action": [i / dataset_metadata.fps for i in range(scorer_cfg.max_state_len)],
     }
     print("Initializing dataset...")
-    dataset = LeRobotDataset(
-        dataset_repo_id, delta_timestamps=delta_timestamps)
-    print("Dataset initialized.")
+
+    # Create a custom subclass of LeRobotDataset to handle string data
+    class CustomLeRobotDataset(LeRobotDataset):
+        def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+            result = {}
+            for key, q_idx in query_indices.items():
+                if key in self.meta.video_keys:
+                    # Handle video keys as in the parent class
+                    continue  # Let parent class handle video keys
+                else:
+                    selected_values = self.hf_dataset.select(q_idx)[key]
+                    if any(key.startswith(prefix) for prefix in ["language_instruction", "task_category"]):
+                        # Handle language instructions and other string values without stacking
+                        result[key] = selected_values
+                    else:
+                        # Handle numeric values with stacking
+                        try:
+                            result[key] = torch.stack(selected_values)
+                        except Exception:
+                            # Fallback for any unexpected data types
+                            result[key] = selected_values
+            return result
+
+    # Try a smaller range of episodes that's likely to be within bounds
+    dataset = CustomLeRobotDataset(
+        dataset_repo_id, root="/media/ahrilab/data/droid_1.0.1/", delta_timestamps=delta_timestamps, episodes=list(range(0, 200)))
+    print("Dataset initialized with episodes from 0 to 199")
 
     # --- Optimizer & Dataloader ---
     optimizer = torch.optim.AdamW(
@@ -129,31 +166,87 @@ def main():
     print("Starting Multimodal Critic Model Training...")
     while not done:
         for batch in dataloader:
-            # --- Filter Batch for Valid Language Instructions ---
-            valid_indices = [i for i, lang in enumerate(
-                batch["language_instruction"]) if isinstance(lang, str) and lang.strip()]
-            if not valid_indices:
-                print("Warning: No valid language instructions in this batch, skipping.")
-                continue  # Skip batch if no valid instructions
+            # Handle task_index to get language instructions
+            task_strings_batch = []
+            valid_sample_indices_for_batch = []
 
-            # Create a filtered batch
-            filtered_batch = {}
-            for key, value in batch.items():
-                if isinstance(value, torch.Tensor):
-                    filtered_batch[key] = value[valid_indices]
-                elif isinstance(value, list):
-                    filtered_batch[key] = [value[i] for i in valid_indices]
+            if "task_index" in batch:
+                task_indices_tensor = batch["task_index"]
+                task_indices_list = []  # Initialize to ensure it's defined
+
+                if isinstance(task_indices_tensor, torch.Tensor):
+                    task_indices_list = task_indices_tensor.cpu().flatten().tolist()
+                elif isinstance(task_indices_tensor, list):
+                    processed_indices = []
+                    for ti_val in task_indices_tensor:
+                        if isinstance(ti_val, (list, tuple)) and len(ti_val) > 0:
+                            try:
+                                processed_indices.append(int(ti_val[0]))
+                            except ValueError:
+                                print(
+                                    f"Warning: Could not convert '{ti_val[0]}' to int. Skipping sample.")
+                                continue
+                        elif isinstance(ti_val, (float, int)):
+                            processed_indices.append(int(ti_val))
+                        else:
+                            print(
+                                f"Warning: Unexpected type in task_indices_tensor element: {type(ti_val)}. Skipping sample.")
+                            continue
+                    task_indices_list = processed_indices
                 else:
-                    filtered_batch[key] = value
+                    print(
+                        f"Warning: 'task_index' in batch is not a Tensor or List ({type(task_indices_tensor)}). Skipping batch.")
+                    continue
 
-            B_filtered = len(valid_indices)
-            lang_instructions_filtered = filtered_batch["language_instruction"]
+                for i, task_idx_val in enumerate(task_indices_list):
+                    try:
+                        task_idx_int = int(task_idx_val)  # Ensure it's an int
+                        if task_idx_int in dataset.meta.tasks:
+                            task_strings_batch.append(
+                                dataset.meta.tasks[task_idx_int])
+                            valid_sample_indices_for_batch.append(i)
+                        else:
+                            # print(f"Warning: Task index {task_idx_int} not found in dataset.meta.tasks for sample {i}. Skipping sample.")
+                            pass  # This sample will not be included
+                    except (KeyError, IndexError, ValueError):
+                        # print(f"Warning: Error processing task index {task_idx_val} for sample {i}. Skipping sample.")
+                        continue  # Skip this sample if task_idx is invalid or not found
+
+                if not valid_sample_indices_for_batch:
+                    print(
+                        "Warning: No valid task descriptions found for any sample in this batch (derived from task_index). Skipping batch.")
+                    continue
+
+                # Create a filtered batch
+                filtered_batch = {}
+                for key, value in batch.items():
+                    if key == "task_index":  # task_index has been processed and used to derive language_instruction
+                        continue
+                    # Filter tensors and lists based on valid_sample_indices_for_batch
+                    # Ensure the item's first dimension matches the original number of samples before filtering
+                    if isinstance(value, torch.Tensor) and value.shape[0] == len(task_indices_list):
+                        filtered_batch[key] = value[valid_sample_indices_for_batch]
+                    elif isinstance(value, list) and len(value) == len(task_indices_list):
+                        filtered_batch[key] = [
+                            value[j] for j in valid_sample_indices_for_batch]
+                    # Keep other batch items (e.g., metadata or items not matching batch size like single tensors)
+                    else:
+                        filtered_batch[key] = value
+
+                # This is the key the model expects
+                filtered_batch["language_instruction"] = task_strings_batch
+                batch = filtered_batch
+                B_filtered = len(valid_sample_indices_for_batch)
+                # print(f"Using {B_filtered} samples with task descriptions derived from task_index.")
+
+            else:
+                print(
+                    "Warning: 'task_index' not found in batch. Cannot derive task descriptions. Skipping batch.")
+                continue
 
             # --- Prepare Positive Examples ---
-            state_batch_pos = {
-                "observation.state": filtered_batch["observation.state"]}
-            # Use the chosen image key
-            image_batch_pos = {image_key: filtered_batch[image_key]}
+            state_batch_pos = {"observation.state": batch["observation.state"]}
+            image_batch_pos = {image_key: batch[image_key]}
 
             # Normalize State (Positive)
             norm_state_batch_pos = normalize_state(state_batch_pos)
@@ -175,10 +268,10 @@ def main():
 
             # Prepare Padding Mask (Positive) - Assuming 'action_is_pad' exists
             state_padding_mask_pos = None
-            if "action_is_pad" in filtered_batch:
+            if "action_is_pad" in batch:
                 pad_mask_key = "action_is_pad"
-                if filtered_batch[pad_mask_key].shape[1] >= scorer_cfg.max_state_len:
-                    state_padding_mask_pos = filtered_batch[pad_mask_key][:, :scorer_cfg.max_state_len].to(
+                if batch[pad_mask_key].shape[1] >= scorer_cfg.max_state_len:
+                    state_padding_mask_pos = batch[pad_mask_key][:, :scorer_cfg.max_state_len].to(
                         device)  # (Bf, T_state)
 
             # --- Create Negative Examples (Shuffle State Sequences) ---
@@ -200,20 +293,40 @@ def main():
             # --- Combine Positive and Negative Data ---
             image_features_combined = torch.cat(
                 [image_features_pos, image_features_pos], dim=0)  # (2*Bf, T_img, D_img_feat)
-            lang_instructions_combined = lang_instructions_filtered + \
-                lang_instructions_filtered  # List of length 2*Bf
+            check_tensor_health(image_features_combined,
+                                "image_features_combined")
+
+            # Combine language instructions
+            if "language_instruction" in batch:
+                lang_instructions_combined = batch["language_instruction"] + \
+                    batch["language_instruction"]  # List of length 2*Bf
+            else:
+                # Fall back to empty strings if no language instruction is available
+                empty_instructions = [""] * B_filtered
+                lang_instructions_combined = empty_instructions + empty_instructions
+
+            if step % log_freq == 0 or step == 0:  # Print for first step too
+                print(
+                    f"DEBUG: Sample lang_instructions_combined (first 2): {lang_instructions_combined[:2]}")
+
             state_sequence_combined = torch.cat(
                 [state_sequence_pos, state_sequence_neg], dim=0)  # (2*Bf, T_state, D_state)
+            check_tensor_health(state_sequence_combined,
+                                "state_sequence_combined")
 
             state_padding_mask_combined = None
             if state_padding_mask_pos is not None:
                 state_padding_mask_combined = torch.cat(
                     [state_padding_mask_pos, state_padding_mask_neg], dim=0)  # (2*Bf, T_state)
+                if state_padding_mask_combined is not None:  # Check again as it might be None
+                    check_tensor_health(
+                        state_padding_mask_combined, "state_padding_mask_combined")
 
             labels = torch.cat([
                 torch.ones(B_filtered, device=device),
                 torch.zeros(B_filtered, device=device)
             ], dim=0).float()  # (2*Bf,)
+            check_tensor_health(labels, "labels")
 
             # --- Compute Scores for Combined Batch ---
             state_sequence_combined_unsqueezed = state_sequence_combined.unsqueeze(
@@ -221,17 +334,46 @@ def main():
             state_padding_mask_combined_unsqueezed = state_padding_mask_combined.unsqueeze(
                 1) if state_padding_mask_combined is not None else None
 
-            image_padding_mask = None
+            image_padding_mask = None  # Assuming no image padding mask for now
 
-            predicted_scores_single = critic_model(
-                state_sequences=state_sequence_combined_unsqueezed,
-                image_features=image_features_combined,
-                lang_instruction=lang_instructions_combined,
-                state_padding_mask=state_padding_mask_combined_unsqueezed,
-                image_padding_mask=image_padding_mask,
-            )  # Output shape (2*Bf, 1)
+            if step % log_freq == 0 or step == 0:  # Print for first step too
+                print(f"\n--- Inputs to critic_model (Step {step}) ---")
+                check_tensor_health(
+                    state_sequence_combined_unsqueezed, "state_sequences_input")
+                check_tensor_health(image_features_combined,
+                                    "image_features_input")
+                print(
+                    f"lang_instruction_input (first 5 samples): {lang_instructions_combined[:5]}")
+                if state_padding_mask_combined_unsqueezed is not None:
+                    check_tensor_health(
+                        state_padding_mask_combined_unsqueezed, "state_padding_mask_input")
+                else:
+                    print("DEBUG: state_padding_mask_input is None")
+                if image_padding_mask is not None:  # Should be None based on current code
+                    check_tensor_health(image_padding_mask,
+                                        "image_padding_mask_input")
+                else:
+                    print("DEBUG: image_padding_mask_input is None")
+
+            try:
+                predicted_scores_single = critic_model(
+                    state_sequences=state_sequence_combined_unsqueezed,
+                    image_features=image_features_combined,
+                    lang_instruction=lang_instructions_combined,
+                    state_padding_mask=state_padding_mask_combined_unsqueezed,
+                    image_padding_mask=image_padding_mask,
+                )  # Output shape (2*Bf, 1)
+                check_tensor_health(predicted_scores_single,
+                                    "predicted_scores_single_output")
+            except Exception as e:
+                print(f"Error during critic model forward pass: {e}")
+                print(f"Batch details: state_sequences shape={state_sequence_combined_unsqueezed.shape}, "
+                      f"image_features shape={image_features_combined.shape}, "
+                      f"lang_instruction type={type(lang_instructions_combined)}, len={len(lang_instructions_combined)}")
+                continue
 
             predicted_scores = predicted_scores_single.squeeze(1)  # (2*Bf,)
+            check_tensor_health(predicted_scores, "predicted_scores_squeezed")
 
             # --- Compute Loss ---
             loss = criterion(predicted_scores, labels)
@@ -263,7 +405,6 @@ def main():
     print(f"Training finished. Final critic model saved to: {final_path}")
 
     # --- Save Config and Stats ---
-    import json
     config_dict = scorer_cfg.__dict__
     with open(output_directory / "config.json", "w") as f:
         json.dump(config_dict, f, indent=4)
