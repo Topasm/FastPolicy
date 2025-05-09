@@ -22,6 +22,7 @@ import numpy
 import torch
 import safetensors
 import einops
+import json
 
 # Import necessary components
 # Import PreTrainedConfig base class
@@ -31,6 +32,7 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.invdynamics.invdyn import MlpInvDynamic
 from model.critic.critic_model import CriticScorer
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import populate_queues
 
@@ -52,42 +54,34 @@ def main():
     output_directory = Path("outputs/eval/combined_policy")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_critic = True  # Set to False to disable critic-based sample selection
+    use_critic = False  # Set to False to disable critic-based sample selection
     # Number of state sequences to sample (if > 1 and use_critic=True)
     num_inference_samples = 8
 
     # --- Load Config and Stats ---
-    config_path = config_stats_path / "config.json"  # Load from specified path
-    if not config_path.is_file():
-        # If not found, try loading from invdyn dir as fallback
-        config_path = invdyn_output_dir / "config.json"
-        if not config_path.is_file():
-            # If still not found, try loading from critic dir
-            config_path = critic_output_dir / "config.json"
-            if not config_path.is_file():
-                raise OSError(
-                    f"config.json not found in specified paths: {config_stats_path}, {invdyn_output_dir}, {critic_output_dir}")
-        # Update config_stats_path if found elsewhere
-        config_stats_path = config_path.parent
+    config_path = config_stats_path
+
+    cfg_path = Path(config_stats_path) / "config.json"
+    data = json.loads(cfg_path.read_text())
+    cfg = DiffusionConfig(**data)
 
     # Load config using the base class method
     # This relies on "policy_name": "mydiffusion" being present in config.json
     # and DiffusionConfig being registered correctly.
-    cfg = PreTrainedConfig.from_json_file(config_path)
-    # Check if the loaded config is actually the expected type (optional but good practice)
-    if not isinstance(cfg, DiffusionConfig):
-        print(
-            f"Warning: Loaded config type is {type(cfg)}, expected DiffusionConfig. Check 'policy_name' in config.json.")
+    cfg = DiffusionConfig.from_pretrained(config_path)
 
     cfg.device = device  # Override device if needed
 
     # Load from the same dir as config
     stats_path = config_stats_path / "stats.safetensors"
-    if not stats_path.is_file():
-        raise OSError(
-            f"stats.safetensors not found in {config_stats_path}")
-    with safetensors.safe_open(stats_path, framework="pt", device="cpu") as f:
-        dataset_stats = {k: f.get_tensor(k) for k in f.keys()}
+
+    metadataset_stats = LeRobotDatasetMetadata("lerobot/pusht")
+    dataset_stats: dict[str, dict[str, torch.Tensor]] = {}
+    for key, stat in metadataset_stats.stats.items():
+        dataset_stats[key] = {
+            subkey: torch.as_tensor(subval, dtype=torch.float32, device=device)
+            for subkey, subval in stat.items()
+        }
 
     # --- Load Models ---
     # Diffusion Model
@@ -223,112 +217,41 @@ def main():
                 # Get the very last state (t=0 relative to window)
                 # State queue has [s_{-1}, s_{0}] for n_obs=2. We need s_0.
                 # Get the last state in the history
-                norm_current_state = model_input_batch["observation.state"][:, -1, :]
+                current_state = model_input_batch["observation.state"][:, 0, :]
+                num_samples = getattr(data, "num_inference_samples", 1)
+                actions = diffusion_model.generate_actions_via_inverse_dynamics(
+                    model_input_batch,  # Pass normalized batch
+                    current_state,     # Pass normalized state
+                    inv_dyn_model,
+                    num_samples=num_samples,
+                )
 
-                # Generate future states using Diffusion Model
-                with torch.no_grad():
-                    # Prepare conditioning
-                    global_cond = diffusion_model._prepare_global_conditioning(
-                        model_input_batch)
+                actions_unnormalized = unnormalize_action_output(
+                    {"action": actions})["action"]
 
-                    # Repeat global_cond if sampling multiple sequences
-                    eff_num_samples = num_inference_samples if use_critic and critic_model else 1
-                    if eff_num_samples > 1:
-                        global_cond = global_cond.repeat_interleave(
-                            eff_num_samples, dim=0)
+        queues["action"].extend(actions_unnormalized.transpose(0, 1))
+        action = queues["action"].popleft()
 
-                    # Sample future state sequences
-                    predicted_states_flat = diffusion_model.conditional_sample(
-                        batch_size=1 * eff_num_samples,  # B=1 for eval
-                        global_cond=global_cond
-                    )  # (B*N, H, D_state)
+        numpy_action = action.squeeze(0).to("cpu").numpy()
 
-                    # Reshape and select best sample if using critic
-                    if eff_num_samples > 1:
-                        predicted_states = einops.rearrange(
-                            predicted_states_flat, "(b n) h d -> b n h d", b=1, n=eff_num_samples
-                        )  # (1, N, H, D_state)
-
-                        # Score sequences with critic
-                        scores = critic_model.score_sequences(
-                            predicted_states.squeeze(0))  # Input (N, H, D), Output (N, 1)
-                        best_sample_idx = torch.argmax(scores)
-                        # (1, H, D_state)
-                        selected_states = predicted_states[:, best_sample_idx]
-                        print(
-                            f"Critic selected sample {best_sample_idx.item()} with score {scores[best_sample_idx].item():.4f}")
-                    else:
-                        selected_states = predicted_states_flat.unsqueeze(
-                            0)  # (1, H, D_state) if B=1, N=1
-
-                    # Iteratively predict actions using Inverse Dynamics Model
-                    predicted_actions = []
-                    current_s = norm_current_state  # s_0 (normalized)
-                    for i in range(cfg.n_action_steps):  # Predict n_action_steps actions
-                        # Check if we need more states than predicted
-                        if i >= selected_states.shape[1]:
-                            print(
-                                f"Warning: Requested {cfg.n_action_steps} actions, but only {selected_states.shape[1]} states predicted. Stopping action prediction.")
-                            break
-                        next_s = selected_states[:, i]  # s_{i+1} (normalized)
-
-                        state_pair = torch.cat(
-                            [current_s, next_s], dim=-1)  # (1, D_state * 2)
-                        action_i = inv_dyn_model.predict(
-                            state_pair)  # (1, D_action) (normalized)
-                        predicted_actions.append(action_i)
-                        current_s = next_s  # Update for next iteration
-
-                    if not predicted_actions:
-                        raise RuntimeError(
-                            "No actions were predicted. Check state sequence length and n_action_steps.")
-
-                    actions_normalized = torch.cat(
-                        predicted_actions, dim=0)  # (n_actions, D_action)
-
-                    # Unnormalize actions
-                    actions_unnormalized = unnormalize_action_output(
-                        # Add batch dim for unnorm
-                        {"action": actions_normalized.unsqueeze(0)}
-                    )["action"].squeeze(0)  # Remove batch dim -> (n_actions, D_action)
-
-                    # Add predicted actions to the action queue
-                    # Need to transpose? No, extend expects individual items.
-                    for action_tensor in actions_unnormalized:
-                        queues["action"].append(action_tensor)
-
-            # Pop the next action from the queue if available
-            if queues["action"]:
-                action_tensor = queues["action"].popleft()
-                numpy_action = action_tensor.to("cpu").numpy()
-            # If queue was empty and still is (e.g., waiting for obs), numpy_action remains from previous step or sample
-            elif 'numpy_action' not in locals():
-                print("Action queue empty, sampling random action.")
-                numpy_action = env.action_space.sample()
-
-        # --- Step Environment ---
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
-        print(
-            f"Step: {step}, Reward: {reward:.4f}, Terminated: {terminated}, Truncated: {truncated}")
+        print(f"{step=} {reward=} {terminated=}")
 
         rewards.append(reward)
         frames.append(env.render())
 
-        done = terminated | truncated
+        done = terminated or truncated or done
         step += 1
-
-    # --- Log Results ---
     if terminated:
         print("Success!")
     else:
         print("Failure!")
 
-    total_reward = sum(rewards)
-    print(f"Total Steps: {step}")
-    print(f"Total Reward: {total_reward:.4f}")
-
+    # Get the speed of environment (i.e. its number of frames per second).
     fps = env.metadata["render_fps"]
+
+    # Encode all frames into a mp4 video.
     video_path = output_directory / "rollout.mp4"
     imageio.mimsave(str(video_path), numpy.stack(frames), fps=fps)
     print(f"Video of the evaluation is available in '{video_path}'.")
