@@ -227,8 +227,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
                     model_input_batch[key] = torch.stack(queue_list, dim=1)
 
             # Get the very last state (already normalized)
-            current_state = model_input_batch["observation.state"][:,
-                                                                   0, :]
+            current_state = model_input_batch["observation.state"][:, 0, :]
             num_samples = getattr(self.config, "num_inference_samples", 1)
 
             # Pass normalized batch and state to generation function

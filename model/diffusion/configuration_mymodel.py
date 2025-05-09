@@ -84,7 +84,7 @@ class DiffusionConfig(PreTrainedConfig):
         critic_hidden_dim: Hidden dimension for the critic MLP.
         do_mask_loss_for_padding: Whether to mask loss for padded targets (actions or states).
     """
-
+    type: str = field(init=True, default="mydiffusion")
     # Prediction mode
     predict_state: bool = False
 

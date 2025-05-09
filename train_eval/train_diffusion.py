@@ -14,7 +14,7 @@ def main():
     output_directory = Path("outputs/train/diffusion_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 5000  # Adjust as needed
+    training_steps = 500  # Adjust as needed
     log_freq = 10
     save_freq = 500  # Frequency to save checkpoints
 
@@ -129,7 +129,7 @@ def main():
     cfg.save_pretrained(output_directory)
     # Filter stats to include only tensors
     stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items() if isinstance(v, torch.Tensor)}
+        k: v for k, v in dataset_metadata.stats.items()}
     safetensors.torch.save_file(
         stats_to_save, output_directory / "stats.safetensors")
     print(f"Config and stats saved to: {output_directory}")
