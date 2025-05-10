@@ -31,133 +31,7 @@ from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.utils import populate_queues
-
-
-# Custom helper function to handle both MLP and Sequential inverse dynamics models
-def generate_actions_with_invdyn(
-    diffusion_model,
-    inv_dyn_model,
-    norm_batch,
-    norm_current_state,
-    use_seq_model=False,
-    seq_length=3,
-    num_inference_samples=1
-):
-    """Generate actions using diffusion model for state prediction and inverse dynamics for action prediction.
-
-    Args:
-        diffusion_model: The diffusion model instance
-        inv_dyn_model: The inverse dynamics model (either MLP or Sequential)
-        norm_batch: Normalized batch dictionary with observation history
-        norm_current_state: Current normalized state
-        use_seq_model: Whether the inverse dynamics model is sequential
-        seq_length: Length of state sequence for sequential model
-        num_inference_samples: Number of diffusion samples to generate
-
-    Returns:
-        Tensor of shape [B, n_action_steps, action_dim] with normalized actions
-    """
-    batch_size = norm_current_state.shape[0]
-    device = norm_current_state.device
-    n_action_steps = diffusion_model.config.n_action_steps  # This is typically 4
-
-    # Prepare conditioning from the normalized batch
-    global_cond = diffusion_model._prepare_global_conditioning(norm_batch)
-
-    # Repeat global_cond if num_inference_samples > 1
-    if num_inference_samples > 1:
-        global_cond = global_cond.repeat_interleave(
-            num_inference_samples, dim=0)
-
-    # Sample normalized future states
-    predicted_states_flat = diffusion_model.conditional_sample(
-        batch_size * num_inference_samples, global_cond=global_cond
-    )  # Output: (B*N, horizon, D_state)
-
-    predicted_states = einops.rearrange(
-        predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_inference_samples
-    )
-
-    # Always select the first sample if multiple are generated
-    selected_states = predicted_states[:, 0]  # (B, horizon, D_state)
-
-    # Iteratively predict actions
-    predicted_actions = []
-
-    if use_seq_model:
-        # For sequential model, prepare sequence of states for each action prediction
-        for i in range(n_action_steps):
-            # For each action i, we need states from i-seq_length+1 to i+1
-            # First gather history states that we need
-            states_seq = []
-
-            # Get the required states for the sequence
-            # We need seq_length states including the next state to predict an action
-
-            # Add states from history if needed (already available in norm_current_state and norm_batch)
-            if i < seq_length - 1:
-                history_states_needed = seq_length - 1 - i
-                # Get states from history
-                if "observation.state" in norm_batch and norm_batch["observation.state"].shape[1] >= history_states_needed:
-                    history_states = norm_batch["observation.state"][:, -
-                                                                     history_states_needed:, :]
-                    states_seq.append(history_states)
-
-                # Add current state
-                states_seq.append(norm_current_state.unsqueeze(1))
-
-            # Add already predicted future states
-            future_states_needed = min(i + 1, seq_length - 1)
-            if future_states_needed > 0:
-                future_states = selected_states[:, :future_states_needed, :]
-                states_seq.append(future_states)
-
-            # Add the next state for which we want to predict action
-            next_state = selected_states[:, i, :].unsqueeze(1)
-            states_seq.append(next_state)
-
-            # Concatenate all states in sequence
-            # [B, seq_length, D_state]
-            state_seq = torch.cat(states_seq, dim=1)
-
-            # Ensure we have the right sequence length
-            if state_seq.shape[1] != seq_length:
-                # Pad or trim if necessary
-                if state_seq.shape[1] < seq_length:
-                    # Pad by repeating the first state
-                    pad_length = seq_length - state_seq.shape[1]
-                    padding = state_seq[:, :1, :].repeat(1, pad_length, 1)
-                    state_seq = torch.cat([padding, state_seq], dim=1)
-                else:
-                    # Trim to keep the most recent states
-                    state_seq = state_seq[:, -seq_length:, :]
-
-            # Predict action using sequential model
-            action_i = inv_dyn_model.predict(state_seq)
-            # Get the final output for this position
-            action_i = action_i[:, -1, :]  # Shape: [B, action_dim]
-            predicted_actions.append(action_i)
-    else:
-        # Original MLP approach using state pairs
-        current_s = norm_current_state  # s_0
-        for i in range(n_action_steps):
-            next_s = selected_states[:, i]  # s_1, s_2, s_3, s_4
-
-            # Create state pair for MLP model
-            state_pair = torch.cat([current_s, next_s], dim=-1)
-
-            # Predict action
-            action_i = inv_dyn_model.predict(state_pair)
-            predicted_actions.append(action_i)
-
-            # Update current state for next iteration
-            current_s = next_s
-
-    # Stack the predicted actions
-    actions_to_execute = torch.stack(
-        predicted_actions, dim=1)  # Shape: (B, n_action_steps, action_dim)
-
-    return actions_to_execute
+from model.invdynamics.evaluation_utils import generate_actions_with_enhanced_invdyn
 
 
 def main():
@@ -285,35 +159,35 @@ def main():
             raise OSError(
                 f"Inverse dynamics checkpoint not found at {invdyn_ckpt_path} or any alternative locations in {invdyn_output_dir}")
 
-    # Initialize the appropriate model type
+    # Check if we're using a regular MLP or sequential model instead of enhanced model
     if use_seq_model:
         print(
-            f"Using sequential inverse dynamics model with {seq_length} state context")
-        # Use the number of layers from command line
-        print(f"Using GRU with {gru_layers} layers")
+            f"Using sequential inverse dynamics model with {seq_length} sequence length")
         inv_dyn_model = SeqInvDynamic(
             state_dim=cfg.robot_state_feature.shape[0],
             action_dim=cfg.action_feature.shape[0],
-            hidden_dim=cfg.inv_dyn_hidden_dim,
+            hidden_dim=512,  # Use default from training
             n_layers=gru_layers,
             dropout=0.1,
-            out_activation=torch.nn.Tanh()  # Match the MLP model's output activation
+            out_activation=torch.nn.Tanh()
         )
     else:
-        print("Using MLP inverse dynamics model")
+        print("Using standard MLP inverse dynamics model")
         inv_dyn_model = MlpInvDynamic(
+            # For (current, next) state pairs
             o_dim=cfg.robot_state_feature.shape[0] * 2,
             a_dim=cfg.action_feature.shape[0],
-            hidden_dim=cfg.inv_dyn_hidden_dim,
+            hidden_dim=512,  # Use default from training
             dropout=0.1,
             use_layernorm=True,
-            out_activation=torch.nn.Tanh(),
+            out_activation=torch.nn.Tanh()
         )
 
-    print(f"Loading invdyn state dict from: {invdyn_ckpt_path}")
+    # Load model weights
+    print(f"Loading inverse dynamics weights from {invdyn_ckpt_path}")
     inv_state_dict = torch.load(invdyn_ckpt_path, map_location="cpu")
 
-    # Add debug option to print model and state dict structure
+    # Debug model loading
     debug_model_loading = True
     if debug_model_loading:
         print("\n--- Model Structure Debug ---")
@@ -325,14 +199,13 @@ def main():
             print(f"  {key}")
         print("---------------------------\n")
 
+    # Load the weights
     try:
         inv_dyn_model.load_state_dict(inv_state_dict)
-    except RuntimeError as e:
-        print(f"Error loading state dict: {e}")
-        # Attempt to load with strict=False which will ignore missing/unexpected keys
-        print("Attempting to load with strict=False...")
-        inv_dyn_model.load_state_dict(inv_state_dict, strict=False)
-        print("Model loaded with non-strict matching. Some weights may not be used.")
+        print("Successfully loaded inverse dynamics checkpoint")
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        print("Using initialized model weights")
 
     inv_dyn_model.eval()
     inv_dyn_model.to(device)
@@ -453,14 +326,12 @@ def main():
                 # Get the last state in the history
                 current_state = model_input_batch["observation.state"][:, 0, :]
 
-                # Use our custom helper function that supports both model types
-                actions = generate_actions_with_invdyn(
+                # Generate actions using enhanced inverse dynamics model
+                actions = generate_actions_with_enhanced_invdyn(
                     diffusion_model,
                     inv_dyn_model,
                     model_input_batch,
                     current_state,
-                    use_seq_model=use_seq_model,
-                    seq_length=seq_length,
                     num_inference_samples=num_inference_samples,
                 )
 
