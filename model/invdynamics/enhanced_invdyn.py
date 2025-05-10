@@ -11,6 +11,20 @@ def get_default_init_scale(weight_tensor, scale=1.0):
     return -bound, bound
 
 
+def ogb_get_default_init_unif_a(weight_tensor, scale=1.0):
+    """Computes the bound for uniform initialization as in OGB code.
+
+    Args:
+        weight_tensor: The weight tensor to initialize
+        scale: Scaling factor for the bound (default: 1.0)
+
+    Returns:
+        float: The bound value for uniform initialization
+    """
+    fan_in = weight_tensor.shape[1]  # Input dimension
+    return 1.0 / (fan_in ** 0.5) * scale
+
+
 class CustomMLP(nn.Module):
     """Customizable MLP backbone similar to OgB_MLP."""
 

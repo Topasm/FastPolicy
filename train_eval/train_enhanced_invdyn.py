@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--batch_size", type=int,
                         default=64, help="Training batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--steps", type=int, default=500,
+    parser.add_argument("--steps", type=int, default=2000,
                         help="Number of training steps")
     parser.add_argument("--log_freq", type=int, default=10,
                         help="Logging frequency (steps)")
