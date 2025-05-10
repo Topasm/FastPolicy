@@ -94,12 +94,24 @@ class MlpInvDynamic(nn.Module):
 
 
 class SeqInvDynamic(nn.Module):
+    """GRU-based sequential inverse dynamics model.
+
+    Args:
+        state_dim: int, dimension of each state vector
+        action_dim: int, dimension of the action vector
+        hidden_dim: int, hidden size (default: 128)
+        n_layers: int, number of GRU layers (default: 1)
+        dropout: float, dropout probability (default: 0.1)
+        out_activation: nn.Module, activation on final layer (default: nn.Tanh())
+    """
+
     def __init__(self,
                  state_dim: int,
                  action_dim: int,
                  hidden_dim: int = 128,
                  n_layers: int = 1,
                  dropout: float = 0.1,
+                 out_activation: nn.Module = nn.Tanh(),
                  ):
         super().__init__()
 
@@ -119,6 +131,10 @@ class SeqInvDynamic(nn.Module):
 
         # now head & weight init as before
         self.head = nn.Linear(hidden_dim, action_dim)
+
+        # Store the output activation function
+        self.out_activation = out_activation
+
         # Initialize head weights AFTER removing the GRU parameter manipulation
         # The self.modules() call might behave differently otherwise.
         for m in self.modules():
@@ -128,7 +144,8 @@ class SeqInvDynamic(nn.Module):
 
     def forward(self, obs_seq: torch.Tensor) -> torch.Tensor:
         gru_out, _ = self.gru(obs_seq)
-        return self.head(gru_out)
+        # Apply activation to constrain output range
+        return self.out_activation(self.head(gru_out))
 
     @torch.no_grad()
     def predict(self, obs_seq: torch.Tensor) -> torch.Tensor:

@@ -49,7 +49,8 @@ def main():
             action_dim=features["action"].shape[0],
             hidden_dim=cfg.inv_dyn_hidden_dim,
             n_layers=2,  # Can increase for more capacity
-            dropout=0.1
+            dropout=0.1,
+            out_activation=torch.nn.Tanh()  # Use same activation as MlpInvDynamic
         )
     else:
         # Original MLP model (for comparison)

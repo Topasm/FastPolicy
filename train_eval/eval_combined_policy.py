@@ -296,7 +296,8 @@ def main():
             action_dim=cfg.action_feature.shape[0],
             hidden_dim=cfg.inv_dyn_hidden_dim,
             n_layers=gru_layers,
-            dropout=0.1
+            dropout=0.1,
+            out_activation=torch.nn.Tanh()  # Match the MLP model's output activation
         )
     else:
         print("Using MLP inverse dynamics model")
