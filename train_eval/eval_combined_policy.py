@@ -219,6 +219,8 @@ def main():
                 # Get the last state in the history
                 current_state = model_input_batch["observation.state"][:, 0, :]
                 num_samples = getattr(data, "num_inference_samples", 1)
+
+                # Pass normalized batch and state to the model
                 actions = diffusion_model.generate_actions_via_inverse_dynamics(
                     model_input_batch,  # Pass normalized batch
                     current_state,     # Pass normalized state
@@ -229,10 +231,32 @@ def main():
                 actions_unnormalized = unnormalize_action_output(
                     {"action": actions})["action"]
 
-        queues["action"].extend(actions_unnormalized.transpose(0, 1))
-        action = queues["action"].popleft()
+                # Convert actions_unnormalized to a list of individual action tensors
+                # The tensor is of shape [B, n_action_steps, action_dim]
+                # We need to extract each action and store it separately in the queue
+                actions_list = []
+                for i in range(actions_unnormalized.shape[1]):
+                    # Create a new tensor for each action to ensure they're distinct objects
+                    action_tensor = actions_unnormalized[0, i].clone()
+                    actions_list.append(action_tensor)
 
-        numpy_action = action.squeeze(0).to("cpu").numpy()
+                # Clear previous actions and add the new ones
+                queues["action"].clear()  # Clear any old actions
+
+                # Add each action tensor as a separate entry in the queue
+                for i, action_tensor in enumerate(actions_list):
+                    queues["action"].append(action_tensor)
+
+                print(
+                    f"Added {len(actions_list)} actions to queue. Queue now has {len(queues['action'])} actions.")
+
+        # Get the next action from the queue, if empty, skip this step
+        if len(queues["action"]) > 0:
+            action = queues["action"].popleft()
+            numpy_action = action.to("cpu").numpy()
+        else:
+            print("WARNING: Action queue is empty! Using random action.")
+            numpy_action = env.action_space.sample()
 
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)

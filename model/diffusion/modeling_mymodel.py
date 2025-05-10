@@ -629,25 +629,36 @@ class MyDiffusionModel(nn.Module):
 
         # Create previous and current states for pairs
         # s_prev: s_{-1} to s_{H-1} (or s_{n_obs+H-2}). Shape: (B, expected_len-1, D_state)
-        s_prev = all_states[:, :-1, :]
+        s_prev = all_states[:, :-1, :]  # All states except the last one
         # s_curr: s_{0} to s_{H} (or s_{n_obs+H-1}). Shape: (B, expected_len-1, D_state)
-        s_curr = all_states[:, 1:, :]
+        s_curr = all_states[:, 1:, :]  # All states except the first one
 
         # Shape: (B, expected_len-1, D_state * 2)
         state_pairs = torch.cat([s_prev, s_curr], dim=-1)
 
-        # We only need the first H pairs corresponding to t=0..H-1 for loss calculation
+        # We only need the pairs corresponding to t=0..H-1 for loss calculation
         # These are pairs (s_0, s_1) ... (s_{H-1}, s_H)
         # The index for t=0 in state_pairs is n_obs_steps - 1
         start_pair_idx = n_obs_steps - 1
-        end_pair_idx = start_pair_idx + horizon
+        # We need to make sure we don't go beyond available action data
+        # Since actions are [0...15] but states go to [17], we need to limit the horizon
+        action_horizon = min(horizon, len(self.config.action_delta_indices))
+        end_pair_idx = start_pair_idx + action_horizon
+
+        # Check if our indices would be in range
+        if start_pair_idx >= state_pairs.shape[1] or end_pair_idx > state_pairs.shape[1]:
+            raise ValueError(
+                f"Invalid indices for state_pairs with shape {state_pairs.shape}. "
+                f"start_pair_idx={start_pair_idx}, end_pair_idx={end_pair_idx}"
+            )
+
         # Shape: (B, H, D_state * 2)
         state_pairs_for_loss = state_pairs[:, start_pair_idx:end_pair_idx, :]
 
         B, H, D_pair = state_pairs_for_loss.shape
-        if H != horizon:
+        if H != action_horizon:  # Compare with action_horizon instead of horizon
             raise ValueError(
-                f"Sliced state_pairs_for_loss has wrong horizon {H}, expected {horizon}")
+                f"Sliced state_pairs_for_loss has wrong horizon {H}, expected {action_horizon}")
 
         state_pairs_flat = state_pairs_for_loss.reshape(
             B * H, D_pair)  # Use reshape instead of view
@@ -656,11 +667,25 @@ class MyDiffusionModel(nn.Module):
         pred_actions = pred_actions_flat.view(
             B, H, self.action_dim)  # Shape: (B, H, A)
 
+        # Get the actions that correspond to the state pairs we're using for loss
+        # These are actions a_0 to a_{H-1}
+        # Make sure we're using the limited action_horizon here
+        # Shape: (B, H, A)
         true_actions = invdyn_batch["action"][:,
-                                              :horizon, :]  # Shape: (B, H, A)
+                                              n_obs_steps:n_obs_steps+action_horizon, :]
 
-        if self.config.do_mask_loss_for_padding:
-            mask = ~invdyn_batch["action_is_pad"][:, :horizon]  # Shape: (B, H)
+        # Ensure shapes match exactly - this can happen if state horizon > action horizon
+        if pred_actions.shape[1] != true_actions.shape[1]:
+            # Adjust pred_actions to match true_actions
+            pred_actions = pred_actions[:, :true_actions.shape[1], :]
+
+        if self.config.do_mask_loss_for_padding and "action_is_pad" in invdyn_batch:
+            # Make sure to use the correct slice of action_is_pad that corresponds to our true_actions
+            pad_mask = invdyn_batch["action_is_pad"][:,
+                                                     n_obs_steps-1:n_obs_steps-1+action_horizon]
+            pad_mask = pad_mask[:, :true_actions.shape[1]]  # Ensure same shape
+            # Invert the mask: 0 for padding, 1 for valid
+            mask = ~pad_mask  # Shape: (B, H)
             loss_e = F.mse_loss(pred_actions, true_actions,
                                 reduction="none")  # Shape: (B, H, A)
             loss_e = loss_e * mask.unsqueeze(-1)

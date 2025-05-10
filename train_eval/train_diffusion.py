@@ -8,13 +8,14 @@ from lerobot.common.policies.normalize import Normalize
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from lerobot.configs.types import FeatureType
+import numpy
 
 
 def main():
     output_directory = Path("outputs/train/diffusion_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 500  # Adjust as needed
+    training_steps = 5000  # Adjust as needed
     log_freq = 10
     save_freq = 500  # Frequency to save checkpoints
 
@@ -127,9 +128,17 @@ def main():
 
     # --- Save Config and Stats ---
     cfg.save_pretrained(output_directory)
-    # Filter stats to include only tensors
-    stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items()}
+
+    # Convert stats to flat dictionary with only tensors (like in train_invdyn.py)
+    stats_to_save = {}
+    for key, value in dataset_metadata.stats.items():
+        if isinstance(value, torch.Tensor) or isinstance(value, numpy.ndarray):
+            # Convert numpy arrays to tensors if needed
+            if isinstance(value, numpy.ndarray):
+                value = torch.from_numpy(value)
+            stats_to_save[key] = value
+        # Skip nested dictionaries instead of trying to process them
+
     safetensors.torch.save_file(
         stats_to_save, output_directory / "stats.safetensors")
     print(f"Config and stats saved to: {output_directory}")
