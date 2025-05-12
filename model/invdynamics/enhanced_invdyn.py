@@ -253,12 +253,14 @@ class EnhancedInvDynamic(nn.Module):
             # Compute negative log likelihood
             log_prob = pred_dist.log_prob(target_action)
             loss = -log_prob.mean()
+            # Save the scalar value, but keep 'loss' as a tensor
             info = {"neg_log_likelihood": loss.item()}
         else:
             # Get predicted action
             pred_action = self.forward(curr_state, next_state)
             # Compute MSE loss
             loss = F.mse_loss(pred_action, target_action)
+            # Save the scalar value, but keep 'loss' as a tensor
             info = {"mse": loss.item()}
 
         return loss, info

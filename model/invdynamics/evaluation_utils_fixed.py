@@ -88,14 +88,11 @@ def generate_actions_with_enhanced_invdyn(
         # Shape: [batch, state_dim]
         first_future_state = predicted_states_flat[:, 1, :]
 
-    # Handle first future state for both single and multiple samples
+    # If we have multiple samples, we need to handle them
     if num_inference_samples > 1:
         # Reshape to [batch*samples, state_dim] for initial action prediction
         future_state = first_future_state.reshape(
             -1, first_future_state.shape[-1])
-    else:
-        # For single sample case, use the first future state directly
-        future_state = first_future_state  # [batch, state_dim]
 
     # Determine the action dimension
     action_dim = 2  # Default for PushT environment

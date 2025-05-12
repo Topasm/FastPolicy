@@ -27,6 +27,7 @@ import json
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic
+from model.invdynamics.enhanced_invdyn import EnhancedInvDynamic
 from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.common.policies.normalize import Normalize, Unnormalize
@@ -40,7 +41,7 @@ def main():
         description="Evaluate combined diffusion and inverse dynamics policy")
     parser.add_argument("--diffusion_dir", type=str, default="outputs/train/diffusion_only",
                         help="Directory containing the diffusion model checkpoint")
-    parser.add_argument("--invdyn_dir", type=str, default="outputs/train/invdyn_only",
+    parser.add_argument("--invdyn_dir", type=str, default="outputs/train/enhanced_invdyn",
                         help="Directory containing the inverse dynamics model checkpoint")
     parser.add_argument("--critic_dir", type=str, default="outputs/train/critic_only",
                         help="Directory containing the critic model checkpoint")
@@ -54,8 +55,10 @@ def main():
                         help="Number of GRU layers for sequential model")
     parser.add_argument("--use_critic", action="store_true", default=False,
                         help="Use critic model for sample selection")
-    parser.add_argument("--num_samples", type=int, default=8,
-                        help="Number of diffusion samples to generate")
+    parser.add_argument("--num_samples", type=int, default=1,
+                        help="Number of diffusion samples to generate (1 for standard evaluation, >1 for multi-sampling)")
+    parser.add_argument("--generate_action_sequence", action="store_true", default=False,
+                        help="Generate action sequences for the full trajectory instead of just the first action")
 
     args = parser.parse_args()
 
@@ -76,7 +79,8 @@ def main():
     if use_seq_model:
         invdyn_ckpt_name = f"invdyn_seq_seq{seq_length}_final.pth"
     else:
-        invdyn_ckpt_name = "invdyn_final.pth"  # Original MLP model checkpoint name
+        # Original MLP model checkpoint name
+        invdyn_ckpt_name = "invdyn_enhanced_final.pth"
 
     # Assume config.json and stats.safetensors are available, e.g., copied from dataset or saved during training.
     # Let's try loading them from the diffusion output directory first.
@@ -88,8 +92,14 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_critic = args.use_critic  # Use the command-line arg
-    # Number of state sequences to sample (if > 1 and use_critic=True)
-    num_inference_samples = args.num_samples
+
+    # For evaluation without critic, one sample is sufficient
+    # Only use multiple samples when the critic is enabled for selection
+    num_inference_samples = 1 if not use_critic else args.num_samples
+
+    # Override with command line argument if specified
+    if args.num_samples > 1:
+        num_inference_samples = args.num_samples
 
     # --- Load Config and Stats ---
     config_path = config_stats_path
@@ -159,8 +169,29 @@ def main():
             raise OSError(
                 f"Inverse dynamics checkpoint not found at {invdyn_ckpt_path} or any alternative locations in {invdyn_output_dir}")
 
-    # Check if we're using a regular MLP or sequential model instead of enhanced model
-    if use_seq_model:
+    # Load the state dict first to check its keys
+    print(f"Loading inverse dynamics weights from {invdyn_ckpt_path}")
+    inv_state_dict = torch.load(invdyn_ckpt_path, map_location="cpu")
+
+    # Check if we're dealing with an enhanced inverse dynamics model
+    is_enhanced_model = any(key.startswith(
+        ("goal_encoder", "feature_net", "mean_net")) for key in inv_state_dict.keys())
+
+    # Create the appropriate model based on the checkpoint and args
+    if is_enhanced_model:
+        print("Detected Enhanced Inverse Dynamics model from checkpoint")
+        state_dim = cfg.robot_state_feature.shape[0]
+        action_dim = cfg.action_feature.shape[0]
+        inv_dyn_model = EnhancedInvDynamic(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dims=[512, 512, 512, 512],  # Default architecture
+            is_probabilistic=False,
+            use_state_encoding=True,
+            temperature=0.1,
+            out_activation=torch.nn.Tanh(),
+        )
+    elif use_seq_model:
         print(
             f"Using sequential inverse dynamics model with {seq_length} sequence length")
         inv_dyn_model = SeqInvDynamic(
@@ -182,10 +213,6 @@ def main():
             use_layernorm=True,
             out_activation=torch.nn.Tanh()
         )
-
-    # Load model weights
-    print(f"Loading inverse dynamics weights from {invdyn_ckpt_path}")
-    inv_state_dict = torch.load(invdyn_ckpt_path, map_location="cpu")
 
     # Debug model loading
     debug_model_loading = True
@@ -243,7 +270,7 @@ def main():
     env = gym.make(
         "gym_pusht/PushT-v0",
         obs_type="pixels_agent_pos",  # Ensure this matches config expectations
-        max_episode_steps=1000,
+        max_episode_steps=100,
     )
 
     # --- Queues for History ---
@@ -277,6 +304,12 @@ def main():
         print("Using critic for trajectory selection")
     else:
         print("Not using critic (taking first sample)")
+
+    # Print action generation mode configuration
+    if args.generate_action_sequence:
+        print("Using enhanced mode: generating action sequences for the full trajectory")
+    else:
+        print("Using standard mode: generating single actions for each planning step")
     print("Output will be saved to", output_directory)
     while not done:
         # --- Prepare Observation ---
@@ -321,31 +354,160 @@ def main():
                         # Stack along time dimension (dim=1)
                         model_input_batch[key] = torch.stack(queue_list, dim=1)
 
-                # Get the very last state (t=0 relative to window)
-                # State queue has [s_{-1}, s_{0}] for n_obs=2. We need s_0.
-                # Get the last state in the history
+                # Get the current state (most recent in the queue)
+                # State queue has [s_0, s_1] for n_obs=2, where s_0 is the current state.
+                # We need s_0 (most recent state) for current_state
                 current_state = model_input_batch["observation.state"][:, 0, :]
 
+                print(f"Current state shape: {current_state}")
+
+                # Log actual sampling configuration
+                print(
+                    f"Sampling {num_inference_samples} trajectory{'s' if num_inference_samples > 1 else ''} for action planning...")
+
                 # Generate actions using enhanced inverse dynamics model
+                # Use the command-line parameter to determine whether to generate action sequences
                 actions = generate_actions_with_enhanced_invdyn(
                     diffusion_model,
                     inv_dyn_model,
                     model_input_batch,
                     current_state,
                     num_inference_samples=num_inference_samples,
+                    generate_action_sequence=args.generate_action_sequence
                 )
 
+                # Print shape for debugging
+                print(f"Received actions with shape: {actions.shape}")
+
+                # Handle both original single action and our new action sequence formats
+                # Original: [B, num_samples, action_dim] or [B, action_dim]
+                # New: [B, num_samples, horizon-1, action_dim] or [B, horizon-1, action_dim]
+
+                # Determine if we're dealing with action sequences
+                # [B, num_samples, horizon-1, action_dim]
+                if len(actions.shape) == 4:
+                    is_action_sequence = True
+                    batch_size, num_samples, action_horizon, action_dim = actions.shape
+                    print(
+                        f"Detected action sequence: {batch_size} batches, {num_samples} samples, {action_horizon} steps")
+                # Heuristic: if middle dim is large, it's likely a horizon
+                elif len(actions.shape) == 3 and actions.shape[1] > 4:
+                    is_action_sequence = True
+                    batch_size, action_horizon, action_dim = actions.shape
+                    num_samples = 1
+                    print(
+                        f"Detected action sequence: {batch_size} batches, {action_horizon} steps")
+                else:
+                    # Original format
+                    is_action_sequence = False
+                    if len(actions.shape) == 3:  # [B, num_samples, action_dim]
+                        batch_size, num_samples, action_dim = actions.shape
+                    else:  # [B, action_dim]
+                        batch_size, action_dim = actions.shape
+                        num_samples = 1
+                    print(
+                        f"Detected standard action format: {batch_size} batches, {num_samples} samples")
+
+                if use_critic and num_inference_samples > 1 and critic_model is not None:
+                    print(
+                        f"Using critic to select best sample from {num_inference_samples} generated samples")
+
+                    # Ensure we have multiple samples to select from
+                    if num_samples > 1:
+
+                        # We need to reshape actions to get scores for each sample trajectory
+                        # First, extract trajectories from the diffusion model output
+                        # We'll need the last state from the input and the generated trajectory
+
+                        # 1. Get the current state from the batch
+                        # [B, state_dim]
+                        current_state = model_input_batch["observation.state"][:, 0, :]
+
+                        # 2. Score each sample trajectory using the critic
+                        best_sample_idx = 0
+                        best_score = -float('inf')
+
+                        # Print the actions shape for debugging
+                        print(f"Actions shape: {actions.shape}")
+
+                        # Score each sample and select the best one
+                        for i in range(num_samples):
+                            # Get the i-th sample trajectory
+                            # [B, horizon, action_dim]
+                            sample_actions = actions[:, i, :, :]
+
+                            try:
+                                # Use the critic model to score this trajectory
+                                # We're using the get_raw_state_cls_features method that we implemented
+                                trajectory_score = critic_model.score_trajectory(
+                                    current_state, sample_actions)
+
+                                score_value = trajectory_score.item()
+                                print(f"Sample {i} score: {score_value}")
+
+                                # Update best sample if this one has a higher score
+                                if score_value > best_score:
+                                    best_score = score_value
+                                    best_sample_idx = i
+                            except Exception as e:
+                                print(f"Error scoring sample {i}: {e}")
+                                # If we encounter an error, just continue with the next sample
+                                continue
+
+                        print(
+                            f"Selected best sample {best_sample_idx} with score {best_score}")
+
+                        # Select only the best sample
+                        # Action sequences [B, N, H, A]
+                        if len(actions.shape) == 4:
+                            actions = actions[:,
+                                              best_sample_idx:best_sample_idx+1, :, :]
+                        else:  # Standard actions [B, N, A]
+                            actions = actions[:,
+                                              best_sample_idx:best_sample_idx+1, :]
+
+                # Unnormalize the actions
                 actions_unnormalized = unnormalize_action_output(
                     {"action": actions})["action"]
 
-                # Convert actions_unnormalized to a list of individual action tensors
-                # The tensor is of shape [B, n_action_steps, action_dim]
-                # We need to extract each action and store it separately in the queue
+                # Convert actions_unnormalized to a list of individual action tensors for the queue
                 actions_list = []
-                for i in range(actions_unnormalized.shape[1]):
-                    # Create a new tensor for each action to ensure they're distinct objects
-                    action_tensor = actions_unnormalized[0, i].clone()
-                    actions_list.append(action_tensor)
+
+                # Use the is_action_sequence flag to handle the actions appropriately
+                if is_action_sequence:
+                    if len(actions_unnormalized.shape) == 4:  # [B, N, H, A]
+                        # Action sequences with multiple samples
+                        # Extract all actions from the first sample (we've already selected the best one)
+                        # Iterate over horizon
+                        for i in range(actions_unnormalized.shape[2]):
+                            action_tensor = actions_unnormalized[0, 0, i].clone(
+                            )
+                            actions_list.append(action_tensor)
+                        print(
+                            f"Added {len(actions_list)} actions from sequence to queue")
+                    else:  # [B, H, A]
+                        # Action sequence without multiple samples
+                        # Iterate over horizon
+                        for i in range(actions_unnormalized.shape[1]):
+                            action_tensor = actions_unnormalized[0, i].clone()
+                            actions_list.append(action_tensor)
+                        print(
+                            f"Added {len(actions_list)} actions from sequence to queue")
+                else:
+                    # Standard actions format (not a sequence)
+                    if len(actions_unnormalized.shape) == 3:  # [B, N, A]
+                        # Standard actions with multiple samples
+                        # Iterate over samples
+                        for i in range(actions_unnormalized.shape[1]):
+                            action_tensor = actions_unnormalized[0, i].clone()
+                            actions_list.append(action_tensor)
+                        print(
+                            f"Added {len(actions_list)} standard actions to queue")
+                    else:  # [B, A]
+                        # Standard actions without multiple samples
+                        action_tensor = actions_unnormalized[0].clone()
+                        actions_list.append(action_tensor)
+                        print("Added 1 standard action to queue")
 
                 # Clear previous actions and add the new ones
                 queues["action"].clear()  # Clear any old actions
@@ -361,16 +523,47 @@ def main():
         if len(queues["action"]) > 0:
             action = queues["action"].popleft()
             numpy_action = action.to("cpu").numpy()
+
+            # Ensure action is properly formatted for the environment
+            if isinstance(numpy_action, numpy.ndarray) and numpy_action.dtype == numpy.float32:
+                # Convert to the correct format expected by the environment
+                # The error suggests it expects an array, not a sequence
+                numpy_action = numpy_action.astype(numpy.float64)
         else:
             print("WARNING: Action queue is empty! Using random action.")
             numpy_action = env.action_space.sample()
+
+        # Make sure the action is within the environment's action space
+        try:
+            numpy_action = numpy.clip(numpy_action,
+                                      env.action_space.low,
+                                      env.action_space.high)
+        except Exception as e:
+            print(f"Warning: Couldn't clip action: {e}")
+
+        # Debug the action shape and type
+        print(
+            f"Action shape: {numpy_action.shape}, type: {type(numpy_action)}, dtype: {numpy_action.dtype}")
 
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
         print(f"{step=} {reward=} {terminated=}")
 
         rewards.append(reward)
-        frames.append(env.render())
+
+        try:
+            frame = env.render()
+            frames.append(frame)
+        except Exception as e:
+            print(f"Warning: Rendering error: {e}")
+            # Try to render with a default/empty action if rendering with action fails
+            try:
+                # Some environments have a render method that takes mode as parameter
+                frame = env.render(mode='rgb_array')
+                frames.append(frame)
+            except Exception as inner_e:
+                print(f"Failed to render even with fallback: {inner_e}")
+                # If rendering completely fails, just continue without adding a frame
 
         done = terminated or truncated or done
         step += 1

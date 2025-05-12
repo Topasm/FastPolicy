@@ -177,11 +177,8 @@ def main():
 
     delta_timestamps = {
         "observation.state": [i / dataset_metadata.fps for i in custom_state_indices],
-        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
+        "action": [i / dataset_metadata.fps for i in custom_state_indices],
     }
-
-    print(f"State indices: {custom_state_indices}")
-    print(f"Action indices: {cfg.action_delta_indices}")
 
     dataset = LeRobotDataset(
         dataset_repo_id, delta_timestamps=delta_timestamps)
@@ -219,25 +216,34 @@ def main():
             # Compute loss based on model type
             if args.model_type == "enhanced":
                 # For enhanced model with current and next state
-                total_loss = 0.0
-                states = norm_batch["observation.state"]
-                actions = norm_batch["action"]
+                # Since we're directly loading s_t and s_{t+1} for current and next state
+                # Our dataset should have states shape [B, 2, state_dim] and action shape [B, 1, action_dim]
+                states = norm_batch["observation.state"]  # [B, 2, state_dim]
+                actions = norm_batch["action"]            # [B, 1, action_dim]
 
-                # Process each action in the sequence
-                for i in range(actions.shape[1]):
-                    # Check if we have the next state
-                    if i + 1 < states.shape[1]:
-                        curr_state = states[:, i, :]
-                        next_state = states[:, i+1, :]
-                        target_action = actions[:, i, :]
+                # Verify the shapes match our expectations
+                if states.shape[1] != 2:
+                    print(
+                        f"Warning: Expected states to have shape [B, 2, state_dim], got {states.shape}")
 
-                        # Compute loss using the enhanced model's loss method
-                        action_loss, _ = invdyn_model.loss(
-                            curr_state, next_state, target_action)
-                        total_loss += action_loss
+                # Extract the current and next states
+                curr_state = states[:, 0, :]  # s_t
+                next_state = states[:, 1, :]  # s_{t+1}
+                target_action = actions[:, 0, :]  # a_t
 
-                # Average loss over sequence length
-                loss = total_loss / actions.shape[1]
+                # Compute loss using the enhanced model's loss method
+                action_loss, loss_info = invdyn_model.loss(
+                    curr_state, next_state, target_action)
+
+                # Make sure action_loss is a tensor with gradients
+                if not isinstance(action_loss, torch.Tensor):
+                    print(
+                        f"Warning: action_loss is type {type(action_loss)}, not a tensor")
+                    action_loss = torch.tensor(
+                        action_loss, device=device, requires_grad=True)
+
+                # For enhanced model, loss is already computed directly from action_loss
+                loss = action_loss
 
             elif args.model_type == "seq":
                 # For sequential GRU model

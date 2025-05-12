@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
-import math
 from dataclasses import dataclass
-import einops
 
 
 # --- Configuration ---
@@ -92,9 +90,27 @@ class AttentionPooling(nn.Module):
 
 # --- Main Model ---
 class MultimodalTrajectoryScorer(nn.Module):
-    def __init__(self, config: MultimodalScorerConfig):
+    def __init__(self, config: MultimodalScorerConfig = None, state_dim: int = None, horizon: int = None, hidden_dim: int = None):
         super().__init__()
-        self.config = config
+
+        # Support both config-based and parameter-based initialization
+        if config is not None:
+            self.config = config
+        else:
+            # Create a default config from the parameters
+            if state_dim is None or horizon is None:
+                raise ValueError(
+                    "When config is not provided, state_dim and horizon must be specified")
+
+            # Set reasonable defaults
+            self.config = MultimodalScorerConfig(
+                state_dim=state_dim,
+                image_feature_dim=512,  # Default value
+                max_state_len=horizon,
+                state_encoder_hidden_dim=hidden_dim if hidden_dim is not None else 768,
+                context_hidden_dim=hidden_dim if hidden_dim is not None else 768,
+                combined_hidden_dim=hidden_dim if hidden_dim is not None else 1024
+            )
 
         # Use num_layers as the definitive setting
         state_encoder_layers = config.num_layers
@@ -305,17 +321,63 @@ class MultimodalTrajectoryScorer(nn.Module):
     @torch.no_grad()
     def score_trajectory(
         self,
-        state_sequences: torch.Tensor,
-        image_features: torch.Tensor,
-        lang_instruction: list[str],
+        current_state: torch.Tensor,
+        action_sequence: torch.Tensor,
+        image_features: torch.Tensor = None,
+        lang_instruction: list[str] = None,
         state_padding_mask: torch.Tensor | None = None,
         image_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Inference entrypoint for getting scores.
         Sets model to eval mode.
+
+        This method supports two calling patterns:
+        1. Full input with state sequences, image features, and language instructions
+        2. Simplified input with just current state and action sequence (for action selection)
+
+        Args:
+            current_state: Current state tensor, shape [B, state_dim]
+            action_sequence: Action sequence tensor, shape [B, horizon, action_dim]
+            image_features: Optional image features, shape [B, N_img, image_feature_dim]
+            lang_instruction: Optional list of B instruction strings
+            state_padding_mask: Optional state padding mask
+            image_padding_mask: Optional image padding mask
+
+        Returns:
+            scores: Score tensor, shape [B, 1]
         """
         self.eval()
+
+        # Handle the simplified case for action selection
+        if image_features is None or lang_instruction is None:
+            batch_size = current_state.shape[0]
+            device = current_state.device
+
+            # Create placeholder image features (zeros)
+            if image_features is None:
+                image_features = torch.zeros(
+                    batch_size, 1, self.config.image_feature_dim, device=device)
+                image_padding_mask = None
+
+            # Create placeholder language instructions (empty strings)
+            if lang_instruction is None:
+                lang_instruction = [""] * batch_size
+
+            # Prepare state sequence by combining current state with action sequence
+            # This is a simplified approach - in a real system you might want to simulate
+            # the states resulting from the actions
+            horizon = action_sequence.shape[1]
+
+            # Just use current state as the state sequence for scoring
+            # Repeat it to fill the sequence
+            repeated_state = current_state.unsqueeze(1).repeat(1, horizon, 1)
+
+            # Combine state with action to get a complete representation
+            state_sequences = torch.cat(
+                [repeated_state, action_sequence], dim=-1)
+
+        # Forward pass to get scores
         scores, _ = self.forward(
             state_sequences,
             image_features,
