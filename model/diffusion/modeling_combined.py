@@ -145,13 +145,8 @@ class CombinedPolicy(nn.Module):
                 # Use our helper method to generate predicted states and actions all at once
                 actions = self._generate_states_and_actions(
                     model_input_batch=model_input_batch,
-                    current_state=current_state,
                     batch_size=batch["observation.state"].shape[0]
                 )
-                start = 0
-                end = self.config.n_action_steps
-
-                actions = actions[:, start:end]
 
                 # Unnormalize actions using our own or diffusion model's unnormalizer
                 if hasattr(self, 'unnormalize_action_output'):
@@ -179,13 +174,12 @@ class CombinedPolicy(nn.Module):
         return next_action
 
     @torch.no_grad()
-    def _generate_states_and_actions(self, model_input_batch, current_state, batch_size):
+    def _generate_states_and_actions(self, model_input_batch, batch_size):
         """
         Helper method to generate future states and corresponding actions
 
         Args:
             model_input_batch: Dict with observation history
-            current_state: Current robot state tensor
             batch_size: Batch size for diffusion model
 
         Returns:
@@ -201,14 +195,19 @@ class CombinedPolicy(nn.Module):
             global_cond=global_cond,
         )
 
+        start = 0
+        end = 3
+
+        predicted_states = predicted_states[:, start:end]
+
         # Generate actions using inverse dynamics
         actions_normalized = []
-        current_s = current_state
-        n_action_steps = min(self.config.n_action_steps,
-                             predicted_states.shape[1])
+        n_action_steps = predicted_states.shape[1]
 
-        for i in range(n_action_steps):
-            next_s = predicted_states[:, i]
+        current_s = predicted_states[:, 0]
+
+        for i in range(n_action_steps-1):
+            next_s = predicted_states[:, i+1]
             # Create state pair (s_t, s_{t+1})
             state_pair = torch.cat([current_s, next_s], dim=-1)
             # Predict action

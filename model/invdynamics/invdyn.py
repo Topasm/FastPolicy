@@ -51,12 +51,7 @@ class MlpInvDynamic(nn.Module):
             return nn.LayerNorm(hidden_dim) if use_layernorm else nn.Identity()
 
         self.net = nn.Sequential(
-            nn.Linear(o_dim, hidden_dim),
-            _norm(),
-            nn.GELU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(2*o_dim, hidden_dim),
             _norm(),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -66,7 +61,6 @@ class MlpInvDynamic(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             _norm(),
             nn.GELU(),
-
             nn.Linear(hidden_dim, a_dim),
             out_activation,
         )

@@ -514,7 +514,7 @@ class MyDiffusionModel(nn.Module):
 
         # Check for image history
         if self.config.image_features:
-            if "observation.image" in norm_batch:
+            if OBS_IMAGE in norm_batch:
                 image_history = norm_batch["observation.image"]
                 # Check if image sequence length matches n_obs_steps
                 if image_history.shape[1] != n_obs_steps:
@@ -536,15 +536,15 @@ class MyDiffusionModel(nn.Module):
 
         # Add env state history if configured and present
         if self.config.env_state_feature:
-            if OBS_ENV in norm_batch:
-                full_env_state = norm_batch[OBS_ENV]
+            if OBS_ROBOT in norm_batch:
+                full_env_state = norm_batch[OBS_ROBOT]
                 if full_env_state.shape[1] < n_obs_steps:
                     raise ValueError(
                         f"Env state sequence too short for history. Need {n_obs_steps}, got {full_env_state.shape[1]}")
-                cond_batch[OBS_ENV] = full_env_state[:, :n_obs_steps]
+                cond_batch[OBS_ROBOT] = full_env_state[:, :n_obs_steps]
             else:
                 print(
-                    f"Warning: env_state_feature configured but '{OBS_ENV}' not found in norm_batch.")
+                    f"Warning: env_state_feature configured but '{OBS_ROBOT}' not found in norm_batch.")
 
         # Calculate global_cond based on available history features in cond_batch
         # This tensor's dimension MUST match the expected input dim of cond_embed layer
@@ -561,7 +561,7 @@ class MyDiffusionModel(nn.Module):
         # Target states are s_1...s_H, which are at indices n_obs_steps to n_obs_steps+horizon-1
         # Shape (B, H, D)
         clean_targets = full_state_sequence[:,
-                                            n_obs_steps:expected_target_end_idx, :]
+                                            n_obs_steps-1:expected_target_end_idx-1, :]
 
         if clean_targets.shape[1] != horizon:
             # This check should be redundant if the length check above passes, but good for safety

@@ -94,7 +94,7 @@ def main():
         raise OSError(
             f"Inverse dynamics checkpoint not found at {invdyn_ckpt_path}")
     inv_dyn_model = MlpInvDynamic(
-        o_dim=cfg.robot_state_feature.shape[0] * 2,
+        o_dim=cfg.robot_state_feature.shape[0],
         a_dim=cfg.action_feature.shape[0],
         hidden_dim=cfg.inv_dyn_hidden_dim,
         # Add other params from MlpInvDynamic if needed (dropout, layernorm, activation)
@@ -136,7 +136,7 @@ def main():
     env = gym.make(
         "gym_pusht/PushT-v0",
         obs_type="pixels_agent_pos",  # Ensure this matches config expectations
-        max_episode_steps=200,
+        max_episode_steps=500,
     )
 
     # The combined policy now manages its own queues internally

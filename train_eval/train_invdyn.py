@@ -16,7 +16,7 @@ def main():
     output_directory = Path("outputs/train/invdyn_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 1000  # Adjust as needed
+    training_steps = 2000  # Adjust as needed
     log_freq = 10
     save_freq = 100  # Frequency to save checkpoints
 
@@ -36,7 +36,7 @@ def main():
 
     # --- Model ---
     invdyn_model = MlpInvDynamic(
-        o_dim=features["observation.state"].shape[0] * 2,  # s_{t-1}, s_t
+        o_dim=features["observation.state"].shape[0],  # s_{t-1}, s_t
         a_dim=features["action"].shape[0],
         hidden_dim=cfg.inv_dyn_hidden_dim,
         dropout=0.1,
@@ -69,8 +69,8 @@ def main():
         dataset_repo_id, delta_timestamps=delta_timestamps)
 
     # --- Optimizer & Dataloader ---
-    optimizer = torch.optim.AdamW(
-        invdyn_model.parameters(), lr=cfg.optimizer_lr)  # Use same LR for now
+    optimizer = torch.optim.Adam(
+        invdyn_model.parameters(), lr=cfg.inv_dyn_lr)  # Use same LR for now
     dataloader = torch.utils.data.DataLoader(
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
     )
