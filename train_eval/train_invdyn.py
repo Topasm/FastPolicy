@@ -16,7 +16,7 @@ def main():
     output_directory = Path("outputs/train/invdyn_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 500  # Adjust as needed
+    training_steps = 1000  # Adjust as needed
     log_freq = 10
     save_freq = 100  # Frequency to save checkpoints
 

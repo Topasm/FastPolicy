@@ -142,34 +142,16 @@ class CombinedPolicy(nn.Module):
             current_state = model_input_batch["observation.state"][:, 0, :]
 
             try:
-                # Prepare global conditioning
-                global_cond = self.diffusion_model._prepare_global_conditioning(
-                    model_input_batch)
-
-                # Generate future states using diffusion
-                predicted_states = self.diffusion_model.conditional_sample(
-                    batch_size=batch["observation.state"].shape[0],
-                    global_cond=global_cond,
+                # Use our helper method to generate predicted states and actions all at once
+                actions = self._generate_states_and_actions(
+                    model_input_batch=model_input_batch,
+                    current_state=current_state,
+                    batch_size=batch["observation.state"].shape[0]
                 )
+                start = self.config.n_obs_steps - 1
+                end = start + self.config.n_action_steps
 
-                # Generate actions using inverse dynamics
-                actions_normalized = []
-                current_s = current_state
-                n_action_steps = min(
-                    self.config.n_action_steps, predicted_states.shape[1])
-
-                for i in range(n_action_steps):
-                    next_s = predicted_states[:, i]
-                    # Create state pair (s_t, s_{t+1})
-                    state_pair = torch.cat([current_s, next_s], dim=-1)
-                    # Predict action
-                    action_i = self.inv_dyn_model(state_pair)
-                    actions_normalized.append(action_i)
-                    # Update current state
-                    current_s = next_s
-
-                # Stack actions into a sequence
-                actions = torch.stack(actions_normalized, dim=1)
+                actions = actions[:, start:end]
 
                 # Unnormalize actions using our own or diffusion model's unnormalizer
                 if hasattr(self, 'unnormalize_action_output'):
@@ -197,22 +179,43 @@ class CombinedPolicy(nn.Module):
         return next_action
 
     @torch.no_grad()
-    def generate_actions_via_inverse_dynamics(
-        self,
-        batch: dict[str, Tensor],  # Expects raw batch
-        num_samples: int = 1,
-    ) -> Tensor:
+    def _generate_states_and_actions(self, model_input_batch, current_state, batch_size):
         """
-        Similar to select_action, but returns all actions at once.
-        This is useful for evaluation where we want to get the full action sequence.
+        Helper method to generate future states and corresponding actions
+
+        Args:
+            model_input_batch: Dict with observation history
+            current_state: Current robot state tensor
+            batch_size: Batch size for diffusion model
+
+        Returns:
+            Normalized actions tensor of shape [batch_size, n_action_steps, action_dim]
         """
-        # Get action using select_action, which will populate the queue
-        action = self.select_action(batch)
+        # Prepare global conditioning
+        global_cond = self.diffusion_model._prepare_global_conditioning(
+            model_input_batch)
 
-        # Collect all actions from the queue
-        actions = [action]
-        for _ in range(len(self._queues["action"])):
-            actions.append(self._queues["action"].popleft())
+        # Generate future states using diffusion
+        predicted_states = self.diffusion_model.conditional_sample(
+            batch_size=batch_size,
+            global_cond=global_cond,
+        )
 
-        # Stack into a single tensor
-        return torch.stack(actions, dim=1)  # Shape: (B, n_steps, action_dim)
+        # Generate actions using inverse dynamics
+        actions_normalized = []
+        current_s = current_state
+        n_action_steps = min(self.config.n_action_steps,
+                             predicted_states.shape[1])
+
+        for i in range(n_action_steps):
+            next_s = predicted_states[:, i]
+            # Create state pair (s_t, s_{t+1})
+            state_pair = torch.cat([current_s, next_s], dim=-1)
+            # Predict action
+            action_i = self.inv_dyn_model(state_pair)
+            actions_normalized.append(action_i)
+            # Update current state
+            current_s = next_s
+
+        # Stack actions into a sequence
+        return torch.stack(actions_normalized, dim=1)

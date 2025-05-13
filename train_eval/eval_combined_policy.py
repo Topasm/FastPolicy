@@ -19,6 +19,7 @@ import imageio
 import numpy
 import torch
 import json
+import time
 
 # Import necessary components
 from model.diffusion.configuration_mymodel import DiffusionConfig
@@ -184,6 +185,8 @@ def main():
 
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
+
+        time.sleep(0.1)
         print(f"{step=} {reward=} {terminated=}")
 
         rewards.append(reward)

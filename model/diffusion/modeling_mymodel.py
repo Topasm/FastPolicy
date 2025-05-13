@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from pathlib import Path
 import safetensors
 
-from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+from lerobot.common.constants import OBS_ENV, OBS_ROBOT, OBS_IMAGE
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.diffusion_modules import (
     DiffusionRgbEncoder,
@@ -29,7 +29,7 @@ from lerobot.common.policies.utils import (
 )
 
 from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
-from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic, TemporalUNetInvDynamic
+from model.invdynamics.invdyn import MlpInvDynamic
 
 
 class MYDiffusionPolicy(PreTrainedPolicy):
@@ -390,24 +390,24 @@ class MyDiffusionModel(nn.Module):
            Expects batch to have normalized 'observation.state' and potentially 'observation.image'.
         """
         # Check required keys exist
-        if "observation.state" not in batch:
+        if OBS_ROBOT not in batch:
             raise KeyError(
-                "Missing 'observation.state' in batch for _prepare_global_conditioning")
+                f"Missing '{OBS_ROBOT}' in batch for _prepare_global_conditioning")
 
-        batch_size = batch["observation.state"].shape[0]
+        batch_size = batch[OBS_ROBOT].shape[0]
         n_obs_steps = self.config.n_obs_steps
 
-        if batch["observation.state"].shape[1] < n_obs_steps:
+        if batch[OBS_ROBOT].shape[1] < n_obs_steps:
             raise ValueError(
-                f"observation.state sequence length ({batch['observation.state'].shape[1]}) "
+                f"{OBS_ROBOT} sequence length ({batch[OBS_ROBOT].shape[1]}) "
                 f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
             )
-        cond_state = batch["observation.state"][:, :n_obs_steps, :]
+        cond_state = batch[OBS_ROBOT][:, :n_obs_steps, :]
         global_cond_feats = [cond_state]
 
         # Check if images are configured AND present in the batch before processing
-        if self.config.image_features and "observation.image" in batch:
-            images = batch["observation.image"]
+        if self.config.image_features and OBS_IMAGE in batch:
+            images = batch[OBS_IMAGE]
             _B = images.shape[0]
             n_img_steps = images.shape[1]
 
