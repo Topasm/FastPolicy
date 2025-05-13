@@ -186,7 +186,6 @@ def main():
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 
-        time.sleep(0.1)
         print(f"{step=} {reward=} {terminated=}")
 
         rewards.append(reward)

@@ -619,10 +619,6 @@ class MyDiffusionModel(nn.Module):
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
 
-        # We need states s_{-1} through s_{H} for pairs (s_t, s_{t+1}) where t= -1..H-1
-        # The state_delta_indices property loads states from t=1-n_obs to t=n_obs+H-1
-        # e.g., n_obs=2, H=16 -> indices -1..17. Length = 19.
-        # Correct expected length
         expected_len = len(self.config.state_delta_indices)
         loaded_state_len = invdyn_batch["observation.state"].shape[1]
 

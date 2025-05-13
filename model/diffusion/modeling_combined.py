@@ -148,8 +148,8 @@ class CombinedPolicy(nn.Module):
                     current_state=current_state,
                     batch_size=batch["observation.state"].shape[0]
                 )
-                start = self.config.n_obs_steps - 1
-                end = start + self.config.n_action_steps
+                start = 0
+                end = self.config.n_action_steps
 
                 actions = actions[:, start:end]
 
