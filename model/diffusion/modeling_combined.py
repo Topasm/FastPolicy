@@ -176,7 +176,7 @@ class CombinedPolicy(nn.Module):
             )
 
             start = 0
-            end = 4
+            end = 3
 
             predicted_states = predicted_states[:, start:end]
 
