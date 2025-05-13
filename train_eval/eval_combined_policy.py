@@ -149,6 +149,11 @@ def main():
     step = 0
     done = False
 
+    # Initialize planning variables
+    future_states_plan = torch.zeros(
+        (1, 0, cfg.robot_state_feature.shape[0]), device=device)
+    current_plan_step = 0
+
     print("Starting evaluation rollout...")
     while not done:
         # --- Prepare Observation ---
@@ -176,24 +181,36 @@ def main():
         if step == 0:
             combined_model.reset()
 
-        # Two-step inference: planning and action prediction
+        # Plan a sequence of states at the beginning or when we've used up our planned states
+        if step == 0 or current_plan_step >= future_states_plan.shape[1]:
+            # Generate a new plan for the next 8 steps
+            with torch.inference_mode():
+                # Step 1: Plan future states
+                predicted_states = combined_model.plan_future_states(
+                    observation)
+                print(
+                    f"Generated new plan for next {predicted_states.shape[1]} steps")
+                # Store for subsequent steps
+                future_states_plan = predicted_states.clone()
+                current_plan_step = 0
+
+        # Get the next state from our plan
         with torch.inference_mode():
-            # Step 1: Plan future states
-            predicted_states = combined_model.plan_future_states(observation)
+            if future_states_plan.shape[1] > current_plan_step:
+                # Get the next state from our pre-planned trajectory
+                next_state = future_states_plan[:, current_plan_step]
 
-            # Step 2: Predict action using current state and predicted next state
-            if predicted_states.shape[1] > 0:
-                # Extract the next desired state (first predicted state)
-                # Use the first predicted state
-                next_state = predicted_states[:, 0]
-
-                # Get normalized current state - we need to normalize it for the inverse dynamics model
-                # The current state needs to be normalized to match the predicted states from the diffusion model
+                # Step 2: Predict action using current state and desired next state
                 try:
-                    # Normalize the current state using the combined_model's normalizer
-                    if hasattr(combined_model, 'normalize_inputs'):
+                    # First try to use the specific inverse dynamics state normalizer
+                    if hasattr(combined_model, 'normalize_invdyn_state'):
+                        norm_curr_state = combined_model.normalize_invdyn_state(
+                            {"observation.state": observation["observation.state"]})["observation.state"]
+                    # Fall back to general input normalizer
+                    elif hasattr(combined_model, 'normalize_inputs'):
                         norm_curr_state = combined_model.normalize_inputs(
                             {"observation.state": observation["observation.state"]})["observation.state"]
+                    # Fall back to diffusion model's normalizer as last resort
                     elif hasattr(combined_model.diffusion_model, 'normalize_inputs'):
                         norm_curr_state = combined_model.diffusion_model.normalize_inputs(
                             {"observation.state": observation["observation.state"]})["observation.state"]
@@ -203,6 +220,8 @@ def main():
                         norm_curr_state = observation["observation.state"]
 
                     # Debug prints
+                    print(
+                        f"Plan step: {current_plan_step+1}/{future_states_plan.shape[1]}")
                     print(f"Raw state: {observation['observation.state']}")
                     print(f"Normalized state: {norm_curr_state}")
                     print(f"Target state: {next_state}")
@@ -210,19 +229,22 @@ def main():
                     # Predict action between normalized current state and desired next state
                     action = combined_model.predict_action(
                         norm_curr_state, next_state)
+                    current_plan_step += 1  # Move to the next planned state after predicting action
                 except Exception as e:
                     print(f"Error during state normalization: {e}")
                     action = torch.zeros(
                         (1, combined_model.config.action_feature.shape[0]), device=device)
             else:
                 # Fallback if planning failed
-                print("Warning: Planning failed. Returning zero action.")
+                print(
+                    "Warning: Planning failed or no more states in plan. Returning zero action.")
                 action = torch.zeros((1, combined_model.config.action_feature.shape[0]),
                                      device=device)
 
         # Convert to numpy for environment step
         numpy_action = action.squeeze(0).cpu().numpy()
 
+        # Execute the action in the environment and get the updated state
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 

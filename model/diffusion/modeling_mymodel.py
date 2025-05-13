@@ -561,7 +561,7 @@ class MyDiffusionModel(nn.Module):
         # Target states are s_1...s_H, which are at indices n_obs_steps to n_obs_steps+horizon-1
         # Shape (B, H, D)
         clean_targets = full_state_sequence[:,
-                                            n_obs_steps:expected_target_end_idx, :]
+                                            n_obs_steps-1:expected_target_end_idx-1, :]
 
         if clean_targets.shape[1] != horizon:
             # This check should be redundant if the length check above passes, but good for safety
