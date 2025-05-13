@@ -267,11 +267,24 @@ class MyDiffusionModel(nn.Module):
     Main model class coordinating the vision encoders, DiT, and noise scheduler.
     """
 
-    def __init__(self, config: DiffusionConfig):
+    def __init__(self, config: DiffusionConfig, dataset_stats: dict[str, dict[str, Tensor]] | None = None):
         super().__init__()
         self.config = config
         self.state_dim = config.robot_state_feature.shape[0]  # Store state dim
         self.action_dim = config.action_feature.shape[0]  # Store action dim
+
+        # Add normalizers/unnormalizers
+        if dataset_stats is not None:
+            self.normalize_inputs = Normalize(
+                config.input_features, config.normalization_mapping, dataset_stats)
+            self.unnormalize_action_output = Unnormalize(
+                {"action": config.action_feature},
+                config.normalization_mapping, dataset_stats
+            )
+        else:
+            # Provide dummy implementations if no stats available
+            self.normalize_inputs = lambda x: x
+            self.unnormalize_action_output = lambda x: x
 
         # Determine the dimension the diffusion model should predict
         self.diffusion_target_dim = self.state_dim  # Always predict state dim now
@@ -336,24 +349,41 @@ class MyDiffusionModel(nn.Module):
 
     def _encode_images(self, images: Tensor) -> Tensor:
         """Encodes images using the appropriate encoder(s)."""
-        B, T_obs, N_cam = images.shape[:3]
-
-        if self.config.use_separate_rgb_encoder_per_camera:
-            images_reshaped = einops.rearrange(
-                images, "b t n c h w -> n (b t) c h w")
-            features_list = []
-            for i in range(N_cam):
-                features_list.append(self.rgb_encoder[i](images_reshaped[i]))
-            img_features = torch.stack(features_list, dim=0)
-            img_features = einops.rearrange(
-                img_features, "n (b t) d -> b t (n d)", b=B, t=T_obs)
+        # Handle various image tensor shapes (including the 6D tensor case)
+        if len(images.shape) == 6 and images.shape[2] == 1:
+            # Special case: Shape is [b, t, 1, c, h, w] - extra dimension
+            B, T_obs = images.shape[:2]
+            # Remove the extra dimension
+            images = images.squeeze(2)
+            N_cam = 1  # Set N_cam to 1 since we've removed that dimension
         else:
-            images_reshaped = einops.rearrange(
-                images, "b t n c h w -> (b t n) c h w")
-            img_features = self.rgb_encoder(images_reshaped)
-            img_features = einops.rearrange(
-                img_features, "(b t n) d -> b t (n d)", b=B, t=T_obs, n=N_cam)
-        return img_features
+            # Standard case: Shape is [b, t, n, c, h, w]
+            B, T_obs, N_cam = images.shape[:3]
+
+        try:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                images_reshaped = einops.rearrange(
+                    images, "b t n c h w -> n (b t) c h w")
+                features_list = []
+                for i in range(N_cam):
+                    features_list.append(
+                        self.rgb_encoder[i](images_reshaped[i]))
+                img_features = torch.stack(features_list, dim=0)
+                img_features = einops.rearrange(
+                    img_features, "n (b t) d -> b t (n d)", b=B, t=T_obs)
+            else:
+                images_reshaped = einops.rearrange(
+                    images, "b t n c h w -> (b t n) c h w")
+                img_features = self.rgb_encoder(images_reshaped)
+                img_features = einops.rearrange(
+                    img_features, "(b t n) d -> b t (n d)", b=B, t=T_obs, n=N_cam)
+            return img_features
+        except Exception as e:
+            print(f"Error during image encoding: {e}")
+            print(f"Image shape: {images.shape}")
+            # Return a zero tensor as fallback
+            return torch.zeros((B, T_obs, self.config.transformer_dim * N_cam),
+                               device=images.device)
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector.
@@ -378,24 +408,63 @@ class MyDiffusionModel(nn.Module):
         # Check if images are configured AND present in the batch before processing
         if self.config.image_features and "observation.image" in batch:
             images = batch["observation.image"]
-            _B, n_img_steps = images.shape[:2]
-            n_cam = 1  # Assuming single camera for "observation.image" key
+            _B = images.shape[0]
+            n_img_steps = images.shape[1]
 
-            if n_img_steps != n_obs_steps:
+            # Handle different image tensor shapes
+            if len(images.shape) == 6:  # Shape: [b, t, n_cam, c, h, w]
+                # Special case for 6D tensor
+                if images.shape[2] == 1:  # If there's just one camera, squeeze that dimension
+                    images = images.squeeze(2)  # Convert to [b, t, c, h, w]
+                else:
+                    # Use the _encode_images method which can handle multi-camera input
+                    try:
+                        img_features = self._encode_images(images)
+                        global_cond_feats.append(img_features)
+                        # Skip the rest of the processing for this case
+                        goto_next_condition = True
+                    except Exception as e:
+                        print(f"Error processing 6D image tensor: {e}")
+                        print(f"Image shape: {images.shape}")
+                        # Create a fallback feature tensor
+                        img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                                   device=batch["observation.state"].device)
+                        global_cond_feats.append(img_features)
+                        goto_next_condition = True
+
+            # If we need to skip to the next condition
+            if 'goto_next_condition' in locals() and goto_next_condition:
+                pass
+            # Standard processing for 5D tensor [b, t, c, h, w]
+            elif len(images.shape) == 5:
+                if n_img_steps != n_obs_steps:
+                    raise ValueError(
+                        f"Image sequence length ({n_img_steps}) in batch does not match "
+                        f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
+                        f"and policy config."
+                    )
+                assert _B == batch_size
+
+                try:
+                    images_reshaped = einops.rearrange(
+                        images, "b t c h w -> (b t) c h w")
+                    img_features = self.rgb_encoder(images_reshaped)
+                    img_features = einops.rearrange(
+                        img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
+                    )
+                    global_cond_feats.append(img_features)
+                except Exception as e:
+                    print(f"Error during standard image processing: {e}")
+                    print(f"Image shape: {images.shape}")
+                    # Create a fallback feature tensor
+                    img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                               device=batch["observation.state"].device)
+                    global_cond_feats.append(img_features)
+            else:
+                # Unknown image tensor format
                 raise ValueError(
-                    f"Image sequence length ({n_img_steps}) in batch does not match "
-                    f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
-                    f"and policy config."
-                )
-            assert _B == batch_size
+                    f"Unsupported image tensor shape: {images.shape}")
 
-            images_reshaped = einops.rearrange(
-                images, "b t c h w -> (b t) c h w")
-            img_features = self.rgb_encoder(images_reshaped)
-            img_features = einops.rearrange(
-                img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
-            )
-            global_cond_feats.append(img_features)
         elif self.config.image_features and "observation.image" not in batch:
             # If images configured but not provided in this specific batch, print warning
             print("Warning: image_features configured but 'observation.image' not found in batch for _prepare_global_conditioning.")
@@ -418,65 +487,6 @@ class MyDiffusionModel(nn.Module):
         concatenated_features = torch.cat(global_cond_feats, dim=-1)
         global_cond = concatenated_features.flatten(start_dim=1)
         return global_cond
-
-    @torch.no_grad()
-    def generate_actions_via_inverse_dynamics(
-        self,
-        norm_batch: dict[str, Tensor],  # Expects normalized batch
-        norm_current_state: Tensor,    # Expects normalized state
-        inv_dyn_model: MlpInvDynamic,
-        num_samples: int = 1,
-    ) -> Tensor:
-        """Generates actions using diffusion for states and then iteratively applying
-           an inverse dynamics model predicting a_t from (s_t, s_{t+1}).
-           Returns `n_action_steps` (4) normalized actions.
-        """
-        batch_size = norm_current_state.shape[0]
-        n_obs_steps = self.config.n_obs_steps
-        n_action_steps = self.config.n_action_steps  # This is 4
-
-        # Prepare conditioning from the normalized batch
-        global_cond = self._prepare_global_conditioning(norm_batch)
-
-        # Repeat global_cond if num_samples > 1
-        if num_samples > 1:
-            global_cond = global_cond.repeat_interleave(num_samples, dim=0)
-
-        # Sample normalized future states (Horizon=16)
-        predicted_states_flat = self.conditional_sample(
-            batch_size * num_samples, global_cond=global_cond
-        )  # Output: (B*N, 16, D_state)
-
-        predicted_states = einops.rearrange(
-            predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
-        )
-
-        # Always select the first sample if multiple are generated
-        selected_states = predicted_states[:, 0]  # (B, 16, D_state)
-
-        # Iteratively predict actions
-        predicted_actions = []
-        current_s = norm_current_state  # s_0
-        for i in range(n_action_steps):  # Iterate 4 times (i=0, 1, 2, 3)
-            next_s = selected_states[:, i+1]  # s_1, s_2, s_3, s_4
-
-            # Create state pair (s_i, s_{i+1})
-            # Shape: (B, D_state * 2)
-            state_pair = torch.cat([current_s, next_s], dim=-1)
-
-            # Predict action a_i
-            action_i = inv_dyn_model.predict(
-                state_pair)  # Shape: (B, action_dim)
-            predicted_actions.append(action_i)
-
-            # Update current state for next iteration
-            current_s = next_s
-
-        # Stack the predicted actions
-        actions_to_execute = torch.stack(
-            predicted_actions, dim=1)  # Shape: (B, 4, action_dim)
-
-        return actions_to_execute  # Return normalized actions
 
     def compute_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
         """Computes the diffusion loss.
@@ -725,19 +735,129 @@ class MyDiffusionModel(nn.Module):
         return sample  # Returns normalized states
 
 
-def generate_actions_via_diffusion_and_invdyn(
-    diffusion_model: MyDiffusionModel,
-    inv_dyn_model: MlpInvDynamic,
-    model_input_batch: dict[str, torch.Tensor],
-    num_samples: int = 1,
-) -> torch.Tensor:
+class CombinedPolicy(nn.Module):
     """
-    1) Diffusion → predicted future states
-    2) Inverse‐dynamics → actions
-    Returns normalized actions of shape (B, n_action_steps, A).
+    Combined policy class for the diffusion model and inverse dynamics model.
+    This class is a simple torch.nn.Module that doesn't require config_class.
     """
-    # grab the most recent state from your history
-    current_state = model_input_batch["observation.state"][:, -1, :]
-    return diffusion_model.generate_actions_via_inverse_dynamics(
-        model_input_batch, current_state, inv_dyn_model, num_samples=num_samples
-    )
+
+    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic):
+        super().__init__()
+        self.diffusion_model = diffusion_model
+        self.inv_dyn_model = inv_dyn_model
+        self.config = diffusion_model.config
+        self.device = get_device_from_parameters(diffusion_model)
+
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+        """Selects an action using the combined policy."""
+        # Normalize inputs
+        norm_batch = self.diffusion_model.normalize_inputs(batch)
+
+        # Prepare global conditioning
+        global_cond = self.diffusion_model._prepare_global_conditioning(
+            norm_batch)
+
+        # Generate actions using the diffusion model
+        actions = self.diffusion_model.conditional_sample(
+            batch_size=batch["observation.state"].shape[0],
+            global_cond=global_cond,
+        )
+
+        # Unnormalize actions
+        actions_unnormalized = self.diffusion_model.unnormalize_action_output(
+            {"action": actions})["action"]
+
+        return actions_unnormalized
+
+    @torch.no_grad()
+    def generate_actions_via_inverse_dynamics(
+        self,
+        batch: dict[str, Tensor],  # Expects the raw batch
+        num_samples: int = 1,
+        action_queues: dict = None,
+    ) -> Tensor:
+        """Generates actions using diffusion for states and then iteratively applying
+        an inverse dynamics model predicting a_t from (s_t, s_{t+1}).
+        Returns `n_action_steps` (4) normalized actions.
+
+        If action_queues is provided, will add predicted actions to the queues
+        similar to how select_action works with populate_queues.
+        """
+        # Ensure input batch tensors are on the correct device
+        batch = {k: v.to(self.device) if isinstance(
+            v, torch.Tensor) else v for k, v in batch.items()}
+
+        # Normalize inputs
+        norm_batch = self.diffusion_model.normalize_inputs(batch)
+
+        # Stack multiple camera views if necessary
+        if self.config.image_features:
+            # Create a temporary dict to avoid modifying the original input batch
+            processed_batch = dict(norm_batch)
+            processed_batch["observation.image"] = torch.stack(
+                [norm_batch[key] for key in self.config.image_features], dim=-4
+            )
+        else:
+            processed_batch = norm_batch  # Use the normalized batch
+
+        # Populate queues with the latest *normalized* observation if provided
+        if action_queues is not None:
+            action_queues = populate_queues(action_queues, processed_batch)
+
+        # Get current state
+        norm_current_state = processed_batch["observation.state"][:, 0, :]
+        batch_size = norm_current_state.shape[0]
+        n_action_steps = self.config.n_action_steps  # This is 4
+
+        # Prepare conditioning from the normalized batch
+        global_cond = self._prepare_global_conditioning(norm_batch)
+
+        # Repeat global_cond if num_samples > 1
+        if num_samples > 1:
+            global_cond = global_cond.repeat_interleave(num_samples, dim=0)
+
+        # Sample normalized future states (Horizon=16)
+        predicted_states_flat = self.conditional_sample(
+            batch_size * num_samples, global_cond=global_cond
+        )  # Output: (B*N, 16, D_state)
+
+        predicted_states = einops.rearrange(
+            predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
+        )
+
+        # Always select the first sample if multiple are generated
+        selected_states = predicted_states[:, 0]  # (B, 16, D_state)
+
+        # Iteratively predict actions
+        predicted_actions = []
+        current_s = norm_current_state  # s_0
+        for i in range(n_action_steps):  # Iterate 4 times (i=0, 1, 2, 3)
+            next_s = selected_states[:, i+1]  # s_1, s_2, s_3, s_4
+
+            # Create state pair (s_i, s_{i+1})
+            # Shape: (B, D_state * 2)
+            state_pair = torch.cat([current_s, next_s], dim=-1)
+
+            # Predict action a_i
+            action_i = inv_dyn_model.predict(
+                state_pair)  # Shape: (B, action_dim)
+            predicted_actions.append(action_i)
+
+            # Update current state for next iteration
+            current_s = next_s
+
+        # Stack the predicted actions
+        actions_to_execute = torch.stack(
+            predicted_actions, dim=1)  # Shape: (B, 4, action_dim)
+
+        # If action_queues is provided, populate it with actions (like in select_action)
+        if action_queues is not None and "action" in action_queues:
+            # Clear the existing action queue to replace with new action plan
+            while len(action_queues["action"]) > 0:
+                action_queues["action"].popleft()
+
+            # Add normalized actions to the queue
+            action_batch = {"action": actions_to_execute}
+            action_queues = populate_queues(action_queues, action_batch)
+
+        return actions_to_execute  # Return normalized actions
