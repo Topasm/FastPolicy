@@ -78,13 +78,21 @@ class CombinedPolicy(nn.Module):
                 maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Selects an action using the combined policy."""
+    def plan_future_states(self, batch: dict[str, Tensor]) -> Tensor:
+        """
+        Step 1: Planner (diffusion model) samples future states using the current observation
+
+        Args:
+            batch: Dictionary with current observations
+
+        Returns:
+            Predicted future states tensor [batch_size, horizon, state_dim]
+        """
         # Ensure input batch tensors are on the correct device
         batch = {k: v.to(self.device) if isinstance(
             v, torch.Tensor) else v for k, v in batch.items()}
 
-        # Normalize inputs using our own normalizer, not the diffusion model's
+        # Normalize inputs
         try:
             # First try to get normalizer from self
             if hasattr(self, 'normalize_inputs'):
@@ -93,11 +101,11 @@ class CombinedPolicy(nn.Module):
             elif hasattr(self.diffusion_model, 'normalize_inputs'):
                 norm_batch = self.diffusion_model.normalize_inputs(batch)
             else:
-                # If neither has the normalizer, use batch as-is and print warning
+                # If neither has the normalizer, use batch as-is
                 print("Warning: No normalizer found. Using raw batch.")
                 norm_batch = batch
         except Exception as e:
-            # If something goes wrong with normalization, try to provide diagnostic info
+            # If something goes wrong with normalization, provide diagnostic info
             print(f"Error during normalization: {e}")
             print(f"Batch keys: {batch.keys()}")
             for k, v in batch.items():
@@ -119,103 +127,70 @@ class CombinedPolicy(nn.Module):
         # Populate queues with the latest *normalized* observation
         self._queues = populate_queues(self._queues, processed_batch)
 
-        # Generate new action plan only when the action queue is empty
-        if len(self._queues["action"]) == 0:
-            # Check if we have enough history to make a prediction
-            required_obs = self.config.n_obs_steps
-            if len(self._queues["observation.state"]) < required_obs:
-                print(
-                    f"Warning: Not enough history in queues. Have {len(self._queues['observation.state'])}, need {required_obs}")
-                # Return zero action if we don't have enough history yet
-                return torch.zeros((1, self.config.action_feature.shape[0]), device=self.device)
+        # Check if we have enough history to make a prediction
+        required_obs = self.config.n_obs_steps
+        if len(self._queues["observation.state"]) < required_obs:
+            print(
+                f"Warning: Not enough history in queues. Have {len(self._queues['observation.state'])}, need {required_obs}")
+            # Return zeros if we don't have enough history yet
+            return torch.zeros((batch["observation.state"].shape[0], self.config.horizon,
+                               self.config.robot_state_feature.shape[0]), device=self.device)
 
-            # Prepare batch for the model by stacking history from queues (already normalized)
-            model_input_batch = {}
-            for key, queue in self._queues.items():
-                if key.startswith("observation"):
-                    # Ensure tensors are on the correct device before stacking if needed
-                    queue_list = [item.to(self.device) if isinstance(
-                        item, torch.Tensor) else item for item in queue]
-                    model_input_batch[key] = torch.stack(queue_list, dim=1)
+        # Prepare batch for the model by stacking history from queues (already normalized)
+        model_input_batch = {}
+        for key, queue in self._queues.items():
+            if key.startswith("observation"):
+                # Ensure tensors are on the correct device before stacking
+                queue_list = [item.to(self.device) if isinstance(
+                    item, torch.Tensor) else item for item in queue]
+                model_input_batch[key] = torch.stack(queue_list, dim=1)
 
-            # Get the current state from the batch
-            current_state = model_input_batch["observation.state"][:, 0, :]
-
-            try:
-                # Use our helper method to generate predicted states and actions all at once
-                actions = self._generate_states_and_actions(
-                    model_input_batch=model_input_batch,
-                    current_state=current_state,
-                    batch_size=batch["observation.state"].shape[0]
-                )
-                start = 0
-                end = self.config.n_action_steps
-
-                actions = actions[:, start:end]
-
-                # Unnormalize actions using our own or diffusion model's unnormalizer
-                if hasattr(self, 'unnormalize_action_output'):
-                    actions_unnormalized = self.unnormalize_action_output(
-                        {"action": actions})["action"]
-                elif hasattr(self.diffusion_model, 'unnormalize_action_output'):
-                    actions_unnormalized = self.diffusion_model.unnormalize_action_output(
-                        {"action": actions})["action"]
-                else:
-                    # If no unnormalizer, just use the actions as they are
-                    print("Warning: No unnormalizer found. Using raw actions.")
-                    actions_unnormalized = actions
-
-                # Add unnormalized actions to the queue
-                for i in range(actions_unnormalized.shape[1]):
-                    self._queues["action"].append(actions_unnormalized[:, i])
-
-            except Exception as e:
-                print(f"Error during action generation: {e}")
-                # Return zero action in case of an error
-                return torch.zeros((1, self.config.action_feature.shape[0]), device=self.device)
-
-        # Pop the next action from the queue
-        next_action = self._queues["action"].popleft()
-        return next_action
-
-    @torch.no_grad()
-    def _generate_states_and_actions(self, model_input_batch, current_state, batch_size):
-        """
-        Helper method to generate future states and corresponding actions
-
-        Args:
-            model_input_batch: Dict with observation history
-            current_state: Current robot state tensor
-            batch_size: Batch size for diffusion model
-
-        Returns:
-            Normalized actions tensor of shape [batch_size, n_action_steps, action_dim]
-        """
-        # Prepare global conditioning
+        # Prepare global conditioning for the diffusion model
+        batch_size = batch["observation.state"].shape[0]
         global_cond = self.diffusion_model._prepare_global_conditioning(
             model_input_batch)
 
-        # Generate future states using diffusion
+        # Generate future states using the diffusion model
         predicted_states = self.diffusion_model.conditional_sample(
             batch_size=batch_size,
             global_cond=global_cond,
         )
 
-        # Generate actions using inverse dynamics
-        actions_normalized = []
-        current_s = current_state
-        n_action_steps = min(self.config.n_action_steps,
-                             predicted_states.shape[1])
+        start = self.config.n_obs_steps-1
+        end = 8
 
-        for i in range(n_action_steps):
-            next_s = predicted_states[:, i]
-            # Create state pair (s_t, s_{t+1})
-            state_pair = torch.cat([current_s, next_s], dim=-1)
-            # Predict action
-            action_i = self.inv_dyn_model(state_pair)
-            actions_normalized.append(action_i)
-            # Update current state
-            current_s = next_s
+        predicted_states = predicted_states[:, start:end]
 
-        # Stack actions into a sequence
-        return torch.stack(actions_normalized, dim=1)
+        return predicted_states
+
+    @torch.no_grad()
+    def predict_action(self, current_state: Tensor, next_state: Tensor) -> Tensor:
+        """
+        Step 2: Predict action between current state and desired next state
+
+        Args:
+            current_state: Current observation state tensor [batch_size, state_dim] (MUST be normalized)
+            next_state: Desired next state tensor [batch_size, state_dim] (already normalized)
+
+        Returns:
+            Predicted action tensor [batch_size, action_dim]
+        """
+        # Create state pair (s_t, s_{t+1})
+        state_pair = torch.cat([current_state, next_state], dim=-1)
+
+        # Predict action using inverse dynamics model
+        action = self.inv_dyn_model(state_pair)
+
+        # Unnormalize action if needed
+        if hasattr(self, 'unnormalize_action_output'):
+            action_unnormalized = self.unnormalize_action_output(
+                {"action": action.unsqueeze(1)})["action"].squeeze(1)
+        elif hasattr(self.diffusion_model, 'unnormalize_action_output'):
+            action_unnormalized = self.diffusion_model.unnormalize_action_output(
+                {"action": action.unsqueeze(1)})["action"].squeeze(1)
+        else:
+            # If no unnormalizer, use the action as is
+            print("Warning: No unnormalizer found. Using raw action.")
+            action_unnormalized = action
+
+        return action_unnormalized
