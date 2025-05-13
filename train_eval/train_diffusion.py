@@ -15,8 +15,8 @@ def main():
     output_directory = Path("outputs/train/diffusion_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 5000  # Adjust as needed
-    log_freq = 10
+    training_steps = 20000  # Adjust as needed
+    log_freq = 100
     save_freq = 500  # Frequency to save checkpoints
 
     # --- Dataset and Config Setup ---
@@ -60,7 +60,7 @@ def main():
     # state_delta_indices loads from 1-n_obs up to H-1. We need up to H for the target.
     # Let's define specific timestamps needed.
     # -1 to 16 for n_obs=2, H=16
-    diffusion_state_indices = list(range(1 - cfg.n_obs_steps, cfg.horizon + 1))
+    diffusion_state_indices = list(range(1 - cfg.n_obs_steps, cfg.horizon))
     delta_timestamps = {
         # -1, 0
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
@@ -74,7 +74,7 @@ def main():
         dataset_repo_id, delta_timestamps=delta_timestamps)
 
     # --- Optimizer & Dataloader ---
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         diffusion_model.parameters(), lr=cfg.optimizer_lr)
     dataloader = torch.utils.data.DataLoader(
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True

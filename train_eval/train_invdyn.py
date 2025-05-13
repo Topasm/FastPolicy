@@ -16,9 +16,9 @@ def main():
     output_directory = Path("outputs/train/invdyn_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 2000  # Adjust as needed
-    log_freq = 10
-    save_freq = 100  # Frequency to save checkpoints
+    training_steps = 3000  # Adjust as needed
+    log_freq = 50
+    save_freq = 500  # Frequency to save checkpoints
 
     # --- Dataset and Config Setup ---
     dataset_repo_id = "lerobot/pusht"
