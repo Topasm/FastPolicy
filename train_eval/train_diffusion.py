@@ -8,14 +8,15 @@ from lerobot.common.policies.normalize import Normalize
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from lerobot.configs.types import FeatureType
+import numpy
 
 
 def main():
     output_directory = Path("outputs/train/diffusion_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 500  # Adjust as needed
-    log_freq = 10
+    training_steps = 20000  # Adjust as needed
+    log_freq = 100
     save_freq = 500  # Frequency to save checkpoints
 
     # --- Dataset and Config Setup ---
@@ -59,7 +60,7 @@ def main():
     # state_delta_indices loads from 1-n_obs up to H-1. We need up to H for the target.
     # Let's define specific timestamps needed.
     # -1 to 16 for n_obs=2, H=16
-    diffusion_state_indices = list(range(1 - cfg.n_obs_steps, cfg.horizon + 1))
+    diffusion_state_indices = list(range(1 - cfg.n_obs_steps, cfg.horizon))
     delta_timestamps = {
         # -1, 0
         "observation.image": [i / dataset_metadata.fps for i in cfg.observation_delta_indices],
@@ -73,7 +74,7 @@ def main():
         dataset_repo_id, delta_timestamps=delta_timestamps)
 
     # --- Optimizer & Dataloader ---
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         diffusion_model.parameters(), lr=cfg.optimizer_lr)
     dataloader = torch.utils.data.DataLoader(
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
@@ -127,9 +128,17 @@ def main():
 
     # --- Save Config and Stats ---
     cfg.save_pretrained(output_directory)
-    # Filter stats to include only tensors
-    stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items()}
+
+    # Convert stats to flat dictionary with only tensors (like in train_invdyn.py)
+    stats_to_save = {}
+    for key, value in dataset_metadata.stats.items():
+        if isinstance(value, torch.Tensor) or isinstance(value, numpy.ndarray):
+            # Convert numpy arrays to tensors if needed
+            if isinstance(value, numpy.ndarray):
+                value = torch.from_numpy(value)
+            stats_to_save[key] = value
+        # Skip nested dictionaries instead of trying to process them
+
     safetensors.torch.save_file(
         stats_to_save, output_directory / "stats.safetensors")
     print(f"Config and stats saved to: {output_directory}")

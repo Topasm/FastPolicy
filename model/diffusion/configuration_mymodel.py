@@ -129,6 +129,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     inv_dyn_loss_weight: float = 1.0
     inv_dyn_hidden_dim: int = 512
+    inv_dyn_lr: float = 3e-4
     critic_model_path: Optional[str] = None
     critic_hidden_dim: int = 128
 

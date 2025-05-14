@@ -12,29 +12,22 @@ pip install -e ".[pusht]"
 """
 
 from pathlib import Path
-from collections import deque
-import os
 
 import gym_pusht  # noqa: F401
 import gymnasium as gym
 import imageio
 import numpy
 import torch
-import safetensors
-import einops
 import json
+import time
 
 # Import necessary components
-# Import PreTrainedConfig base class
-from lerobot.configs.policies import PreTrainedConfig
-# Keep this for type hints if needed
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
+from model.diffusion.modeling_combined import CombinedPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
-from model.critic.critic_model import CriticScorer
+from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.policies.utils import populate_queues
 
 
 def main():
@@ -55,8 +48,6 @@ def main():
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_critic = False  # Set to False to disable critic-based sample selection
-    # Number of state sequences to sample (if > 1 and use_critic=True)
-    num_inference_samples = 8
 
     # --- Load Config and Stats ---
     config_path = config_stats_path
@@ -72,8 +63,7 @@ def main():
 
     cfg.device = device  # Override device if needed
 
-    # Load from the same dir as config
-    stats_path = config_stats_path / "stats.safetensors"
+    # No need to load the stats directly, we use metadataset stats
 
     metadataset_stats = LeRobotDatasetMetadata("lerobot/pusht")
     dataset_stats: dict[str, dict[str, torch.Tensor]] = {}
@@ -104,7 +94,7 @@ def main():
         raise OSError(
             f"Inverse dynamics checkpoint not found at {invdyn_ckpt_path}")
     inv_dyn_model = MlpInvDynamic(
-        o_dim=cfg.robot_state_feature.shape[0] * 2,
+        o_dim=cfg.robot_state_feature.shape[0],
         a_dim=cfg.action_feature.shape[0],
         hidden_dim=cfg.inv_dyn_hidden_dim,
         # Add other params from MlpInvDynamic if needed (dropout, layernorm, activation)
@@ -115,13 +105,15 @@ def main():
     inv_dyn_model.eval()
     inv_dyn_model.to(device)
 
+    combined_model = CombinedPolicy(diffusion_model, inv_dyn_model)
+
     # Critic Model (Optional)
     critic_model = None
     critic_ckpt_path = critic_output_dir / \
         "critic_final.pth"  # Use final checkpoint name
     if use_critic and critic_ckpt_path.is_file():
         print(f"Loading critic state dict from: {critic_ckpt_path}")
-        critic_model = CriticScorer(
+        critic_model = MultimodalTrajectoryScorer(
             state_dim=cfg.robot_state_feature.shape[0],
             horizon=cfg.horizon,
             hidden_dim=cfg.critic_hidden_dim
@@ -138,29 +130,16 @@ def main():
     else:
         print("Critic usage disabled.")
 
-    # --- Normalization ---
-    normalize_inputs = Normalize(
-        cfg.input_features, cfg.normalization_mapping, dataset_stats)
-    unnormalize_action_output = Unnormalize(
-        {"action": cfg.action_feature}, cfg.normalization_mapping, dataset_stats)
+    # No need for external normalizers - the policy models have their own
 
     # --- Environment Setup ---
     env = gym.make(
         "gym_pusht/PushT-v0",
         obs_type="pixels_agent_pos",  # Ensure this matches config expectations
-        max_episode_steps=1000,
+        max_episode_steps=500,
     )
 
-    # --- Queues for History ---
-    queues = {
-        "observation.state": deque(maxlen=cfg.n_obs_steps),
-        # Use "observation.image" consistent with config/training
-        "observation.image": deque(maxlen=cfg.n_obs_steps),
-        "action": deque(maxlen=cfg.n_action_steps),
-    }
-    # Add env state queue if needed by config
-    if cfg.env_state_feature:
-        queues["observation.environment_state"] = deque(maxlen=cfg.n_obs_steps)
+    # The combined policy now manages its own queues internally
 
     # --- Evaluation Loop ---
     numpy_observation, info = env.reset(seed=42)
@@ -180,62 +159,33 @@ def main():
         image = torch.from_numpy(image_np).to(torch.float32) / 255
         image = image.permute(2, 0, 1)  # HWC to CHW
 
+        state = state.to(device=device, non_blocking=True)
+        image = image.to(device=device, non_blocking=True)
+
         # Add batch dim and move to device
         state = state.unsqueeze(0).to(device)
         image = image.unsqueeze(0).to(device)
 
-        # Create batch dict for normalization and queue population
-        current_obs_batch = {
+        # Create observation dictionary for the model
+        observation = {
             "observation.state": state,
             "observation.image": image,
-            # Add env state if needed: "observation.environment_state": env_state_tensor
         }
 
-        # --- Normalize and Populate Queues ---
-        norm_obs_batch = normalize_inputs(current_obs_batch)
-        # Populates with normalized obs
-        queues = populate_queues(queues, norm_obs_batch)
+        # Reset combined model if starting a new episode
+        if step == 0:
+            combined_model.reset()
 
-        # --- Action Generation ---
-        if len(queues["action"]) == 0:
-            if len(queues["observation.state"]) < cfg.n_obs_steps:
-                print(
-                    f"Waiting for observation queue to fill ({len(queues['observation.state'])}/{cfg.n_obs_steps})...")
-                # Optionally take a default/random action while queue fills
-                numpy_action = env.action_space.sample()
-            else:
-                print("Generating new action plan...")
-                # Prepare batch for the model by stacking history from queues (already normalized)
-                model_input_batch = {}
-                for key, queue in queues.items():
-                    if key.startswith("observation"):
-                        # Items should already be tensors
-                        queue_list = [item.to(device) for item in queue]
-                        # Stack along time dimension (dim=1)
-                        model_input_batch[key] = torch.stack(queue_list, dim=1)
+        # Get action from the combined policy
+        with torch.inference_mode():
+            action = combined_model.select_action(observation)
 
-                # Get the very last state (t=0 relative to window)
-                # State queue has [s_{-1}, s_{0}] for n_obs=2. We need s_0.
-                # Get the last state in the history
-                current_state = model_input_batch["observation.state"][:, 0, :]
-                num_samples = getattr(data, "num_inference_samples", 1)
-                actions = diffusion_model.generate_actions_via_inverse_dynamics(
-                    model_input_batch,  # Pass normalized batch
-                    current_state,     # Pass normalized state
-                    inv_dyn_model,
-                    num_samples=num_samples,
-                )
-
-                actions_unnormalized = unnormalize_action_output(
-                    {"action": actions})["action"]
-
-        queues["action"].extend(actions_unnormalized.transpose(0, 1))
-        action = queues["action"].popleft()
-
-        numpy_action = action.squeeze(0).to("cpu").numpy()
+        # Convert to numpy for environment step
+        numpy_action = action.squeeze(0).cpu().numpy()
 
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
+
         print(f"{step=} {reward=} {terminated=}")
 
         rewards.append(reward)

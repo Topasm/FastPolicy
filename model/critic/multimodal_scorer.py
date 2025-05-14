@@ -18,13 +18,14 @@ class MultimodalScorerConfig:
     max_lang_len: int = 77
     # Transformer settings (used for state sequence encoding)
     state_encoder_hidden_dim: int = 768  # Dim for state encoder transformer
-    state_encoder_num_layers: int = 4   # Fewer layers for state sequence
+    state_encoder_num_layers: int = 4   # Base number of layers for state sequence
     state_encoder_num_heads: int = 12
     # Context settings
     context_hidden_dim: int = 768  # Dim for language/image context
     # Final MLP settings
     combined_hidden_dim: int = 1024  # Hidden dim for the final scoring MLP
-    swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
+    # Factor for SwiGLU intermediate dim (multiplier for combined_hidden_dim)
+    swiglu_intermediate_factor: int = 4
     dropout: float = 0.1
     tokenizer_name: str = "gpt2"
     # Allow changing the number of state encoder layers
@@ -38,8 +39,9 @@ class SwiGLU(nn.Module):
 
     def __init__(self, dim: int, hidden_dim: int | None = None, bias: bool = False):
         super().__init__()
-        hidden_dim = hidden_dim if hidden_dim is not None else int(
-            2/3 * dim * 4)  # Common SwiGLU intermediate size
+        if hidden_dim is None:
+            # Default expansion factor for SwiGLU if not provided (e.g., 4 * 2/3)
+            hidden_dim = int(dim * 4 * 2 / 3)
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -75,8 +77,9 @@ class AttentionPooling(nn.Module):
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
 
         if mask is not None:
-            # Mask expects True for positions NOT to attend to.
-            # Add mask dimension for query head.
+            # mask is (B, Seq), True where tokens should be ignored.
+            # attn_scores is (B, 1, Seq). We need to apply mask before softmax.
+            # Add a large negative number to masked positions.
             attn_scores = attn_scores.masked_fill(
                 mask.unsqueeze(1), float('-inf'))
 
@@ -93,8 +96,8 @@ class MultimodalTrajectoryScorer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Override state encoder layers if num_layers is explicitly set differently
-        state_encoder_layers = config.num_layers if config.num_layers != 8 else config.state_encoder_num_layers
+        # Use num_layers as the definitive setting
+        state_encoder_layers = config.num_layers
         state_encoder_dim = config.state_encoder_hidden_dim
         context_dim = config.context_hidden_dim
         use_bias = False  # ModernBERT: No bias in linear layers
@@ -102,9 +105,8 @@ class MultimodalTrajectoryScorer(nn.Module):
         # 1. Tokenizer & Language Embedding/Projection
         self.tokenizer = tiktoken.get_encoding(config.tokenizer_name)
         vocab_size = self.tokenizer.n_vocab
-        lang_embed_dim = 512
+        lang_embed_dim = config.context_hidden_dim  # Align with context_dim
         self.lang_embed = nn.Embedding(vocab_size, lang_embed_dim)
-        # Use Attention Pooling instead of projection after mean pooling
         self.lang_pool = AttentionPooling(
             lang_embed_dim, context_dim, bias=use_bias)
         self.lang_pos_embed = nn.Parameter(torch.randn(
@@ -122,183 +124,199 @@ class MultimodalTrajectoryScorer(nn.Module):
         self.state_cls_token = nn.Parameter(
             torch.randn(1, 1, state_encoder_dim))
 
-        state_encoder_layer = nn.TransformerEncoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=state_encoder_dim,
             nhead=config.state_encoder_num_heads,
-            dim_feedforward=state_encoder_dim * 4,
+            dim_feedforward=state_encoder_dim * 4,  # Standard feedforward expansion
             dropout=config.dropout,
-            activation=F.gelu,
+            activation=F.gelu,  # GELU is common in Transformers
             batch_first=True,
-            norm_first=True
+            norm_first=True  # Pre-LN
         )
-        self.state_transformer_encoder = nn.TransformerEncoder(
-            state_encoder_layer,
-            num_layers=state_encoder_layers,
-            norm=nn.LayerNorm(state_encoder_dim)
-        )
-
-        # 4. Combined MLP Head using SwiGLU
-        combined_input_dim = context_dim + state_encoder_dim
-        mlp_hidden_dim = config.combined_hidden_dim
-        swiglu_intermediate_dim = int(
-            mlp_hidden_dim * config.swiglu_intermediate_factor * (2/3))
-
-        self.output_head = nn.Sequential(
-            nn.LayerNorm(combined_input_dim),
-            nn.Linear(combined_input_dim,
-                      swiglu_intermediate_dim * 2, bias=use_bias),
-            nn.SiLU(),
-            nn.Linear(swiglu_intermediate_dim, 1, bias=use_bias)
+        self.state_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=state_encoder_layers
         )
 
-        self._init_weights()
+        # 4. Final MLP
+        combined_features_dim = state_encoder_dim + context_dim
+        # Calculate SwiGLU hidden dimension using the factor from config
+        swiglu_hidden_dim = config.combined_hidden_dim * config.swiglu_intermediate_factor
 
-    def _init_weights(self):
-        # Initialize projections and output head
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-        # Positional embeddings and CLS token are already initialized via nn.Parameter
+        self.final_mlp = nn.Sequential(
+            nn.Linear(combined_features_dim,
+                      config.combined_hidden_dim, bias=use_bias),
+            nn.LayerNorm(config.combined_hidden_dim),
+            SwiGLU(config.combined_hidden_dim,
+                   hidden_dim=swiglu_hidden_dim, bias=use_bias),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.combined_hidden_dim, 1,
+                      bias=use_bias)  # Output a single score
+        )
+        self.apply(self._init_weights_custom)
+
+    def _init_weights_custom(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.padding_idx is not None:
+                with torch.no_grad():
+                    module.weight[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            if module.elementwise_affine:
+                nn.init.zeros_(module.bias)
+                nn.init.ones_(module.weight)
 
     def encode_context(
         self,
-        image_features: torch.Tensor,      # (B, T_image, D_image)
-        lang_instruction: list[str],       # List of strings [B]
-        # (B, T_image), True where padded
+        image_features: torch.Tensor,        # (B, N_img, image_feature_dim)
+        lang_instruction: list[str],         # List of B strings
+        # (B, N_img) True if padded
         image_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """ Encodes language and image history into a context vector. """
-        B = image_features.shape[0]
+    ) -> torch.Tensor:  # (B, context_hidden_dim)
         device = image_features.device
 
-        # --- Encode Language ---
-        lang_tokens = [self.tokenizer.encode(
-            text) for text in lang_instruction]
-        max_len = min(max(len(tokens)
-                      for tokens in lang_tokens), self.config.max_lang_len)
-        padded_tokens = torch.full(
-            (B, max_len), self.tokenizer.eot_token, dtype=torch.long, device=device)
-        lang_attn_mask = torch.zeros(
-            (B, max_len), dtype=torch.bool, device=device)
-        for i, tokens in enumerate(lang_tokens):
-            seq = tokens[:max_len]
-            padded_tokens[i, :len(seq)] = torch.tensor(
-                seq, dtype=torch.long, device=device)
-            lang_attn_mask[i, len(seq):] = True
+        # Language encoding
+        processed_tokens_list = []
+        # Using eot_token for padding. A dedicated pad token ID would be ideal if available and handled by embedding.
+        pad_token_id = self.tokenizer.eot_token
 
-        lang_emb = self.lang_embed(padded_tokens)  # (B, T_lang, D_lang_embed)
-        lang_emb = lang_emb + self.lang_pos_embed[:, :max_len, :]
+        for text in lang_instruction:
+            tokens = self.tokenizer.encode(text)
+            # Truncate if longer than max_lang_len
+            tokens = tokens[:self.config.max_lang_len]
+            padding_len = self.config.max_lang_len - len(tokens)
+            tokens += [pad_token_id] * padding_len
+            processed_tokens_list.append(tokens)
 
-        # Use Attention Pooling for language context
-        lang_context = self.lang_pool(
-            lang_emb, mask=lang_attn_mask)  # (B, D_context)
+        lang_tokens_tensor = torch.tensor(
+            processed_tokens_list, dtype=torch.long, device=device)
+        # Create lang_padding_mask: True for pad tokens (to be ignored by AttentionPooling)
+        lang_padding_mask = (lang_tokens_tensor ==
+                             pad_token_id)  # (B, max_lang_len)
 
-        # --- Encode Image ---
-        image_emb = self.image_proj(image_features)  # (B, T_image, D_context)
+        # (B, max_lang_len, lang_embed_dim)
+        lang_embeds = self.lang_embed(lang_tokens_tensor)
+        # Add positional embeddings up to the actual sequence length used
+        lang_embeds = lang_embeds + \
+            self.lang_pos_embed[:, :self.config.max_lang_len, :]
+        lang_features = self.lang_pool(
+            lang_embeds, mask=lang_padding_mask)  # (B, context_hidden_dim)
+
+        # Image encoding
+        # (B, N_img, context_hidden_dim)
+        projected_images = self.image_proj(image_features)
+
         if image_padding_mask is not None:
-            image_emb = image_emb.masked_fill(
+            # Mask out padded images before averaging
+            # image_padding_mask is (B, N_img), True for padded. Unsqueeze for broadcasting.
+            projected_images = projected_images.masked_fill(
                 image_padding_mask.unsqueeze(-1), 0.0)
-            num_unmasked = (~image_padding_mask).sum(dim=1, keepdim=True)
-            image_context = image_emb.sum(dim=1) / num_unmasked.clamp(min=1)
+            # Count non-padded images for averaging, clamp to avoid division by zero.
+            num_valid_images = (~image_padding_mask).sum(
+                dim=1, keepdim=True).clamp(min=1)  # (B, 1)
+            image_features_pooled = projected_images.sum(
+                dim=1) / num_valid_images  # (B, context_hidden_dim)
         else:
-            image_context = image_emb.mean(dim=1)
+            # If no mask, assume all images are valid and average
+            image_features_pooled = projected_images.mean(
+                dim=1)  # (B, context_hidden_dim)
 
-        # --- Combine Context ---
-        context = lang_context + image_context  # (B, D_context)
-        return context
+        # Combine language and image features (e.g., by averaging)
+        context_embedding = (lang_features + image_features_pooled) * 0.5
+        return context_embedding
 
     def encode_state_sequence(
         self,
-        state_sequence: torch.Tensor,      # (B * N_seq, T_state, D_state)
-        # (B * N_seq, T_state), True where padded
+        state_sequence: torch.Tensor,  # (B, Seq_len, state_dim)
+        # (B, Seq_len) True where padded
         state_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """ Encodes a batch of state sequences using a Transformer. """
-        BN, T_state, _ = state_sequence.shape
+    ) -> torch.Tensor:  # (B, state_encoder_dim) CLS token output
+        B, S, _ = state_sequence.shape
         device = state_sequence.device
+        projected_states = self.state_proj(
+            state_sequence.float())  # (B, S, state_encoder_dim)
 
-        state_emb = self.state_proj(state_sequence)
-        state_emb = state_emb + self.state_pos_embed[:, :T_state, :]
+        # Add positional embeddings up to the actual sequence length
+        projected_states = projected_states + self.state_pos_embed[:, :S, :]
 
-        cls_token = self.state_cls_token.expand(BN, -1, -1)
-        state_emb_with_cls = torch.cat([cls_token, state_emb], dim=1)
+        cls_tokens = self.state_cls_token.expand(
+            B, -1, -1)  # (B, 1, state_encoder_dim)
+        # (B, 1+S, state_encoder_dim)
+        encoder_input = torch.cat([cls_tokens, projected_states], dim=1)
 
-        if state_padding_mask is None:
-            state_padding_mask = torch.zeros(
-                (BN, T_state), dtype=torch.bool, device=device)
+        # Create padding mask for the transformer
+        # True means the position is masked (ignored by attention)
+        full_padding_mask = None
+        if state_padding_mask is not None:
+            # CLS token is never padded
+            cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+            full_padding_mask = torch.cat(
+                [cls_mask, state_padding_mask], dim=1)  # (B, 1+S)
 
-        cls_mask = torch.zeros((BN, 1), dtype=torch.bool, device=device)
-        combined_attn_mask = torch.cat([cls_mask, state_padding_mask], dim=1)
-
-        transformer_output = self.state_transformer_encoder(
-            state_emb_with_cls,
-            src_key_padding_mask=combined_attn_mask
-        )
-
-        state_encoding = transformer_output[:, 0, :]
-        return state_encoding
+        # Transformer expects src_key_padding_mask where True indicates a padded token
+        transformer_output = self.state_encoder(
+            encoder_input, src_key_padding_mask=full_padding_mask)
+        state_cls_output = transformer_output[:, 0]  # (B, state_encoder_dim)
+        return state_cls_output
 
     def forward(
         self,
-        state_sequences: torch.Tensor,     # (B, N_seq, T_state, D_state)
-        image_features: torch.Tensor,      # (B, T_image, D_image) - History
-        lang_instruction: list[str],       # List of strings [B]
-        state_padding_mask: torch.Tensor | None = None,
-        image_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Scores multiple state sequences for each language/image context.
+        state_sequences: torch.Tensor,        # (B, Seq_len, state_dim)
+        image_features: torch.Tensor,        # (B, N_img, image_feature_dim)
+        lang_instruction: list[str],         # List of B strings
+        state_padding_mask: torch.Tensor | None = None,  # (B, Seq_len)
+        image_padding_mask: torch.Tensor | None = None,  # (B, N_img)
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # Returns (scores (B,1), state_cls_embedding (B, state_encoder_dim))
 
-        Returns:
-            Tensor of shape (B, N_seq) with scores.
-        """
-        B, N_seq, T_state, _ = state_sequences.shape
-        device = state_sequences.device
+        state_cls_embedding = self.encode_state_sequence(
+            state_sequences, state_padding_mask
+        )  # (B, state_encoder_dim)
 
-        context_encoding = self.encode_context(
-            image_features, lang_instruction, image_padding_mask)
-
-        state_sequences_flat = einops.rearrange(
-            state_sequences, 'b n t d -> (b n) t d')
-        state_padding_mask_flat = None
-        if state_padding_mask is not None:
-            state_padding_mask_flat = einops.rearrange(
-                state_padding_mask, 'b n t -> (b n) t')
-
-        state_encoding_flat = self.encode_state_sequence(
-            state_sequences_flat, state_padding_mask_flat)
-
-        context_encoding_repeated = einops.repeat(
-            context_encoding, 'b d -> b n d', n=N_seq)
-        state_encoding = einops.rearrange(
-            state_encoding_flat, '(b n) d -> b n d', n=N_seq)
+        context_embedding = self.encode_context(
+            image_features, lang_instruction, image_padding_mask
+        )  # (B, context_dim)
 
         combined_features = torch.cat(
-            [context_encoding_repeated, state_encoding], dim=-1)
+            [state_cls_embedding, context_embedding], dim=-1)
+        scores = self.final_mlp(combined_features)  # (B, 1)
 
-        combined_features_flat = einops.rearrange(
-            combined_features, 'b n d -> (b n) d')
-        scores_flat = self.output_head(
-            combined_features_flat)
-
-        scores = einops.rearrange(scores_flat, '(b n) 1 -> b n', n=N_seq)
-
-        return scores
+        return scores, state_cls_embedding
 
     @torch.no_grad()
-    def score(
+    def get_raw_state_cls_features(
         self,
-        state_sequences: torch.Tensor,     # (B, N_seq, T_state, D_state)
-        image_features: torch.Tensor,      # (B, T_image, D_image) - History
-        lang_instruction: list[str],       # List of strings [B]
+        state_sequences: torch.Tensor,
+        state_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Returns the raw CLS token features from the state encoder.
+        Sets model to eval mode.
+        """
+        self.eval()
+        state_cls_embedding = self.encode_state_sequence(
+            state_sequences, state_padding_mask
+        )
+        return state_cls_embedding
+
+    @torch.no_grad()
+    def score_trajectory(
+        self,
+        state_sequences: torch.Tensor,
+        image_features: torch.Tensor,
+        lang_instruction: list[str],
         state_padding_mask: torch.Tensor | None = None,
         image_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """ Inference entry point. Returns scores of shape (B, N_seq). """
+        """
+        Inference entrypoint for getting scores.
+        Sets model to eval mode.
+        """
         self.eval()
-        scores = self.forward(
+        scores, _ = self.forward(
             state_sequences,
             image_features,
             lang_instruction,

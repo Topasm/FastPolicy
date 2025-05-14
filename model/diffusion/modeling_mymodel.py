@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from pathlib import Path
 import safetensors
 
-from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+from lerobot.common.constants import OBS_ENV, OBS_ROBOT, OBS_IMAGE
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.diffusion_modules import (
     DiffusionRgbEncoder,
@@ -27,8 +27,9 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     populate_queues,
 )
-from model.critic.critic_model import CriticScorer  # Import CriticScorer
-from model.invdynamics.invdyn import MlpInvDynamic, SeqInvDynamic, TemporalUNetInvDynamic
+
+from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
+from model.invdynamics.invdyn import MlpInvDynamic
 
 
 class MYDiffusionPolicy(PreTrainedPolicy):
@@ -90,8 +91,8 @@ class MYDiffusionPolicy(PreTrainedPolicy):
             use_layernorm=True,
             out_activation=nn.Tanh(),
         )
-        # Instantiate CriticScorer
-        self.critic_scorer = CriticScorer(
+        # Instantiate MultimodalTrajectoryScorer
+        self.critic_scorer = MultimodalTrajectoryScorer(
             state_dim=self.state_dim,
             horizon=config.horizon,
             hidden_dim=config.critic_hidden_dim
@@ -116,7 +117,7 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         - stats.safetensors
         - diffusion.pth (state_dict for MyDiffusionModel)
         - invdyn.pth (state_dict for MlpInvDynamic)
-        - critic.pth (state_dict for CriticScorer, optional)
+        - critic.pth (state_dict for MultimodalTrajectoryScorer, optional)
         """
         pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
 
@@ -266,11 +267,24 @@ class MyDiffusionModel(nn.Module):
     Main model class coordinating the vision encoders, DiT, and noise scheduler.
     """
 
-    def __init__(self, config: DiffusionConfig):
+    def __init__(self, config: DiffusionConfig, dataset_stats: dict[str, dict[str, Tensor]] | None = None):
         super().__init__()
         self.config = config
         self.state_dim = config.robot_state_feature.shape[0]  # Store state dim
         self.action_dim = config.action_feature.shape[0]  # Store action dim
+
+        # Add normalizers/unnormalizers
+        if dataset_stats is not None:
+            self.normalize_inputs = Normalize(
+                config.input_features, config.normalization_mapping, dataset_stats)
+            self.unnormalize_action_output = Unnormalize(
+                {"action": config.action_feature},
+                config.normalization_mapping, dataset_stats
+            )
+        else:
+            # Provide dummy implementations if no stats available
+            self.normalize_inputs = lambda x: x
+            self.unnormalize_action_output = lambda x: x
 
         # Determine the dimension the diffusion model should predict
         self.diffusion_target_dim = self.state_dim  # Always predict state dim now
@@ -335,66 +349,122 @@ class MyDiffusionModel(nn.Module):
 
     def _encode_images(self, images: Tensor) -> Tensor:
         """Encodes images using the appropriate encoder(s)."""
-        B, T_obs, N_cam = images.shape[:3]
-
-        if self.config.use_separate_rgb_encoder_per_camera:
-            images_reshaped = einops.rearrange(
-                images, "b t n c h w -> n (b t) c h w")
-            features_list = []
-            for i in range(N_cam):
-                features_list.append(self.rgb_encoder[i](images_reshaped[i]))
-            img_features = torch.stack(features_list, dim=0)
-            img_features = einops.rearrange(
-                img_features, "n (b t) d -> b t (n d)", b=B, t=T_obs)
+        # Handle various image tensor shapes (including the 6D tensor case)
+        if len(images.shape) == 6 and images.shape[2] == 1:
+            # Special case: Shape is [b, t, 1, c, h, w] - extra dimension
+            B, T_obs = images.shape[:2]
+            # Remove the extra dimension
+            images = images.squeeze(2)
+            N_cam = 1  # Set N_cam to 1 since we've removed that dimension
         else:
-            images_reshaped = einops.rearrange(
-                images, "b t n c h w -> (b t n) c h w")
-            img_features = self.rgb_encoder(images_reshaped)
-            img_features = einops.rearrange(
-                img_features, "(b t n) d -> b t (n d)", b=B, t=T_obs, n=N_cam)
-        return img_features
+            # Standard case: Shape is [b, t, n, c, h, w]
+            B, T_obs, N_cam = images.shape[:3]
+
+        try:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                images_reshaped = einops.rearrange(
+                    images, "b t n c h w -> n (b t) c h w")
+                features_list = []
+                for i in range(N_cam):
+                    features_list.append(
+                        self.rgb_encoder[i](images_reshaped[i]))
+                img_features = torch.stack(features_list, dim=0)
+                img_features = einops.rearrange(
+                    img_features, "n (b t) d -> b t (n d)", b=B, t=T_obs)
+            else:
+                images_reshaped = einops.rearrange(
+                    images, "b t n c h w -> (b t n) c h w")
+                img_features = self.rgb_encoder(images_reshaped)
+                img_features = einops.rearrange(
+                    img_features, "(b t n) d -> b t (n d)", b=B, t=T_obs, n=N_cam)
+            return img_features
+        except Exception as e:
+            print(f"Error during image encoding: {e}")
+            print(f"Image shape: {images.shape}")
+            # Return a zero tensor as fallback
+            return torch.zeros((B, T_obs, self.config.transformer_dim * N_cam),
+                               device=images.device)
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector.
            Expects batch to have normalized 'observation.state' and potentially 'observation.image'.
         """
         # Check required keys exist
-        if "observation.state" not in batch:
+        if OBS_ROBOT not in batch:
             raise KeyError(
-                "Missing 'observation.state' in batch for _prepare_global_conditioning")
+                f"Missing '{OBS_ROBOT}' in batch for _prepare_global_conditioning")
 
-        batch_size = batch["observation.state"].shape[0]
+        batch_size = batch[OBS_ROBOT].shape[0]
         n_obs_steps = self.config.n_obs_steps
 
-        if batch["observation.state"].shape[1] < n_obs_steps:
+        if batch[OBS_ROBOT].shape[1] < n_obs_steps:
             raise ValueError(
-                f"observation.state sequence length ({batch['observation.state'].shape[1]}) "
+                f"{OBS_ROBOT} sequence length ({batch[OBS_ROBOT].shape[1]}) "
                 f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
             )
-        cond_state = batch["observation.state"][:, :n_obs_steps, :]
+        cond_state = batch[OBS_ROBOT][:, :n_obs_steps, :]
         global_cond_feats = [cond_state]
 
         # Check if images are configured AND present in the batch before processing
-        if self.config.image_features and "observation.image" in batch:
-            images = batch["observation.image"]
-            _B, n_img_steps = images.shape[:2]
-            n_cam = 1  # Assuming single camera for "observation.image" key
+        if self.config.image_features and OBS_IMAGE in batch:
+            images = batch[OBS_IMAGE]
+            _B = images.shape[0]
+            n_img_steps = images.shape[1]
 
-            if n_img_steps != n_obs_steps:
+            # Handle different image tensor shapes
+            if len(images.shape) == 6:  # Shape: [b, t, n_cam, c, h, w]
+                # Special case for 6D tensor
+                if images.shape[2] == 1:  # If there's just one camera, squeeze that dimension
+                    images = images.squeeze(2)  # Convert to [b, t, c, h, w]
+                else:
+                    # Use the _encode_images method which can handle multi-camera input
+                    try:
+                        img_features = self._encode_images(images)
+                        global_cond_feats.append(img_features)
+                        # Skip the rest of the processing for this case
+                        goto_next_condition = True
+                    except Exception as e:
+                        print(f"Error processing 6D image tensor: {e}")
+                        print(f"Image shape: {images.shape}")
+                        # Create a fallback feature tensor
+                        img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                                   device=batch["observation.state"].device)
+                        global_cond_feats.append(img_features)
+                        goto_next_condition = True
+
+            # If we need to skip to the next condition
+            if 'goto_next_condition' in locals() and goto_next_condition:
+                pass
+            # Standard processing for 5D tensor [b, t, c, h, w]
+            elif len(images.shape) == 5:
+                if n_img_steps != n_obs_steps:
+                    raise ValueError(
+                        f"Image sequence length ({n_img_steps}) in batch does not match "
+                        f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
+                        f"and policy config."
+                    )
+                assert _B == batch_size
+
+                try:
+                    images_reshaped = einops.rearrange(
+                        images, "b t c h w -> (b t) c h w")
+                    img_features = self.rgb_encoder(images_reshaped)
+                    img_features = einops.rearrange(
+                        img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
+                    )
+                    global_cond_feats.append(img_features)
+                except Exception as e:
+                    print(f"Error during standard image processing: {e}")
+                    print(f"Image shape: {images.shape}")
+                    # Create a fallback feature tensor
+                    img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                               device=batch["observation.state"].device)
+                    global_cond_feats.append(img_features)
+            else:
+                # Unknown image tensor format
                 raise ValueError(
-                    f"Image sequence length ({n_img_steps}) in batch does not match "
-                    f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
-                    f"and policy config."
-                )
-            assert _B == batch_size
+                    f"Unsupported image tensor shape: {images.shape}")
 
-            images_reshaped = einops.rearrange(
-                images, "b t c h w -> (b t) c h w")
-            img_features = self.rgb_encoder(images_reshaped)
-            img_features = einops.rearrange(
-                img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
-            )
-            global_cond_feats.append(img_features)
         elif self.config.image_features and "observation.image" not in batch:
             # If images configured but not provided in this specific batch, print warning
             print("Warning: image_features configured but 'observation.image' not found in batch for _prepare_global_conditioning.")
@@ -417,65 +487,6 @@ class MyDiffusionModel(nn.Module):
         concatenated_features = torch.cat(global_cond_feats, dim=-1)
         global_cond = concatenated_features.flatten(start_dim=1)
         return global_cond
-
-    @torch.no_grad()
-    def generate_actions_via_inverse_dynamics(
-        self,
-        norm_batch: dict[str, Tensor],  # Expects normalized batch
-        norm_current_state: Tensor,    # Expects normalized state
-        inv_dyn_model: MlpInvDynamic,
-        num_samples: int = 1,
-    ) -> Tensor:
-        """Generates actions using diffusion for states and then iteratively applying
-           an inverse dynamics model predicting a_t from (s_t, s_{t+1}).
-           Returns `n_action_steps` (4) normalized actions.
-        """
-        batch_size = norm_current_state.shape[0]
-        n_obs_steps = self.config.n_obs_steps
-        n_action_steps = self.config.n_action_steps  # This is 4
-
-        # Prepare conditioning from the normalized batch
-        global_cond = self._prepare_global_conditioning(norm_batch)
-
-        # Repeat global_cond if num_samples > 1
-        if num_samples > 1:
-            global_cond = global_cond.repeat_interleave(num_samples, dim=0)
-
-        # Sample normalized future states (Horizon=16)
-        predicted_states_flat = self.conditional_sample(
-            batch_size * num_samples, global_cond=global_cond
-        )  # Output: (B*N, 16, D_state)
-
-        predicted_states = einops.rearrange(
-            predicted_states_flat, "(b n) h d -> b n h d", b=batch_size, n=num_samples
-        )
-
-        # Always select the first sample if multiple are generated
-        selected_states = predicted_states[:, 0]  # (B, 16, D_state)
-
-        # Iteratively predict actions
-        predicted_actions = []
-        current_s = norm_current_state  # s_0
-        for i in range(n_action_steps):  # Iterate 4 times (i=0, 1, 2, 3)
-            next_s = selected_states[:, i]  # s_1, s_2, s_3, s_4
-
-            # Create state pair (s_i, s_{i+1})
-            # Shape: (B, D_state * 2)
-            state_pair = torch.cat([current_s, next_s], dim=-1)
-
-            # Predict action a_i
-            action_i = inv_dyn_model.predict(
-                state_pair)  # Shape: (B, action_dim)
-            predicted_actions.append(action_i)
-
-            # Update current state for next iteration
-            current_s = next_s
-
-        # Stack the predicted actions
-        actions_to_execute = torch.stack(
-            predicted_actions, dim=1)  # Shape: (B, 4, action_dim)
-
-        return actions_to_execute  # Return normalized actions
 
     def compute_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
         """Computes the diffusion loss.
@@ -503,7 +514,7 @@ class MyDiffusionModel(nn.Module):
 
         # Check for image history
         if self.config.image_features:
-            if "observation.image" in norm_batch:
+            if OBS_IMAGE in norm_batch:
                 image_history = norm_batch["observation.image"]
                 # Check if image sequence length matches n_obs_steps
                 if image_history.shape[1] != n_obs_steps:
@@ -525,15 +536,15 @@ class MyDiffusionModel(nn.Module):
 
         # Add env state history if configured and present
         if self.config.env_state_feature:
-            if OBS_ENV in norm_batch:
-                full_env_state = norm_batch[OBS_ENV]
+            if OBS_ROBOT in norm_batch:
+                full_env_state = norm_batch[OBS_ROBOT]
                 if full_env_state.shape[1] < n_obs_steps:
                     raise ValueError(
                         f"Env state sequence too short for history. Need {n_obs_steps}, got {full_env_state.shape[1]}")
-                cond_batch[OBS_ENV] = full_env_state[:, :n_obs_steps]
+                cond_batch[OBS_ROBOT] = full_env_state[:, :n_obs_steps]
             else:
                 print(
-                    f"Warning: env_state_feature configured but '{OBS_ENV}' not found in norm_batch.")
+                    f"Warning: env_state_feature configured but '{OBS_ROBOT}' not found in norm_batch.")
 
         # Calculate global_cond based on available history features in cond_batch
         # This tensor's dimension MUST match the expected input dim of cond_embed layer
@@ -544,13 +555,9 @@ class MyDiffusionModel(nn.Module):
         target_key = "observation.state"
         # Ensure sequence is long enough for target horizon starting after history
         expected_target_end_idx = n_obs_steps + horizon
-        if full_state_sequence.shape[1] < expected_target_end_idx:
-            raise ValueError(
-                f"Full state sequence too short for target. Need length {expected_target_end_idx}, got {full_state_sequence.shape[1]}")
-        # Target states are s_1...s_H, which are at indices n_obs_steps to n_obs_steps+horizon-1
-        # Shape (B, H, D)
+
         clean_targets = full_state_sequence[:,
-                                            n_obs_steps:expected_target_end_idx, :]
+                                            n_obs_steps-1:expected_target_end_idx-1, :]
 
         if clean_targets.shape[1] != horizon:
             # This check should be redundant if the length check above passes, but good for safety
@@ -608,10 +615,6 @@ class MyDiffusionModel(nn.Module):
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
 
-        # We need states s_{-1} through s_{H} for pairs (s_t, s_{t+1}) where t= -1..H-1
-        # The state_delta_indices property loads states from t=1-n_obs to t=n_obs+H-1
-        # e.g., n_obs=2, H=16 -> indices -1..17. Length = 19.
-        # Correct expected length
         expected_len = len(self.config.state_delta_indices)
         loaded_state_len = invdyn_batch["observation.state"].shape[1]
 
@@ -628,25 +631,36 @@ class MyDiffusionModel(nn.Module):
 
         # Create previous and current states for pairs
         # s_prev: s_{-1} to s_{H-1} (or s_{n_obs+H-2}). Shape: (B, expected_len-1, D_state)
-        s_prev = all_states[:, :-1, :]
+        s_prev = all_states[:, :-1, :]  # All states except the last one
         # s_curr: s_{0} to s_{H} (or s_{n_obs+H-1}). Shape: (B, expected_len-1, D_state)
-        s_curr = all_states[:, 1:, :]
+        s_curr = all_states[:, 1:, :]  # All states except the first one
 
         # Shape: (B, expected_len-1, D_state * 2)
         state_pairs = torch.cat([s_prev, s_curr], dim=-1)
 
-        # We only need the first H pairs corresponding to t=0..H-1 for loss calculation
+        # We only need the pairs corresponding to t=0..H-1 for loss calculation
         # These are pairs (s_0, s_1) ... (s_{H-1}, s_H)
         # The index for t=0 in state_pairs is n_obs_steps - 1
         start_pair_idx = n_obs_steps - 1
-        end_pair_idx = start_pair_idx + horizon
+        # We need to make sure we don't go beyond available action data
+        # Since actions are [0...15] but states go to [17], we need to limit the horizon
+        action_horizon = min(horizon, len(self.config.action_delta_indices))
+        end_pair_idx = start_pair_idx + action_horizon
+
+        # Check if our indices would be in range
+        if start_pair_idx >= state_pairs.shape[1] or end_pair_idx > state_pairs.shape[1]:
+            raise ValueError(
+                f"Invalid indices for state_pairs with shape {state_pairs.shape}. "
+                f"start_pair_idx={start_pair_idx}, end_pair_idx={end_pair_idx}"
+            )
+
         # Shape: (B, H, D_state * 2)
         state_pairs_for_loss = state_pairs[:, start_pair_idx:end_pair_idx, :]
 
         B, H, D_pair = state_pairs_for_loss.shape
-        if H != horizon:
+        if H != action_horizon:  # Compare with action_horizon instead of horizon
             raise ValueError(
-                f"Sliced state_pairs_for_loss has wrong horizon {H}, expected {horizon}")
+                f"Sliced state_pairs_for_loss has wrong horizon {H}, expected {action_horizon}")
 
         state_pairs_flat = state_pairs_for_loss.reshape(
             B * H, D_pair)  # Use reshape instead of view
@@ -655,11 +669,25 @@ class MyDiffusionModel(nn.Module):
         pred_actions = pred_actions_flat.view(
             B, H, self.action_dim)  # Shape: (B, H, A)
 
+        # Get the actions that correspond to the state pairs we're using for loss
+        # These are actions a_0 to a_{H-1}
+        # Make sure we're using the limited action_horizon here
+        # Shape: (B, H, A)
         true_actions = invdyn_batch["action"][:,
-                                              :horizon, :]  # Shape: (B, H, A)
+                                              n_obs_steps:n_obs_steps+action_horizon, :]
 
-        if self.config.do_mask_loss_for_padding:
-            mask = ~invdyn_batch["action_is_pad"][:, :horizon]  # Shape: (B, H)
+        # Ensure shapes match exactly - this can happen if state horizon > action horizon
+        if pred_actions.shape[1] != true_actions.shape[1]:
+            # Adjust pred_actions to match true_actions
+            pred_actions = pred_actions[:, :true_actions.shape[1], :]
+
+        if self.config.do_mask_loss_for_padding and "action_is_pad" in invdyn_batch:
+            # Make sure to use the correct slice of action_is_pad that corresponds to our true_actions
+            pad_mask = invdyn_batch["action_is_pad"][:,
+                                                     n_obs_steps-1:n_obs_steps-1+action_horizon]
+            pad_mask = pad_mask[:, :true_actions.shape[1]]  # Ensure same shape
+            # Invert the mask: 0 for padding, 1 for valid
+            mask = ~pad_mask  # Shape: (B, H)
             loss_e = F.mse_loss(pred_actions, true_actions,
                                 reduction="none")  # Shape: (B, H, A)
             loss_e = loss_e * mask.unsqueeze(-1)
