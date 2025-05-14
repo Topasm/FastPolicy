@@ -22,7 +22,7 @@ import json
 # Import necessary components
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
-from model.diffusion.modeling_combined import CombinedPolicy
+from model.diffusion.modeling_critic_combined import CombinedCriticPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
 from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -101,9 +101,6 @@ def main():
     inv_dyn_model.eval()
     inv_dyn_model.to(device)
 
-    # Create combined model
-    combined_model = CombinedPolicy(diffusion_model, inv_dyn_model)
-
     # Noise Critic Model
     noise_critic_ckpt_path = noise_critic_output_dir / "noise_critic_final.pth"
     if not noise_critic_ckpt_path.is_file():
@@ -131,6 +128,14 @@ def main():
     noise_critic_model.eval()
     noise_critic_model.to(device)
     print("Noise critic model loaded successfully.")
+
+    # Create combined model with critic
+    combined_model = CombinedCriticPolicy(
+        diffusion_model=diffusion_model,
+        inv_dyn_model=inv_dyn_model,
+        critic_model=noise_critic_model,
+        num_samples=5  # Generate 5 trajectory samples
+    )
 
     # --- Environment Setup ---
     env = gym.make(
@@ -177,13 +182,11 @@ def main():
             combined_model.reset()
 
         # Get action from the combined policy
-        # We use predict_with_trajectories to get both action and trajectories
+        # The select_action method now returns both action and trajectories
         with torch.inference_mode():
-            # For the combined policy we need to get trajectories as well
-            action, trajectories = combined_model.predict_with_trajectories(
+            # Call our updated select_action method that uses the critic model
+            action, trajectories = combined_model.select_action(
                 curr_state=observation["observation.state"],
-                # Same as current for first step
-                prev_state=observation["observation.state"],
                 image=image
             )
 

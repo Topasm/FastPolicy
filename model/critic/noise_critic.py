@@ -21,98 +21,6 @@ class NoiseCriticConfig:
     norm_type: str = "post"
 
 
-class MLPCritic(nn.Module):
-    """
-    MLP-based critic that scores a sequence of states.
-    Input: (B, H, D_state)
-    Output: (B, 1) score per sequence
-    """
-
-    def __init__(self, config: NoiseCriticConfig):
-        super().__init__()
-        self.state_dim = config.state_dim
-        self.horizon = config.horizon
-        self.hidden_dim = config.hidden_dim
-        self.use_image_context = config.use_image_context
-
-        # Input dimensions
-        input_dim = config.state_dim * config.horizon
-
-        # Add image feature dimension if using image context
-        if self.use_image_context:
-            self.img_encoder = nn.Sequential(
-                nn.Linear(config.image_feature_dim, config.hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(
-                    config.hidden_dim) if config.use_layernorm else nn.Identity(),
-                nn.Dropout(config.dropout),
-                nn.Linear(config.hidden_dim, config.hidden_dim // 2)
-            )
-            input_dim += config.hidden_dim // 2
-
-        # Build network
-        layers = []
-        current_dim = input_dim
-
-        # Hidden layers
-        for _ in range(config.num_layers - 1):
-            layers.append(nn.Linear(current_dim, config.hidden_dim))
-            if config.use_layernorm:
-                layers.append(nn.LayerNorm(config.hidden_dim))
-            layers.append(nn.GELU())
-            layers.append(nn.Dropout(config.dropout))
-            current_dim = config.hidden_dim
-
-        # Output layer (no activation for logits)
-        layers.append(nn.Linear(current_dim, 1))
-
-        self.net = nn.Sequential(*layers)
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights for better training stability."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                nn.init.zeros_(m.bias)
-
-    def forward(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
-        """
-        Args:
-            trajectory_sequence: (B, H, D_state) tensor of state sequences.
-            image_features: Optional (B, D_img) tensor of image features.
-        Returns:
-            (B, 1) tensor of scores (logits).
-        """
-        B, H, D = trajectory_sequence.shape
-        if H != self.horizon or D != self.state_dim:
-            raise ValueError(
-                f"Input shape mismatch. Expected (B, {self.horizon}, {self.state_dim}), got {(B, H, D)}")
-
-        # Flatten sequence
-        state_flat = trajectory_sequence.view(B, -1)
-
-        # Process image features if provided
-        if self.use_image_context and image_features is not None:
-            img_encoded = self.img_encoder(image_features)
-            # Concatenate flattened state sequence with image features
-            net_input = torch.cat([state_flat, img_encoded], dim=1)
-        else:
-            net_input = state_flat
-
-        # Pass through network
-        score = self.net(net_input.float())
-        return score
-
-    @torch.no_grad()
-    def score(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
-        """Inference entrypoint."""
-        self.eval()
-        score = self.forward(trajectory_sequence, image_features)
-        self.train()
-        return score
-
-
 class TransformerCritic(nn.Module):
     """
     Transformer-based critic that scores a sequence of states.
@@ -221,104 +129,6 @@ class TransformerCritic(nn.Module):
 
         # Output head
         score = self.output_head(first_token)
-        return score
-
-    @torch.no_grad()
-    def score(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
-        """Inference entrypoint."""
-        self.eval()
-        score = self.forward(trajectory_sequence, image_features)
-        self.train()
-        return score
-
-
-class GRUCritic(nn.Module):
-    """
-    GRU-based critic that scores a sequence of states.
-    Input: (B, H, D_state)
-    Output: (B, 1) score per sequence
-    """
-
-    def __init__(self, config: NoiseCriticConfig):
-        super().__init__()
-        self.state_dim = config.state_dim
-        self.horizon = config.horizon
-        self.hidden_dim = config.hidden_dim
-        self.use_image_context = config.use_image_context
-
-        # GRU layer
-        self.gru = nn.GRU(
-            input_size=config.state_dim,
-            hidden_size=config.hidden_dim,
-            num_layers=config.num_layers,
-            batch_first=True,
-            dropout=config.dropout if config.num_layers > 1 else 0
-        )
-
-        # Image context processing if needed
-        if self.use_image_context:
-            self.img_encoder = nn.Sequential(
-                nn.Linear(config.image_feature_dim, config.hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(
-                    config.hidden_dim) if config.use_layernorm else nn.Identity(),
-                nn.Dropout(config.dropout)
-            )
-
-        # Output head
-        output_input_dim = config.hidden_dim
-        if self.use_image_context:
-            output_input_dim += config.hidden_dim  # Add image feature dimension
-
-        self.output_head = nn.Sequential(
-            nn.Linear(output_input_dim, config.hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(
-                config.hidden_dim) if config.use_layernorm else nn.Identity(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, 1)
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                nn.init.zeros_(m.bias)
-
-    def forward(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
-        """
-        Args:
-            trajectory_sequence: (B, H, D_state) tensor of state sequences.
-            image_features: Optional (B, D_img) tensor of image features.
-        Returns:
-            (B, 1) tensor of scores (logits).
-        """
-        B, H, D = trajectory_sequence.shape
-        if H != self.horizon or D != self.state_dim:
-            raise ValueError(
-                f"Input shape mismatch. Expected (B, {self.horizon}, {self.state_dim}), got {(B, H, D)}")
-
-        # Process sequence through GRU
-        # h_n shape: (num_layers, B, hidden_dim)
-        _, h_n = self.gru(trajectory_sequence)
-
-        # Use the final hidden state from the last layer
-        final_hidden = h_n[-1]  # (B, hidden_dim)
-
-        # Process image features if provided
-        if self.use_image_context and image_features is not None:
-            img_encoded = self.img_encoder(image_features)  # (B, hidden_dim)
-            # Concatenate with GRU output
-            # (B, 2*hidden_dim)
-            combined = torch.cat([final_hidden, img_encoded], dim=1)
-        else:
-            combined = final_hidden
-
-        # Final score
-        score = self.output_head(combined)
         return score
 
     @torch.no_grad()
@@ -525,12 +335,9 @@ def create_noise_critic(config: NoiseCriticConfig):
     """
     Factory function to create the appropriate critic model based on config.
     """
-    if config.architecture.lower() == "mlp":
-        return MLPCritic(config)
-    elif config.architecture.lower() == "transformer":
+    if config.architecture.lower() == "transformer":
         return TransformerCritic(config)
-    elif config.architecture.lower() == "gru":
-        return GRUCritic(config)
+
     elif config.architecture.lower() == "dv_horizon":
         return DVHorizonCritic(config)
     else:
