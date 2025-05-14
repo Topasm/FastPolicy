@@ -16,7 +16,7 @@ def main():
     output_directory = Path("outputs/train/invdyn_only")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    training_steps = 3000  # Adjust as needed
+    training_steps = 5000  # Adjust as needed
     log_freq = 50
     save_freq = 500  # Frequency to save checkpoints
 
@@ -68,9 +68,12 @@ def main():
     dataset = LeRobotDataset(
         dataset_repo_id, delta_timestamps=delta_timestamps)
 
-    # --- Optimizer & Dataloader ---
+    # --- Optimizer, Scheduler & Dataloader ---
     optimizer = torch.optim.Adam(
         invdyn_model.parameters(), lr=cfg.inv_dyn_lr)  # Use same LR for now
+    # Add LR scheduler with cosine annealing
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=training_steps)
     dataloader = torch.utils.data.DataLoader(
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
     )
@@ -79,6 +82,9 @@ def main():
     step = 0
     done = False
     print("Starting Inverse Dynamics Model Training...")
+    print(
+        f"Training for {training_steps} steps with cosine annealing LR schedule")
+    print(f"Initial learning rate: {optimizer.param_groups[0]['lr']:.6f}")
     while not done:
         for batch in dataloader:
             # Prepare normalized batch for invdyn loss (on CPU)
@@ -98,9 +104,12 @@ def main():
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            lr_scheduler.step()  # Step the LR scheduler
 
             if step % log_freq == 0:
-                print(f"Step: {step}/{training_steps} Loss: {loss.item():.4f}")
+                current_lr = lr_scheduler.get_last_lr()[0]
+                print(
+                    f"Step: {step}/{training_steps} Loss: {loss.item():.4f} LR: {current_lr:.6f}")
 
             if step % save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"invdyn_step_{step}.pth"
