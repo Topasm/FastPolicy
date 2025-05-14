@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Evaluation script for the noise trajectory critic model.
-Tests the model's ability to distinguish between original and noisy trajectories.
+Evaluation script for the noise trajectory critic model in a real environment.
+This script combines the diffusion model, inverse dynamics model, and the noise critic
+to evaluate the effectiveness of the noise critic in a real environment setting.
 """
 
 import torch
@@ -10,38 +11,75 @@ import seaborn as sns
 import numpy as np
 from pathlib import Path
 import argparse
+import gym_pusht  # noqa: F401
+import gymnasium as gym
+import imageio
+import json
+import time
+from typing import Dict, List, Optional, Tuple, Any, Union
+import os
+
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.common.datasets.utils import dataset_to_policy_features
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+
+# Import the models
+from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
+from model.diffusion.configuration_mymodel import DiffusionConfig
+from model.diffusion.modeling_mymodel import MyDiffusionModel
+from model.diffusion.modeling_combined import CombinedPolicy
+from model.invdynamics.invdyn import MlpInvDynamic
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve, confusion_matrix
+from pathlib import Path
+import argparse
 import einops
+import gym_pusht  # noqa: F401
+import gymnasium as gym
+import imageio
+import json
+import time
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.policies.normalize import Normalize
+from lerobot.common.policies.normalize import Normalize, Unnormalize
 
-# Import the critic model
+# Import the models
 from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
 from model.diffusion.configuration_mymodel import DiffusionConfig
+from model.diffusion.modeling_mymodel import MyDiffusionModel
+from model.diffusion.modeling_combined import CombinedPolicy
+from model.invdynamics.invdyn import MlpInvDynamic
 from model.diffusion.diffusion_modules import DiffusionRgbEncoder
+from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve, confusion_matrix
 
 
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description="Evaluate noise trajectory critic model")
-    parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to the trained model checkpoint")
+        description="Evaluate noise trajectory critic model with combined policy")
+    parser.add_argument("--critic_path", type=str, required=True,
+                        help="Path to the trained critic model checkpoint")
+    parser.add_argument("--diffusion_path", type=str, required=True,
+                        help="Path to the trained diffusion model checkpoint")
+    parser.add_argument("--invdyn_path", type=str, required=True,
+                        help="Path to the trained inverse dynamics model checkpoint")
     parser.add_argument("--config_path", type=str, required=True,
                         help="Path to the model configuration file")
     parser.add_argument("--output_dir", type=str, default="outputs/eval/noise_critic",
                         help="Directory to save evaluation results")
-    parser.add_argument("--batch_size", type=int,
-                        default=16, help="Evaluation batch size")
-    parser.add_argument("--num_samples", type=int, default=100,
-                        help="Number of samples to evaluate")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use (cuda, cpu)")
     parser.add_argument("--dataset", type=str, default="lerobot/pusht",
                         help="Dataset to use for evaluation")
     parser.add_argument("--noise_levels", type=str, default="0.01,0.05,0.1,0.2,0.5,1.0",
                         help="Comma-separated list of noise levels to evaluate")
+    parser.add_argument("--num_episodes", type=int, default=5,
+                        help="Number of episodes to run in the environment")
+    parser.add_argument("--render", action="store_true",
+                        help="Render the environment")
+    parser.add_argument("--save_video", action="store_true",
+                        help="Save videos of the episodes")
     args = parser.parse_args()
 
     # Create output directory
@@ -52,23 +90,18 @@ def main():
     device = torch.device(args.device)
 
     # Load model configuration
-    import json
     with open(args.config_path, "r") as f:
         config_dict = json.load(f)
 
-    critic_cfg = NoiseCriticConfig(**config_dict)
+    # Use DiffusionConfig for dataset parameters and load from the config path
+    cfg = DiffusionConfig(**config_dict)
+    cfg.device = device  # Override device if needed
 
     # Load dataset metadata
     print(f"Loading dataset metadata for: {args.dataset}")
     dataset_metadata = LeRobotDatasetMetadata(args.dataset)
     features = dataset_to_policy_features(dataset_metadata.features)
     print("Dataset metadata loaded.")
-
-    # Create temporary diffusion config for dataset loading parameters
-    temp_diffusion_cfg = DiffusionConfig(
-        input_features={"observation.state": features["observation.state"]},
-        output_features={"action": features["action"]}
-    )
 
     # Setup image processing if needed
     image_key = None
