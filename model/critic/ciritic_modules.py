@@ -156,6 +156,12 @@ class TransformerCritic(nn.Module):
         # images: (B, C, H, W)
         B = images.shape[0]
 
+        # Resize images if they don't match the expected size
+        if images.shape[2] != self.img_size or images.shape[3] != self.img_size:
+            import torch.nn.functional as F
+            images = F.interpolate(images, size=(
+                self.img_size, self.img_size), mode='bilinear')
+
         # Patch embedding and transpose manually
         patch_embs = self.patch_embedding(
             images)  # (B, hidden_dim, num_patches)

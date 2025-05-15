@@ -246,41 +246,34 @@ class CombinedCriticPolicy(nn.Module):
         critic_scores = []
         num_samples_to_generate = self.num_samples if self.critic_model is not None else 1
 
-        # Prepare image features for the critic if needed
-        critic_image_features_encoded = None
+        # Prepare raw images for the critic if needed
+        critic_raw_images = None
         if self.critic_model is not None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-            if not (hasattr(self.diffusion_model, 'image_encoder') and self.diffusion_model.image_encoder is not None):
-                raise ValueError(
-                    "Critic requires encoded image features, but diffusion_model has no image_encoder.")
-
             # model_input_batch contains normalized observation history.
             # We need the "current" image context for the critic, typically the last image in the observation sequence.
-            current_raw_img_obs_dict = {}
-            # Assuming diffusion_model.config.image_features lists the keys for raw image observations
-            for key in self.diffusion_model.config.image_features.keys():
+
+            # Assuming critic_model.image_features lists the keys for raw image observations
+            for key in self.critic_model.image_features.keys():
                 if key not in model_input_batch:
                     raise ValueError(
-                        f"Image key '{key}' expected by diffusion_model.image_encoder not in model_input_batch.")
+                        f"Image key '{key}' expected by critic model not in model_input_batch.")
 
                 # Should be (B, T_obs, C, H, W) or (B, C, H, W) if T_obs=1
                 img_tensor = model_input_batch[key]
                 # B, T_obs, C, H, W
                 if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
                     # Get the last image frame
-                    current_raw_img_obs_dict[key] = img_tensor[:, -1]
+                    critic_raw_images = img_tensor[:, -1]  # B, C, H, W
                 # B, C, H, W (implies T_obs=1 or single image context)
                 elif img_tensor.ndim == 4:
-                    current_raw_img_obs_dict[key] = img_tensor
+                    critic_raw_images = img_tensor
                 else:
                     raise ValueError(
                         f"Unexpected shape for image key '{key}': {img_tensor.shape} in model_input_batch.")
 
-            if not current_raw_img_obs_dict:
+            if critic_raw_images is None:
                 raise ValueError(
                     "No valid image data found in model_input_batch for critic.")
-
-            critic_image_features_encoded = self.diffusion_model.image_encoder(
-                current_raw_img_obs_dict)
 
         for _ in range(num_samples_to_generate):
             predicted_states = self.diffusion_model.conditional_sample(
@@ -295,13 +288,13 @@ class CombinedCriticPolicy(nn.Module):
             all_trajectories.append(trajectory)
 
             if self.critic_model is not None:
-                if critic_image_features_encoded is None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+                if critic_raw_images is None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
                     raise ValueError(
-                        "Critic requires image features, but they were not prepared.")
+                        "Critic requires raw images, but they were not prepared.")
 
                 score = self.critic_model.score(
                     trajectory_sequence=trajectory,
-                    image_features=critic_image_features_encoded
+                    raw_images=critic_raw_images
                 ).squeeze()
                 critic_scores.append(score)
 
@@ -349,43 +342,33 @@ class CombinedCriticPolicy(nn.Module):
         # Normalize the input batch (contains raw observations)
         norm_batch = self.normalize_inputs(batch)
 
-        encoded_image_features = None
+        # Get raw images for the critic (to be processed directly by the critic)
+        critic_raw_images = None
         if hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-            if not (hasattr(self.diffusion_model, 'image_encoder') and self.diffusion_model.image_encoder is not None):
-                raise ValueError(
-                    "Critic requires encoded image features, but diffusion_model has no image_encoder.")
-
-            # Extract current raw image observations for the encoder
+            # Extract current raw image observations
             # The critic usually conditions on the "current" image context.
             # If norm_batch['observation.image'] has a time dimension (from obs history), take the last one.
-            current_raw_img_obs_dict = {}
-            for key in self.diffusion_model.config.image_features.keys():  # e.g. "observation.image"
+            for key in self.critic_model.image_features.keys():  # e.g. "observation.image"
                 if key not in norm_batch:
                     raise ValueError(
-                        f"Image key '{key}' expected by diffusion_model.image_encoder not in norm_batch.")
+                        f"Image key '{key}' expected by critic model not in norm_batch.")
 
                 img_tensor = norm_batch[key]
                 # B, T, C, H, W
                 if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
                     # Last image in the sequence
-                    current_raw_img_obs_dict[key] = img_tensor[:, -1]
+                    critic_raw_images = img_tensor[:, -1]  # B, C, H, W
+                    break
                 elif img_tensor.ndim == 4:  # B, C, H, W
-                    current_raw_img_obs_dict[key] = img_tensor
+                    critic_raw_images = img_tensor
+                    break
                 else:
                     raise ValueError(
                         f"Unexpected shape for image key '{key}': {img_tensor.shape} in norm_batch.")
 
-            if not current_raw_img_obs_dict:
+            if critic_raw_images is None:
                 raise ValueError(
-                    "No valid image data found in norm_batch for critic's image encoder.")
-
-            encoded_image_features = self.diffusion_model.image_encoder(
-                current_raw_img_obs_dict)
-            encoded_image_features = encoded_image_features.to(self.device)
-
-        elif hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-            raise ValueError(
-                "Critic requires image features, but they could not be obtained/encoded.")
+                    "No valid image data found in norm_batch for critic.")
 
         positive_trajectories = positive_trajectories.to(self.device)
         negative_trajectories = negative_trajectories.to(self.device)
@@ -393,6 +376,6 @@ class CombinedCriticPolicy(nn.Module):
         loss, accuracy = self.critic_model.compute_binary_classification_loss(
             positive_trajectories=positive_trajectories,
             negative_trajectories=negative_trajectories,
-            image_features=encoded_image_features  # Pass encoded features
+            raw_images=critic_raw_images  # Pass raw images directly
         )
         return loss, accuracy
