@@ -22,9 +22,9 @@ import json
 # Import necessary components
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
-from model.diffusion.modeling_critic_combined import CombinedCriticPolicy
+from model.critic.modeling_critic_combined import CombinedCriticPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
-from model.critic.noise_critic import NoiseCriticConfig, TransformerCritic
+from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from sklearn.metrics import roc_auc_score, accuracy_score
 

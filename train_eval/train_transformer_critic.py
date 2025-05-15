@@ -1,4 +1,6 @@
+#!/usr/bin/env python
 import torch
+import numpy
 from pathlib import Path
 import safetensors.torch
 from torch.utils.data import DataLoader
@@ -8,7 +10,7 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize
 
 # Import the necessary model modules
-from model.critic.noise_critic import NoiseCriticConfig, TransformerCritic
+from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
 from model.diffusion.diffusion_modules import DiffusionRgbEncoder
 
 
@@ -25,16 +27,10 @@ def main():
     batch_size = 64
     learning_rate = 1e-4
 
-    # Noise parameters
+    # Noise parameters for generating negative examples
     noise_type = "progressive"  # Options: "progressive", "diffusion", "uniform"
     base_noise_scale = 0.05
     noise_growth_factor = 1.2  # For progressive noise
-
-    # Improved data augmentation parameters
-    augment_positive_examples = True  # Apply small noise to positive examples
-    augment_probability = 0.2         # Probability of augmenting positive examples
-    use_shuffled_negatives = True     # Create some negatives by trajectory shuffling
-    use_temporal_shifts = True        # Apply time shifts to some negative examples
 
     # Model parameters
     hidden_dim = 512
@@ -49,83 +45,67 @@ def main():
     dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
-    # Set up features similar to diffusion training
-    input_features = {
-        "observation.state": features["observation.state"],
-    }
-
-    # Add image features if needed
-    image_key = "observation.image"
-    if use_images and image_key in features:
-        input_features[image_key] = features[image_key]
-        print(f"Using images from key: {image_key}")
-
-    output_features = {
-        "observation.state": features["observation.state"],
-        "action": features["action"]
-    }
-
-    # Use DiffusionConfig to get consistent horizon and observation parameters
-    cfg = NoiseCriticConfig()
-
-    # --- Image Encoder Setup (required) ---
     # Check if image feature is available in the dataset
+    image_key = "observation.image"
     if image_key not in features:
         raise ValueError(
             f"Image features ({image_key}) required but not found in dataset features.")
 
-    # Debug print to understand the image feature structure
-    print(f"Image feature type: {type(features[image_key])}")
-    print(f"Image feature content: {features[image_key]}")
+    # --- Create Base Config ---
+    cfg = NoiseCriticConfig(
+        state_dim=features["observation.state"].shape[0],
+        horizon=16,  # Default horizon
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=0.1,
+        use_layernorm=True,
+        use_image_context=True,
+        transformer_dim=hidden_dim,
+    )
 
-    # Create a modified NoiseCriticConfig for the DiffusionRgbEncoder
-    # with the right image_features structure
+    # --- Create Custom Feature Shape for DiffusionRgbEncoder ---
+    # For DiffusionRgbEncoder, the image_features needs to have a shape attribute
+    class FeatureShape:
+        def __init__(self, shape):
+            self.shape = shape
+
+    # Create a modified config for the image encoder
     encoder_cfg = NoiseCriticConfig()
-
-    # Create a custom feature shape that has the shape attribute
     if isinstance(features[image_key], tuple):
-        # For DiffusionRgbEncoder, the image_features need to have a shape attribute
-        # Create a class with a shape attribute
-        class FeatureShape:
-            def __init__(self, shape):
-                self.shape = shape
-
-        # Create the image_features dictionary with the right structure
         encoder_cfg.image_features = {
             "observation.image": FeatureShape(features[image_key])
         }
     else:
         encoder_cfg.image_features = {"observation.image": features[image_key]}
 
-    # Initialize the image encoder with the modified config
+    # --- Image Encoder Setup ---
+    print("Initializing image encoder...")
     image_encoder = DiffusionRgbEncoder(encoder_cfg).to(device)
     image_encoder.eval()  # No need to train the image encoder
     image_feature_dim = encoder_cfg.transformer_dim
 
-    # --- Model Setup ---
-    # Create the transformer critic configuration
+    # --- Critic Model Setup ---
+    print("Initializing transformer critic model...")
     critic_cfg = NoiseCriticConfig(
         state_dim=features["observation.state"].shape[0],
-        horizon=cfg.horizon,  # Using horizon from diffusion config for consistency
+        horizon=16,  # Default horizon
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         dropout=0.1,
         use_layernorm=True,
-        use_image_context=True,  # Always use image context
+        use_image_context=True,
         image_feature_dim=image_feature_dim,
         transformer_dim=image_feature_dim,
-        # Use the same image_features structure as the encoder_cfg
         image_features=encoder_cfg.image_features,
         n_heads=8
     )
 
-    # Create transformer critic model directly
     critic_model = TransformerCritic(critic_cfg)
     critic_model.to(device)
     print(
-        f"Created transformer critic model with {sum(p.numel() for p in critic_model.parameters())} parameters")
+        f"Created transformer critic with {sum(p.numel() for p in critic_model.parameters())} parameters")
 
-    # Try to use torch.compile if available (optional performance boost)
+    # Try to use torch.compile if available
     try:
         if hasattr(torch, "compile"):
             print("Compiling transformer critic model...")
@@ -142,16 +122,15 @@ def main():
         dataset_metadata.stats
     )
 
-    # --- Dataset ---
-    # Define time indices similar to diffusion training
-    critic_state_indices = list(
-        range(0, cfg.horizon))
+    # --- Dataset Setup ---
+    # Define time indices for state and image features
+    critic_state_indices = list(range(0, cfg.horizon))
 
-    # Setup delta timestamps for state and image (both required)
+    # Setup delta timestamps
     delta_timestamps = {
         "observation.state": [i / dataset_metadata.fps for i in critic_state_indices],
-        image_key: [
-            i / dataset_metadata.fps for i in cfg.observation_delta_indices]
+        # Just need the current image
+        image_key: [i / dataset_metadata.fps for i in [0]]
     }
 
     # Initialize dataset
@@ -160,9 +139,8 @@ def main():
         dataset_repo_id, delta_timestamps=delta_timestamps)
     print(f"Dataset initialized with {len(dataset)} samples")
 
-    # --- Optimizer & Dataloader ---
+    # --- Training Setup ---
     optimizer = torch.optim.AdamW(critic_model.parameters(), lr=learning_rate)
-    # Optional: add a learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=training_steps)
 
@@ -175,23 +153,14 @@ def main():
         drop_last=True
     )
 
-    # --- Training Setup ---
-    criterion = torch.nn.BCEWithLogitsLoss()  # Binary classification loss
+    # --- Training Loop ---
     step = 0
     losses = []
     accuracies = []
 
-    # --- Training Loop ---
     print(f"Starting transformer critic training ({training_steps} steps)...")
     print(f"Noise type: {noise_type}, Base scale: {base_noise_scale}" +
           (f", Growth factor: {noise_growth_factor}" if noise_type == "progressive" else ""))
-    print("Using improved data augmentation:")
-    print("  - Positive examples: Small random noise (20% probability)")
-    print("  - Negative examples: Mix of techniques:")
-    print("    * Inter-batch trajectory shuffling (30% of examples)")
-    print("    * Noise-based corruption (all examples)")
-    print("    * Temporal shifts (30% probability with 50% of batch affected)")
-    print("  Note: Multiple augmentations may be applied to the same example")
 
     while step < training_steps:
         for batch in dataloader:
@@ -212,32 +181,31 @@ def main():
             norm_batch["observation.state"] = norm_state_batch["observation.state"].to(
                 device)
 
-            # Extract state trajectories - use only the future states
-            all_state_trajectories = norm_batch["observation.state"][:,
-                                                                     0:cfg.horizon]
+            # Extract state trajectories
+            all_state_trajectories = norm_batch["observation.state"][:, 0:cfg.horizon]
             B, H, D_state = all_state_trajectories.shape
 
-            # Create positive state trajectories
+            # Create positive state trajectories (original or slightly perturbed)
             positive_state_trajectory = all_state_trajectories.clone()
 
-            # Apply optional minor data augmentation to positive examples
-            if torch.rand(1).item() < 0.2:  # 20% probability
-                # Apply minimal noise to positive examples
+            # Apply minor data augmentation to positive examples (20% probability)
+            if torch.rand(1).item() < 0.2:
                 tiny_noise_scale = base_noise_scale * 0.1  # 10x smaller noise
                 for t_step in range(1, H):
                     tiny_noise = torch.randn_like(
                         positive_state_trajectory[:, t_step]) * tiny_noise_scale
                     positive_state_trajectory[:, t_step] += tiny_noise
 
-            # Create base for negative trajectories - use original trajectories
-            # For some examples (30%), create completely shuffled trajectories
+            # Create negative state trajectories (corrupted with noise)
             negative_state_trajectory = all_state_trajectories.clone()
+
+            # Apply shuffling to some negative examples (30% of batch)
             shuffle_mask = torch.rand(B) < 0.3
             if shuffle_mask.any():
                 # Get the number of examples to shuffle
                 num_to_shuffle = shuffle_mask.sum().item()
 
-                # Create a single set of shuffled indices (not a stack)
+                # Create a single set of shuffled indices
                 shuffle_indices = torch.randperm(B)[:num_to_shuffle]
 
                 # Get the indices of elements where shuffle_mask is True
@@ -257,7 +225,7 @@ def main():
             if noise_type == "progressive":
                 # Apply progressive noise (increasing with each timestep)
                 current_noise_scale = base_noise_scale
-                for t_step in range(1, H):  # Start from the second state
+                for t_step in range(1, H):
                     noise = torch.randn_like(
                         negative_state_trajectory[:, t_step]) * current_noise_scale
                     negative_state_trajectory[:, t_step] += noise
@@ -281,21 +249,18 @@ def main():
                         negative_state_trajectory[:, t_step]) * base_noise_scale
                     negative_state_trajectory[:, t_step] += noise
 
-            # Apply random temporal shifts to some negative examples (30% probability)
-            # This helps the model learn temporal coherence importance
+            # Apply temporal shifts to some negative examples (30% probability)
             if torch.rand(1).item() < 0.3:
                 shift_mask = torch.rand(B) < 0.5
                 if shift_mask.any():
                     # Get the indices of elements where shift_mask is True
                     mask_indices = torch.where(shift_mask)[0]
 
-                    # For elements where shift_mask is True, shift the trajectory in time
-                    # Ensure minimum shift of 1 and maximum of 1/4 of horizon length
+                    # Maximum shift is 1/4 of horizon length
                     max_shift = max(1, H//4)
 
-                    # For each index where shift_mask is True, apply a temporal shift
                     for idx in mask_indices:
-                        # Generate a random shift amount for this example
+                        # Generate random shift amount
                         shift = torch.randint(1, max_shift + 1, (1,)).item()
                         shift = min(shift, H-1)  # Safety check
 
@@ -311,83 +276,77 @@ def main():
                         negative_state_trajectory[idx, -
                                                   shift:] = last_state.unsqueeze(0).repeat(shift, 1)
 
-            # Process images (required for TransformerCritic)
-            if image_key not in batch:
-                raise ValueError(
-                    f"Image features ({image_key}) required but not found in batch.")
-
+            # Process images to get image features
             with torch.no_grad():
                 # Extract observation images
-                # Can be (B, C, H, W) or (B, T_img, C, H, W)
                 images = batch[image_key]
-                print(f"Batch image shape: {images.shape}")
 
-                # Handle both 4D and 5D tensors
-                if len(images.shape) == 4:
-                    # Single image per batch item: (B, C, H, W)
-                    # Add a time dimension: (B, 1, C, H, W)
-                    images = images.unsqueeze(1)
-                    print(f"Added time dimension. New shape: {images.shape}")
-                elif len(images.shape) != 5:
-                    raise ValueError(
-                        f"Image shape incorrect. Expected 4D or 5D tensor, got shape {images.shape}")
+                # Print shape for debugging
+                print(f"Original image shape: {images.shape}")
 
-                # Process images with the encoder
-                B_i, T_img = images.shape[:2]
-                images_flat = images.flatten(0, 1)  # (B*T_img, C, H, W)
-                print(f"Flattened image shape: {images_flat.shape}")
+                # Handle different image shapes
+                if len(images.shape) == 5:  # (B, T_img, C, H, W)
+                    B_i, T_img = images.shape[:2]
+
+                    # Check if images need to be normalized to [0,1]
+                    if images.max() > 1.0:
+                        images = images / 255.0
+
+                    # Flatten batch and time dimensions
+                    # (B*T_img, C, H, W)
+                    images_flat = images.reshape(-1, *images.shape[2:])
+
+                elif len(images.shape) == 4:  # (B, C, H, W) - only one timestep
+                    B_i = images.shape[0]
+                    T_img = 1
+
+                    # Check if images need to be normalized to [0,1]
+                    if images.max() > 1.0:
+                        images = images / 255.0
+
+                    # Already in the right format for processing
+                    images_flat = images
+
+                # Print shape for debugging
+                print(f"Processed image shape: {images_flat.shape}")
+
+                # Extract features using the image encoder
                 image_features_flat = image_encoder(images_flat)
 
-                # Reshape back and use the last frame features
-                image_features_seq = image_features_flat.view(B_i, T_img, -1)
-                # Last frame
-                image_features = image_features_seq[:, -1]
+                # Handle the reshaping based on original shape
+                if len(images.shape) == 5:  # (B, T_img, C, H, W)
+                    # Reshape back to sequence format
+                    image_features_seq = image_features_flat.view(
+                        B_i, T_img, -1)
+                    # Last frame
+                    image_features = image_features_seq[:, -1]
+                else:  # (B, C, H, W)
+                    # Already flat, no need to take the last frame
+                    image_features = image_features_flat
 
-            # Combine trajectories and create labels
-            combined_trajectories = torch.cat(
-                [positive_state_trajectory, negative_state_trajectory], dim=0
-            )  # (2*B, H, D_state)
-
-            # Duplicate image features for combined trajectories
-            combined_image_features = torch.cat(
-                [image_features, image_features], dim=0
-            )  # (2*B, feature_dim)
-
-            # Create labels (1=original, 0=noisy)
-            labels = torch.cat([
-                torch.ones(B, device=device),    # Positive examples (original)
-                torch.zeros(B, device=device)    # Negative examples (noisy)
-            ]).float()
-
-            # Zero gradients and compute loss
+            # Calculate loss using the simplified critic loss computation
             optimizer.zero_grad()
+            loss, accuracy = critic_model.compute_critic_loss(
+                positive_trajectories=positive_state_trajectory,
+                negative_trajectories=negative_state_trajectory,
+                image_features=image_features
+            )
 
-            # Forward pass
-            logits = critic_model(
-                trajectory_sequence=combined_trajectories,
-                image_features=combined_image_features
-            )  # (2*B, 1)
-
-            # Compute loss and backpropagate
-            loss = criterion(logits.squeeze(-1), labels)
+            # Backprop and optimize
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
 
             # Log progress
             if step % log_freq == 0:
-                # Calculate accuracy
-                preds = (torch.sigmoid(logits.squeeze(-1)) > 0.5).float()
-                acc = (preds == labels).float().mean().item()
-
                 # Store metrics
                 losses.append(loss.item())
-                accuracies.append(acc)
+                accuracies.append(accuracy.item())
 
                 # Print metrics
                 current_lr = lr_scheduler.get_last_lr()[0]
                 print(
-                    f"Step {step}/{training_steps}: Loss={loss.item():.4f}, Acc={acc:.4f}, LR={current_lr:.6f}")
+                    f"Step {step}/{training_steps}: Loss={loss.item():.4f}, Acc={accuracy.item():.4f}, LR={current_lr:.6f}")
 
             # Save checkpoint
             if step % save_freq == 0 and step > 0:
@@ -413,11 +372,16 @@ def main():
         import json
         json.dump(config_dict, f, indent=4)
 
-    # Filter stats to include only tensors
-    stats_to_save = {
-        k: v for k, v in dataset_metadata.stats.items()
-        if isinstance(v, torch.Tensor)
-    }
+    # Filter stats to only include tensors
+    stats_to_save = {}
+    for key, value in dataset_metadata.stats.items():
+        if isinstance(value, torch.Tensor) or isinstance(value, numpy.ndarray):
+            # Convert numpy arrays to tensors if needed
+            if isinstance(value, numpy.ndarray):
+                value = torch.from_numpy(value)
+            stats_to_save[key] = value
+
+    # Save the stats using safetensors
     safetensors.torch.save_file(
         stats_to_save, output_directory / "stats.safetensors")
     print(f"Config and stats saved to: {output_directory}")

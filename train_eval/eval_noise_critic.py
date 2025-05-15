@@ -24,7 +24,7 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 # Import the models
-from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
+from model.critic.ciritic_modules import create_noise_critic, NoiseCriticConfig
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.modeling_combined import CombinedPolicy
@@ -45,7 +45,7 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 # Import the models
-from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
+from model.critic.ciritic_modules import create_noise_critic, NoiseCriticConfig
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.modeling_combined import CombinedPolicy

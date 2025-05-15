@@ -351,3 +351,102 @@ class CombinedCriticPolicy(nn.Module):
 
         # Return both actions and the best trajectory
         return actions, best_trajectory
+
+    def compute_critic_loss(self, batch: dict) -> Tensor:
+        """
+        Compute the critic loss for the combined policy. This samples multiple trajectories,
+        scores them, and uses the scores to select the best one.
+
+        Unlike the TransformerCritic.compute_critic_loss which does binary classification,
+        this one focuses on regression to select the best trajectory.
+
+        Args:
+            batch: Dictionary containing normalized observation data.
+
+        Returns:
+            Tensor representing the computed loss and selected trajectory.
+        """
+
+        # Normalize inputs
+        norm_batch = self.normalize_inputs(batch)
+
+        # Process image features if needed
+        processed_batch = dict(norm_batch)
+        if "observation.image" not in norm_batch and self.config.image_features:
+            if all(key in norm_batch for key in self.config.image_features):
+                processed_batch["observation.image"] = torch.stack(
+                    [norm_batch[key] for key in self.config.image_features], dim=-4
+                )
+
+        # Prepare model input
+        model_input_batch = {}
+        for key in processed_batch.keys():
+            if key.startswith("observation"):
+                model_input_batch[key] = processed_batch[key]
+
+        # Generate future state trajectories
+        batch_size = batch["observation.state"].shape[0]
+        global_cond = self.diffusion_model._prepare_global_conditioning(
+            model_input_batch)
+
+        # Generate multiple trajectory samples
+        all_trajectories = []
+        for i in range(self.num_samples):
+            predicted_states = self.diffusion_model.conditional_sample(
+                batch_size=batch_size,
+                global_cond=global_cond,
+            )
+
+            # Truncate to critic horizon
+            if self.critic_model and hasattr(self.critic_model, 'horizon'):
+                horizon = min(self.critic_model.horizon,
+                              predicted_states.shape[1])
+            else:
+                horizon = min(16, predicted_states.shape[1])
+
+            trajectory = predicted_states[:, :horizon]
+            all_trajectories.append(trajectory)
+
+        # Stack all trajectories
+        # [B, num_samples, horizon, state_dim]
+        stacked_trajectories = torch.stack(all_trajectories, dim=1)
+
+        # Extract image features for the critic
+        image_features = None
+        if "observation.image" in model_input_batch:
+            if model_input_batch["observation.image"].ndim == 5:  # [B, T, C, H, W]
+                # Last timestep
+                image_features = model_input_batch["observation.image"][:, -1]
+            else:
+                image_features = model_input_batch["observation.image"]
+
+        # Score all trajectories with the critic (if available)
+        if self.critic_model is not None:
+            B, S, H, D = stacked_trajectories.shape
+
+            # Reshape to score all trajectories at once
+            flat_trajectories = stacked_trajectories.reshape(B*S, H, D)
+            # Repeat image features for each trajectory
+            repeated_image_features = image_features.repeat_interleave(
+                S, dim=0)
+
+            # Get scores from critic
+            with torch.no_grad():
+                flat_scores = self.critic_model(
+                    flat_trajectories, repeated_image_features).squeeze(-1)
+                scores = flat_scores.reshape(B, S)
+
+            # Find best trajectory indices
+            best_indices = torch.argmax(scores, dim=1)
+
+            # Select the best trajectory for each batch item
+            best_trajectories = torch.stack([
+                stacked_trajectories[b, best_indices[b]]
+                for b in range(B)
+            ])
+
+            # Return best trajectories and their scores
+            return best_trajectories, scores
+        else:
+            # Without a critic, just return the first trajectory for each batch element
+            return stacked_trajectories[:, 0], None
