@@ -1,31 +1,55 @@
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from lerobot.configs.types import NormalizationMode
 
 
 @dataclass
 class NoiseCriticConfig:
     """Configuration for the noise trajectory critic model."""
-    state_dim: int  # Dimension of state vectors
-    horizon: int  # Length of state sequence to evaluate
+    state_dim: int = 2  # Dimension of state vectors
+    horizon: int = 16  # Length of state sequence to evaluate
     hidden_dim: int = 512  # Hidden dimension of the network
     num_layers: int = 4  # Number of transformer layers or MLP blocks
     dropout: float = 0.1
     use_layernorm: bool = True
     # Options: "mlp", "transformer", "gru", "dv_horizon"
     architecture: str = "transformer"
-    use_image_context: bool = False  # Whether to use image features as context
-    image_feature_dim: int = 0  # Dimension of image features (if used)
+    use_image_context: bool = True  # Always use image features as context
+    image_feature_dim: int = 512  # Dimension of image features (required)
+    # Fields needed for DiffusionRgbEncoder
+    image_features: dict = field(default_factory=lambda: {
+                                 "observation.image": (3, 84, 84)})  # Image features dict
+    transformer_dim: int = 512  # Dimension for the transformer
     # Additional parameters for DVHorizonCritic
     n_heads: int = 8  # Number of attention heads
     # Norm type for DVTransformerBlock ("pre" or "post")
     norm_type: str = "post"
+    observation_delta_indices: list = field(default_factory=lambda: [0])
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX
+        }
+    )
+
+    # Parameters for DiffusionRgbEncoder
+    vision_backbone: str = "resnet18"
+    crop_shape: tuple[int, int] | None = (84, 84)
+    crop_is_random: bool = True
+    pretrained_backbone_weights: str | None = None
+    use_group_norm: bool = True
+    spatial_softmax_num_keypoints: int = 32
+    use_separate_rgb_encoder_per_camera: bool = False
 
 
 class TransformerCritic(nn.Module):
     """
-    Transformer-based critic that scores a sequence of states.
-    Input: (B, H, D_state)
+    Transformer-based critic that scores a sequence of states with required image context.
+    Input: 
+        - trajectory_sequence: (B, H, D_state) tensor of state sequences
+        - image_features: (B, D_img) tensor of image features
     Output: (B, 1) score per sequence
     """
 
@@ -34,7 +58,10 @@ class TransformerCritic(nn.Module):
         self.state_dim = config.state_dim
         self.horizon = config.horizon
         self.hidden_dim = config.hidden_dim
-        self.use_image_context = config.use_image_context
+
+        # Always use image context - no longer optional
+        config.use_image_context = True
+        self.use_image_context = True
 
         # State embedding layer (to transformer hidden dim)
         self.state_embedding = nn.Linear(config.state_dim, config.hidden_dim)
@@ -58,16 +85,15 @@ class TransformerCritic(nn.Module):
             num_layers=config.num_layers
         )
 
-        # Image context processing if needed
-        if self.use_image_context:
-            self.img_encoder = nn.Sequential(
-                nn.Linear(config.image_feature_dim, config.hidden_dim),
-                nn.GELU(),
-                nn.LayerNorm(
-                    config.hidden_dim) if config.use_layernorm else nn.Identity(),
-                nn.Dropout(config.dropout)
-            )
-            # We'll use image features as a prefix token
+        # Image context processing - always required
+        self.img_encoder = nn.Sequential(
+            nn.Linear(config.image_feature_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(
+                config.hidden_dim) if config.use_layernorm else nn.Identity(),
+            nn.Dropout(config.dropout)
+        )
+        # Using image features as prefix token
 
         # Output head (token aggregation + linear layer)
         self.output_head = nn.Sequential(
@@ -92,11 +118,11 @@ class TransformerCritic(nn.Module):
         # Initialize positional embeddings
         nn.init.normal_(self.pos_embedding, std=0.02)
 
-    def forward(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
+    def forward(self, trajectory_sequence: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
             trajectory_sequence: (B, H, D_state) tensor of state sequences.
-            image_features: Optional (B, D_img) tensor of image features.
+            image_features: Required (B, D_img) tensor of image features.
         Returns:
             (B, 1) tensor of scores (logits).
         """
@@ -105,6 +131,10 @@ class TransformerCritic(nn.Module):
             raise ValueError(
                 f"Input shape mismatch. Expected (B, {self.horizon}, {self.state_dim}), got {(B, H, D)}")
 
+        if image_features is None:
+            raise ValueError(
+                "Image features are required for TransformerCritic")
+
         # Embed states to hidden dimension
         state_embeddings = self.state_embedding(
             trajectory_sequence)  # (B, H, hidden_dim)
@@ -112,14 +142,11 @@ class TransformerCritic(nn.Module):
         # Add positional embeddings
         state_embeddings = state_embeddings + self.pos_embedding
 
-        # Process image features and prepend to sequence if provided
-        sequence_for_transformer = state_embeddings
-
-        if self.use_image_context and image_features is not None:
-            img_embedding = self.img_encoder(
-                image_features).unsqueeze(1)  # (B, 1, hidden_dim)
-            sequence_for_transformer = torch.cat(
-                [img_embedding, state_embeddings], dim=1)  # (B, H+1, hidden_dim)
+        # Process image features and prepend to sequence
+        img_embedding = self.img_encoder(
+            image_features).unsqueeze(1)  # (B, 1, hidden_dim)
+        sequence_for_transformer = torch.cat(
+            [img_embedding, state_embeddings], dim=1)  # (B, H+1, hidden_dim)
 
         # Through transformer
         transformer_output = self.transformer_encoder(sequence_for_transformer)
@@ -133,8 +160,14 @@ class TransformerCritic(nn.Module):
         return score
 
     @torch.no_grad()
-    def score(self, trajectory_sequence: torch.Tensor, image_features=None) -> torch.Tensor:
-        """Inference entrypoint."""
+    def score(self, trajectory_sequence: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
+        """
+        Inference entrypoint.
+
+        Args:
+            trajectory_sequence: (B, H, D_state) tensor of state sequences.
+            image_features: Required (B, D_img) tensor of image features.
+        """
         self.eval()
         score = self.forward(trajectory_sequence, image_features)
         self.train()

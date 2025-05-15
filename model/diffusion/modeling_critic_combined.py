@@ -20,7 +20,7 @@ class CombinedCriticPolicy(nn.Module):
     This class is a simple torch.nn.Module that doesn't require config_class.
     """
 
-    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic, critic_model=None, num_samples=10):
+    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic, critic_model=None, num_samples=4):
         super().__init__()
         self.diffusion_model = diffusion_model
         self.inv_dyn_model = inv_dyn_model
@@ -126,16 +126,28 @@ class CombinedCriticPolicy(nn.Module):
                     print(f"{k} shape: {v.shape}, dtype: {v.dtype}")
             raise
 
-        # Stack multiple camera views if necessary
-        if self.config.image_features and all(key in norm_batch for key in self.config.image_features):
-            # Create a temporary dict to avoid modifying the original input batch
-            processed_batch = dict(norm_batch)
+        # Process image features - required for TransformerCritic
+        processed_batch = dict(norm_batch)
+
+        # Handle different ways images may be provided
+        if "observation.image" in norm_batch:
+            # Image already present in the right format
+            pass
+        elif self.config.image_features and all(key in norm_batch for key in self.config.image_features):
+            # Stack multiple camera views
             processed_batch["observation.image"] = torch.stack(
                 [norm_batch[key] for key in self.config.image_features], dim=-4
             )
         else:
-            # If image features configured but not all present in batch, just use what we have
-            processed_batch = norm_batch
+            # If no image is available but critic requires it, warn
+            if self.critic_model is not None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+                print(
+                    "WARNING: TransformerCritic requires image features, but none provided in input batch!")
+                # What image keys are available vs what we need
+                if self.config.image_features:
+                    print(
+                        f"Required image features: {self.config.image_features}")
+                print(f"Available batch keys: {list(norm_batch.keys())}")
 
         # Populate queues with the latest *normalized* observation
         self._queues = populate_queues(self._queues, processed_batch)
@@ -213,52 +225,6 @@ class CombinedCriticPolicy(nn.Module):
         return next_action, trajectories
 
     @torch.no_grad()
-    def _generate_states_and_actions(self, model_input_batch, batch_size):
-        """
-        Helper method to generate future states and corresponding actions
-
-        Args:
-            model_input_batch: Dict with observation history
-            batch_size: Batch size for diffusion model
-
-        Returns:
-            Normalized actions tensor of shape [batch_size, n_action_steps, action_dim]
-        """
-        # Prepare global conditioning
-        global_cond = self.diffusion_model._prepare_global_conditioning(
-            model_input_batch)
-
-        # Generate future states using diffusion
-        predicted_states = self.diffusion_model.conditional_sample(
-            batch_size=batch_size,
-            global_cond=global_cond,
-        )
-
-        start = 0
-        end = 8
-
-        predicted_states = predicted_states[:, start:end]
-
-        # Generate actions using inverse dynamics
-        actions_normalized = []
-        n_action_steps = predicted_states.shape[1]
-
-        current_s = predicted_states[:, 0]
-
-        for i in range(n_action_steps-1):
-            next_s = predicted_states[:, i+1]
-            # Create state pair (s_t, s_{t+1})
-            state_pair = torch.cat([current_s, next_s], dim=-1)
-            # Predict action
-            action_i = self.inv_dyn_model(state_pair)
-            actions_normalized.append(action_i)
-            # Update current state
-            current_s = next_s
-
-        # Stack actions into a sequence
-        return torch.stack(actions_normalized, dim=1)
-
-    @torch.no_grad()
     def _generate_states_critic_actions(self, model_input_batch, batch_size):
         """
         Helper method to generate multiple future state sequences, evaluate them with critic model,
@@ -302,7 +268,6 @@ class CombinedCriticPolicy(nn.Module):
 
             # Ensure we don't exceed the available predicted states
             end = min(end, predicted_states.shape[1])
-            print(f"Trajectory shape will be: [batch_size, {end}, state_dim]")
 
             trajectory = predicted_states[:, start:end]
             all_trajectories.append(trajectory)
@@ -312,13 +277,42 @@ class CombinedCriticPolicy(nn.Module):
                 # Get score from critic model
                 with torch.no_grad():
                     try:
-                        # Try to score the trajectory with the critic
+                        # Check if the trajectory already has a batch dimension
+                        # Critics expect [batch_size, horizon, state_dim]
+                        if trajectory.ndim == 2:
+                            # Add batch dimension if needed
+                            trajectory_batch = trajectory.unsqueeze(0)
+                        else:
+                            trajectory_batch = trajectory
+
+                        # Extract image features from the input batch (now required)
+                        image_features = None
+                        if "observation.image" in model_input_batch:
+                            # Use the last frame's image features
+                            image_features = model_input_batch["observation.image"][:, -1]
+                        elif self.config.image_features and all(key in model_input_batch for key in self.config.image_features):
+                            # Create a feature tensor from multiple camera views
+                            image_features = torch.stack(
+                                [model_input_batch[key][:, -1] for key in self.config.image_features], dim=-4)
+                        else:
+                            print(
+                                "Warning: No image features found for critic scoring!")
+
+                        # Try to score the trajectory with the critic, providing image features
                         score = self.critic_model(
-                            trajectory_sequence=trajectory).squeeze()
+                            trajectory_sequence=trajectory_batch,
+                            image_features=image_features).squeeze()
                         critic_scores.append(score)
-                    except ValueError as e:
-                        # If there's a shape mismatch, print the error but continue with the sample
+                    except Exception as e:
+                        # Provide more detailed error information
                         print(f"Critic scoring failed with error: {e}")
+                        print(f"Trajectory shape: {trajectory_batch.shape}")
+                        if image_features is not None:
+                            print(
+                                f"Image features shape: {image_features.shape}")
+                        else:
+                            print(
+                                "Image features are None (required for TransformerCritic)")
                         # Assign a neutral score
                         critic_scores.append(
                             torch.tensor(0.0, device=self.device))
@@ -355,4 +349,5 @@ class CombinedCriticPolicy(nn.Module):
         # Stack actions into a sequence
         actions = torch.stack(actions_normalized, dim=1)
 
+        # Return both actions and the best trajectory
         return actions, best_trajectory

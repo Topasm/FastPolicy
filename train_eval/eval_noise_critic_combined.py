@@ -123,6 +123,19 @@ def main():
             critic_config_data["state_dim"] = cfg.robot_state_feature.shape[0]
         if "horizon" not in critic_config_data:
             critic_config_data["horizon"] = cfg.horizon
+        if "image_feature_dim" not in critic_config_data:
+            critic_config_data["image_feature_dim"] = cfg.hidden_dim
+
+        # Ensure use_image_context is always True
+        critic_config_data["use_image_context"] = True
+
+        # Make sure image_features is properly set
+        if "image_features" not in critic_config_data:
+            critic_config_data["image_features"] = {
+                "observation.image": (3, 84, 84)}
+        if "transformer_dim" not in critic_config_data:
+            critic_config_data["transformer_dim"] = critic_config_data.get(
+                "hidden_dim", 512)
 
         # Create the config from file data
         critic_cfg = NoiseCriticConfig(**critic_config_data)
@@ -137,7 +150,11 @@ def main():
                 num_layers=cfg.num_layers,
                 dropout=cfg.dropout,
                 use_layernorm=cfg.use_layernorm,
-                use_image_context=cfg.use_image_observations
+                use_image_context=True,  # Always use image context
+                image_feature_dim=cfg.hidden_dim,  # Use hidden_dim as image feature dimension
+                transformer_dim=cfg.hidden_dim,
+                image_features={"observation.image": (
+                    3, 84, 84)}  # Default image shape
             )
         )
 
@@ -167,7 +184,7 @@ def main():
         diffusion_model=diffusion_model,
         inv_dyn_model=inv_dyn_model,
         critic_model=noise_critic_model,
-        num_samples=5  # Generate 5 trajectory samples
+        num_samples=4  # Generate 5 trajectory samples
     )
 
     # --- Environment Setup ---
@@ -182,10 +199,6 @@ def main():
     rewards = []
     frames = []
     frames.append(env.render())
-
-    # Store noise critic scores
-    critic_scores = {level: [] for level in noise_levels}
-    critic_scores["original"] = []
 
     step = 0
     done = False
@@ -223,49 +236,6 @@ def main():
                 image=image
             )
 
-        # Extract trajectory for noise critic (take first trajectory if available)
-        if trajectories and len(trajectories) > 0:
-            # Shape: [horizon, state_dim]
-            normalized_trajectory = trajectories[0]
-
-            # Score original trajectory with noise critic
-            with torch.inference_mode():
-                try:
-                    orig_score = noise_critic_model(
-                        trajectory_sequence=normalized_trajectory.unsqueeze(0)
-                    ).squeeze().item()
-                    critic_scores["original"].append(orig_score)
-                except Exception as e:
-                    print(f"Error scoring original trajectory: {e}")
-                    # Add a default score
-                    critic_scores["original"].append(0.0)
-        else:
-            print("Warning: No trajectories returned from select_action")
-            # Add a default score
-            critic_scores["original"].append(0.0)
-            # Create a default normalized_trajectory for the noise tests below
-            normalized_trajectory = torch.zeros(
-                (noise_critic_model.horizon, noise_critic_model.state_dim), device=device)
-
-        # Score noisy trajectories
-        for noise_level in noise_levels:
-            try:
-                # Apply noise to trajectory
-                noisy_traj = normalized_trajectory.clone(
-                ) + torch.randn_like(normalized_trajectory) * noise_level
-
-                # Get critic score
-                with torch.inference_mode():
-                    noise_score = noise_critic_model(
-                        trajectory_sequence=noisy_traj.unsqueeze(0)
-                    ).squeeze().item()
-                    critic_scores[noise_level].append(noise_score)
-            except Exception as e:
-                print(
-                    f"Error scoring noisy trajectory at level {noise_level}: {e}")
-                # Add a default score
-                critic_scores[noise_level].append(0.0)
-
         # Convert to numpy for environment step
         numpy_action = action.squeeze(0).cpu().numpy()
 
@@ -293,10 +263,6 @@ def main():
     imageio.mimsave(str(video_path), np.stack(frames), fps=fps)
     print(f"Video of the evaluation is available in '{video_path}'.")
 
-    # Calculate basic metrics
-    for k in critic_scores:
-        critic_scores[k] = np.array(critic_scores[k])
-
     # Save metrics to a JSON file
     metrics = {
         "noise_levels": noise_levels,
@@ -306,34 +272,6 @@ def main():
         "auc": [],
         "accuracy": []
     }
-
-    # Calculate classifier metrics for each noise level
-    for noise_level in noise_levels:
-        # Combine original and noisy scores
-        all_scores = np.concatenate([
-            critic_scores["original"],
-            critic_scores[noise_level]
-        ])
-
-        # Create labels (1 for original, 0 for noisy)
-        all_labels = np.concatenate([
-            np.ones_like(critic_scores["original"]),
-            np.zeros_like(critic_scores[noise_level])
-        ])
-
-        # Apply sigmoid to convert logits to probabilities
-        all_probs = 1 / (1 + np.exp(-all_scores))
-
-        # Calculate AUC and accuracy
-        auc = roc_auc_score(all_labels, all_probs)
-        preds = (all_probs > 0.5).astype(float)
-        accuracy = accuracy_score(all_labels, preds)
-
-        metrics["auc"].append(auc)
-        metrics["accuracy"].append(accuracy)
-
-        print(
-            f"Noise level {noise_level}: AUC = {auc:.4f}, Accuracy = {accuracy:.4f}")
 
     # Save metrics to JSON
     metrics_file = output_directory / "metrics.json"
