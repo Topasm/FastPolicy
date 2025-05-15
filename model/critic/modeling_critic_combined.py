@@ -11,6 +11,7 @@ from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.invdynamics.invdyn import MlpInvDynamic
 from model.diffusion.modeling_mymodel import MyDiffusionModel
+from model.critic.ciritic_modules import TransformerCritic
 
 
 class CombinedCriticPolicy(nn.Module):
@@ -19,7 +20,7 @@ class CombinedCriticPolicy(nn.Module):
     This class is a simple torch.nn.Module that doesn't require config_class.
     """
 
-    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic, critic_model=None, num_samples=4):
+    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic, critic_model=TransformerCritic, num_samples=4):
         super().__init__()
         self.diffusion_model = diffusion_model
         self.inv_dyn_model = inv_dyn_model
