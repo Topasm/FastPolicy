@@ -2,7 +2,6 @@ from collections import deque
 import torch
 import torch.nn as nn
 from torch import Tensor
-import einops
 
 from lerobot.common.policies.utils import (
     get_device_from_parameters,
@@ -231,7 +230,7 @@ class CombinedCriticPolicy(nn.Module):
         and select the best one to generate actions with inverse dynamics.
 
         Args:
-            model_input_batch: Dict with observation history
+            model_input_batch: Dict with observation history (already normalized by select_action)
             batch_size: Batch size for diffusion model
 
         Returns:
@@ -243,210 +242,157 @@ class CombinedCriticPolicy(nn.Module):
         global_cond = self.diffusion_model._prepare_global_conditioning(
             model_input_batch)
 
-        # Store all trajectories and their scores
         all_trajectories = []
         critic_scores = []
+        num_samples_to_generate = self.num_samples if self.critic_model is not None else 1
 
-        # Generate multiple samples if we have a critic model
-        num_samples = self.num_samples if self.critic_model is not None else 1
+        # Prepare image features for the critic if needed
+        critic_image_features_encoded = None
+        if self.critic_model is not None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+            if not (hasattr(self.diffusion_model, 'image_encoder') and self.diffusion_model.image_encoder is not None):
+                raise ValueError(
+                    "Critic requires encoded image features, but diffusion_model has no image_encoder.")
 
-        for i in range(num_samples):
-            # Generate future states using diffusion
+            # model_input_batch contains normalized observation history.
+            # We need the "current" image context for the critic, typically the last image in the observation sequence.
+            current_raw_img_obs_dict = {}
+            # Assuming diffusion_model.config.image_features lists the keys for raw image observations
+            for key in self.diffusion_model.config.image_features.keys():
+                if key not in model_input_batch:
+                    raise ValueError(
+                        f"Image key '{key}' expected by diffusion_model.image_encoder not in model_input_batch.")
+
+                # Should be (B, T_obs, C, H, W) or (B, C, H, W) if T_obs=1
+                img_tensor = model_input_batch[key]
+                # B, T_obs, C, H, W
+                if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
+                    # Get the last image frame
+                    current_raw_img_obs_dict[key] = img_tensor[:, -1]
+                # B, C, H, W (implies T_obs=1 or single image context)
+                elif img_tensor.ndim == 4:
+                    current_raw_img_obs_dict[key] = img_tensor
+                else:
+                    raise ValueError(
+                        f"Unexpected shape for image key '{key}': {img_tensor.shape} in model_input_batch.")
+
+            if not current_raw_img_obs_dict:
+                raise ValueError(
+                    "No valid image data found in model_input_batch for critic.")
+
+            critic_image_features_encoded = self.diffusion_model.image_encoder(
+                current_raw_img_obs_dict)
+
+        for _ in range(num_samples_to_generate):
             predicted_states = self.diffusion_model.conditional_sample(
                 batch_size=batch_size,
                 global_cond=global_cond,
             )
-
-            start = 0
-            # Use the critic model's horizon if available, otherwise use default
-            if self.critic_model is not None and hasattr(self.critic_model, 'horizon'):
-                end = self.critic_model.horizon
-                print(f"Using critic model's horizon: {end}")
-            else:
-                end = 16  # Default to a larger horizon which is what the transformer critic appears to expect
-                print(f"Using default horizon: {end}")
-
-            # Ensure we don't exceed the available predicted states
-            end = min(end, predicted_states.shape[1])
-
-            trajectory = predicted_states[:, start:end]
+            # Diffusion model predicts future states: (B, horizon, state_dim)
+            # Critic model horizon might be different or same as diffusion horizon
+            critic_horizon = self.critic_model.horizon if self.critic_model is not None and hasattr(
+                self.critic_model, 'horizon') else predicted_states.shape[1]
+            trajectory = predicted_states[:, :critic_horizon]
             all_trajectories.append(trajectory)
 
-            # Score trajectory with critic if available
             if self.critic_model is not None:
-                # Get score from critic model
-                with torch.no_grad():
-                    try:
-                        # Check if the trajectory already has a batch dimension
-                        # Critics expect [batch_size, horizon, state_dim]
-                        if trajectory.ndim == 2:
-                            # Add batch dimension if needed
-                            trajectory_batch = trajectory.unsqueeze(0)
-                        else:
-                            trajectory_batch = trajectory
+                if critic_image_features_encoded is None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+                    raise ValueError(
+                        "Critic requires image features, but they were not prepared.")
 
-                        # Extract image features from the input batch (now required)
-                        image_features = None
-                        if "observation.image" in model_input_batch:
-                            # Use the last frame's image features
-                            image_features = model_input_batch["observation.image"][:, -1]
-                        elif self.config.image_features and all(key in model_input_batch for key in self.config.image_features):
-                            # Create a feature tensor from multiple camera views
-                            image_features = torch.stack(
-                                [model_input_batch[key][:, -1] for key in self.config.image_features], dim=-4)
-                        else:
-                            print(
-                                "Warning: No image features found for critic scoring!")
+                score = self.critic_model.score(
+                    trajectory_sequence=trajectory,
+                    image_features=critic_image_features_encoded
+                ).squeeze()
+                critic_scores.append(score)
 
-                        # Try to score the trajectory with the critic, providing image features
-                        score = self.critic_model(
-                            trajectory_sequence=trajectory_batch,
-                            image_features=image_features).squeeze()
-                        critic_scores.append(score)
-                    except Exception as e:
-                        # Provide more detailed error information
-                        print(f"Critic scoring failed with error: {e}")
-                        print(f"Trajectory shape: {trajectory_batch.shape}")
-                        if image_features is not None:
-                            print(
-                                f"Image features shape: {image_features.shape}")
-                        else:
-                            print(
-                                "Image features are None (required for TransformerCritic)")
-                        # Assign a neutral score
-                        critic_scores.append(
-                            torch.tensor(0.0, device=self.device))
-
-        # Select best trajectory based on critic scores
         if self.critic_model is not None and len(critic_scores) > 0:
-            critic_scores = torch.stack(critic_scores, dim=0)
-            # Find index of trajectory with highest score
-            best_idx = torch.argmax(critic_scores).item()
-            best_trajectory = all_trajectories[best_idx]
-
-            print(
-                f"Selected trajectory {best_idx} with score {critic_scores[best_idx].item():.4f}")
+            critic_scores_tensor = torch.stack(
+                critic_scores, dim=1)  # (B, num_samples)
+            best_indices = torch.argmax(critic_scores_tensor, dim=1)  # (B,)
+            # Select the best trajectory for each item in the batch
+            best_trajectory_list = []
+            for i in range(batch_size):
+                best_trajectory_list.append(
+                    all_trajectories[best_indices[i]][i])
+            best_trajectory = torch.stack(
+                best_trajectory_list, dim=0)  # (B, H, D_state)
         else:
-            # If no critic model, just use the first trajectory
             best_trajectory = all_trajectories[0]
 
-        # Generate actions using inverse dynamics on the best trajectory
         actions_normalized = []
         n_action_steps = best_trajectory.shape[1]
-
         current_s = best_trajectory[:, 0]
 
-        for i in range(n_action_steps-1):
-            next_s = best_trajectory[:, i+1]
-            # Create state pair (s_t, s_{t+1})
+        # Predict action from s_t to s_{t+1}
+        for i in range(n_action_steps - 1):
+            next_s = best_trajectory[:, i + 1]
+            # Inverse dynamics model expects concatenated (s_t, s_{t+1})
             state_pair = torch.cat([current_s, next_s], dim=-1)
-            # Predict action
             action_i = self.inv_dyn_model(state_pair)
             actions_normalized.append(action_i)
-            # Update current state
             current_s = next_s
 
-        # Stack actions into a sequence
-        actions = torch.stack(actions_normalized, dim=1)
-
-        # Return both actions and the best trajectory
+        if not actions_normalized:  # Handle case where n_action_steps <= 1
+            # Return zero actions or handle as per policy design for short horizons
+            action_dim = self.config.action_feature["shape"][-1]
+            actions = torch.zeros(
+                (batch_size, 0, action_dim), device=self.device)
+        else:
+            actions = torch.stack(actions_normalized, dim=1)
         return actions, best_trajectory
 
-    def compute_critic_loss(self, batch: dict) -> Tensor:
-        """
-        Compute the critic loss for the combined policy. This samples multiple trajectories,
-        scores them, and uses the scores to select the best one.
+    def compute_critic_loss(self, batch: dict, positive_trajectories: torch.Tensor, negative_trajectories: torch.Tensor) -> tuple[Tensor, Tensor]:
+        if self.critic_model is None:
+            raise ValueError(
+                "Critic model is not defined. Cannot compute critic loss.")
 
-        Unlike the TransformerCritic.compute_critic_loss which does binary classification,
-        this one focuses on regression to select the best trajectory.
-
-        Args:
-            batch: Dictionary containing normalized observation data.
-
-        Returns:
-            Tensor representing the computed loss and selected trajectory.
-        """
-
-        # Normalize inputs
+        # Normalize the input batch (contains raw observations)
         norm_batch = self.normalize_inputs(batch)
 
-        # Process image features if needed
-        processed_batch = dict(norm_batch)
-        if "observation.image" not in norm_batch and self.config.image_features:
-            if all(key in norm_batch for key in self.config.image_features):
-                processed_batch["observation.image"] = torch.stack(
-                    [norm_batch[key] for key in self.config.image_features], dim=-4
-                )
+        encoded_image_features = None
+        if hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+            if not (hasattr(self.diffusion_model, 'image_encoder') and self.diffusion_model.image_encoder is not None):
+                raise ValueError(
+                    "Critic requires encoded image features, but diffusion_model has no image_encoder.")
 
-        # Prepare model input
-        model_input_batch = {}
-        for key in processed_batch.keys():
-            if key.startswith("observation"):
-                model_input_batch[key] = processed_batch[key]
+            # Extract current raw image observations for the encoder
+            # The critic usually conditions on the "current" image context.
+            # If norm_batch['observation.image'] has a time dimension (from obs history), take the last one.
+            current_raw_img_obs_dict = {}
+            for key in self.diffusion_model.config.image_features.keys():  # e.g. "observation.image"
+                if key not in norm_batch:
+                    raise ValueError(
+                        f"Image key '{key}' expected by diffusion_model.image_encoder not in norm_batch.")
 
-        # Generate future state trajectories
-        batch_size = batch["observation.state"].shape[0]
-        global_cond = self.diffusion_model._prepare_global_conditioning(
-            model_input_batch)
+                img_tensor = norm_batch[key]
+                # B, T, C, H, W
+                if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
+                    # Last image in the sequence
+                    current_raw_img_obs_dict[key] = img_tensor[:, -1]
+                elif img_tensor.ndim == 4:  # B, C, H, W
+                    current_raw_img_obs_dict[key] = img_tensor
+                else:
+                    raise ValueError(
+                        f"Unexpected shape for image key '{key}': {img_tensor.shape} in norm_batch.")
 
-        # Generate multiple trajectory samples
-        all_trajectories = []
-        for i in range(self.num_samples):
-            predicted_states = self.diffusion_model.conditional_sample(
-                batch_size=batch_size,
-                global_cond=global_cond,
-            )
+            if not current_raw_img_obs_dict:
+                raise ValueError(
+                    "No valid image data found in norm_batch for critic's image encoder.")
 
-            # Truncate to critic horizon
-            if self.critic_model and hasattr(self.critic_model, 'horizon'):
-                horizon = min(self.critic_model.horizon,
-                              predicted_states.shape[1])
-            else:
-                horizon = min(16, predicted_states.shape[1])
+            encoded_image_features = self.diffusion_model.image_encoder(
+                current_raw_img_obs_dict)
+            encoded_image_features = encoded_image_features.to(self.device)
 
-            trajectory = predicted_states[:, :horizon]
-            all_trajectories.append(trajectory)
+        elif hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
+            raise ValueError(
+                "Critic requires image features, but they could not be obtained/encoded.")
 
-        # Stack all trajectories
-        # [B, num_samples, horizon, state_dim]
-        stacked_trajectories = torch.stack(all_trajectories, dim=1)
+        positive_trajectories = positive_trajectories.to(self.device)
+        negative_trajectories = negative_trajectories.to(self.device)
 
-        # Extract image features for the critic
-        image_features = None
-        if "observation.image" in model_input_batch:
-            if model_input_batch["observation.image"].ndim == 5:  # [B, T, C, H, W]
-                # Last timestep
-                image_features = model_input_batch["observation.image"][:, -1]
-            else:
-                image_features = model_input_batch["observation.image"]
-
-        # Score all trajectories with the critic (if available)
-        if self.critic_model is not None:
-            B, S, H, D = stacked_trajectories.shape
-
-            # Reshape to score all trajectories at once
-            flat_trajectories = stacked_trajectories.reshape(B*S, H, D)
-            # Repeat image features for each trajectory
-            repeated_image_features = image_features.repeat_interleave(
-                S, dim=0)
-
-            # Get scores from critic
-            with torch.no_grad():
-                flat_scores = self.critic_model(
-                    flat_trajectories, repeated_image_features).squeeze(-1)
-                scores = flat_scores.reshape(B, S)
-
-            # Find best trajectory indices
-            best_indices = torch.argmax(scores, dim=1)
-
-            # Select the best trajectory for each batch item
-            best_trajectories = torch.stack([
-                stacked_trajectories[b, best_indices[b]]
-                for b in range(B)
-            ])
-
-            # Return best trajectories and their scores
-            return best_trajectories, scores
-        else:
-            # Without a critic, just return the first trajectory for each batch element
-            return stacked_trajectories[:, 0], None
+        loss, accuracy = self.critic_model.compute_binary_classification_loss(
+            positive_trajectories=positive_trajectories,
+            negative_trajectories=negative_trajectories,
+            image_features=encoded_image_features  # Pass encoded features
+        )
+        return loss, accuracy

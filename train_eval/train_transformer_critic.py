@@ -11,7 +11,6 @@ from lerobot.common.policies.normalize import Normalize
 
 # Import the necessary model modules
 from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
-from model.diffusion.diffusion_modules import DiffusionRgbEncoder
 
 
 def main():
@@ -35,7 +34,6 @@ def main():
     # Model parameters
     hidden_dim = 512
     num_layers = 4
-    use_images = True  # Always use image features with TransformerCritic
 
     # Dataset parameters
     dataset_repo_id = "lerobot/pusht"
@@ -51,38 +49,14 @@ def main():
         raise ValueError(
             f"Image features ({image_key}) required but not found in dataset features.")
 
-    # --- Create Base Config ---
-    cfg = NoiseCriticConfig(
-        state_dim=features["observation.state"].shape[0],
-        horizon=16,  # Default horizon
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout=0.1,
-        use_layernorm=True,
-        use_image_context=True,
-        transformer_dim=hidden_dim,
-    )
-
-    # --- Create Custom Feature Shape for DiffusionRgbEncoder ---
-    # For DiffusionRgbEncoder, the image_features needs to have a shape attribute
-    class FeatureShape:
-        def __init__(self, shape):
-            self.shape = shape
-
-    # Create a modified config for the image encoder
-    encoder_cfg = NoiseCriticConfig()
+    # --- Image Feature Configuration ---
+    # Define the structure of the image features
     if isinstance(features[image_key], tuple):
-        encoder_cfg.image_features = {
-            "observation.image": FeatureShape(features[image_key])
+        image_features_dict = {
+            "observation.image": features[image_key]
         }
     else:
-        encoder_cfg.image_features = {"observation.image": features[image_key]}
-
-    # --- Image Encoder Setup ---
-    print("Initializing image encoder...")
-    image_encoder = DiffusionRgbEncoder(encoder_cfg).to(device)
-    image_encoder.eval()  # No need to train the image encoder
-    image_feature_dim = encoder_cfg.transformer_dim
+        image_features_dict = {"observation.image": features[image_key]}
 
     # --- Critic Model Setup ---
     print("Initializing transformer critic model...")
@@ -94,9 +68,9 @@ def main():
         dropout=0.1,
         use_layernorm=True,
         use_image_context=True,
-        image_feature_dim=image_feature_dim,
-        transformer_dim=image_feature_dim,
-        image_features=encoder_cfg.image_features,
+        image_feature_dim=hidden_dim,  # For ViT-like patching
+        transformer_dim=hidden_dim,
+        image_features=image_features_dict,
         n_heads=8
     )
 
@@ -118,13 +92,13 @@ def main():
     # --- Normalization Setup ---
     normalize_state = Normalize(
         {"observation.state": features["observation.state"]},
-        cfg.normalization_mapping,
+        critic_cfg.normalization_mapping,
         dataset_metadata.stats
     )
 
     # --- Dataset Setup ---
     # Define time indices for state and image features
-    critic_state_indices = list(range(0, cfg.horizon))
+    critic_state_indices = list(range(0, critic_cfg.horizon))
 
     # Setup delta timestamps
     delta_timestamps = {
@@ -175,161 +149,28 @@ def main():
 
             # Create normalized batch on device
             norm_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                          for k, v in batch.items()}
+                          for k, v in batch.items()}  # batch is already on device
 
-            # Replace with normalized state
+            # Replace with normalized state (which was normalized on CPU)
             norm_batch["observation.state"] = norm_state_batch["observation.state"].to(
                 device)
 
-            # Extract state trajectories
-            all_state_trajectories = norm_batch["observation.state"][:, 0:cfg.horizon]
-            B, H, D_state = all_state_trajectories.shape
-
-            # Create positive state trajectories (original or slightly perturbed)
-            positive_state_trajectory = all_state_trajectories.clone()
-
-            # Apply minor data augmentation to positive examples (20% probability)
-            if torch.rand(1).item() < 0.2:
-                tiny_noise_scale = base_noise_scale * 0.1  # 10x smaller noise
-                for t_step in range(1, H):
-                    tiny_noise = torch.randn_like(
-                        positive_state_trajectory[:, t_step]) * tiny_noise_scale
-                    positive_state_trajectory[:, t_step] += tiny_noise
-
-            # Create negative state trajectories (corrupted with noise)
-            negative_state_trajectory = all_state_trajectories.clone()
-
-            # Apply shuffling to some negative examples (30% of batch)
-            shuffle_mask = torch.rand(B) < 0.3
-            if shuffle_mask.any():
-                # Get the number of examples to shuffle
-                num_to_shuffle = shuffle_mask.sum().item()
-
-                # Create a single set of shuffled indices
-                shuffle_indices = torch.randperm(B)[:num_to_shuffle]
-
-                # Get the indices of elements where shuffle_mask is True
-                mask_indices = torch.where(shuffle_mask)[0]
-
-                # For each index where shuffle_mask is True, assign a trajectory from a different batch element
-                for i, idx in enumerate(mask_indices):
-                    # Get a random index from the shuffle_indices
-                    random_idx = shuffle_indices[i % len(shuffle_indices)]
-                    # Make sure we're not copying the same trajectory
-                    if random_idx == idx:
-                        random_idx = (random_idx + 1) % B
-                    # Copy the trajectory
-                    negative_state_trajectory[idx] = all_state_trajectories[random_idx]
-
-            # Apply noise to negative trajectories based on specified noise type
-            if noise_type == "progressive":
-                # Apply progressive noise (increasing with each timestep)
-                current_noise_scale = base_noise_scale
-                for t_step in range(1, H):
-                    noise = torch.randn_like(
-                        negative_state_trajectory[:, t_step]) * current_noise_scale
-                    negative_state_trajectory[:, t_step] += noise
-                    current_noise_scale *= noise_growth_factor
-
-            elif noise_type == "diffusion":
-                # Apply diffusion-like noise (stronger at the end of the sequence)
-                for t_step in range(1, H):
-                    # Calculate noise scale based on position in sequence
-                    timestep_fraction = t_step / (H - 1)  # 0 to 1
-                    noise_scale = base_noise_scale * \
-                        (1.0 + 10 * timestep_fraction**2)
-                    noise = torch.randn_like(
-                        negative_state_trajectory[:, t_step]) * noise_scale
-                    negative_state_trajectory[:, t_step] += noise
-
-            elif noise_type == "uniform":
-                # Apply uniform noise across all timesteps
-                for t_step in range(1, H):
-                    noise = torch.randn_like(
-                        negative_state_trajectory[:, t_step]) * base_noise_scale
-                    negative_state_trajectory[:, t_step] += noise
-
-            # Apply temporal shifts to some negative examples (30% probability)
-            if torch.rand(1).item() < 0.3:
-                shift_mask = torch.rand(B) < 0.5
-                if shift_mask.any():
-                    # Get the indices of elements where shift_mask is True
-                    mask_indices = torch.where(shift_mask)[0]
-
-                    # Maximum shift is 1/4 of horizon length
-                    max_shift = max(1, H//4)
-
-                    for idx in mask_indices:
-                        # Generate random shift amount
-                        shift = torch.randint(1, max_shift + 1, (1,)).item()
-                        shift = min(shift, H-1)  # Safety check
-
-                        # Create a shifted version of this trajectory
-                        trajectory = negative_state_trajectory[idx].clone()
-
-                        # Apply the shift: move states ahead
-                        negative_state_trajectory[idx,
-                                                  :-shift] = trajectory[shift:]
-
-                        # Repeat the last state for the remaining positions
-                        last_state = trajectory[-1]
-                        negative_state_trajectory[idx, -
-                                                  shift:] = last_state.unsqueeze(0).repeat(shift, 1)
-
-            # Process images to get image features
-            with torch.no_grad():
-                # Extract observation images
-                images = batch[image_key]
-
-                # Print shape for debugging
-                print(f"Original image shape: {images.shape}")
-
-                # Handle different image shapes
-                if len(images.shape) == 5:  # (B, T_img, C, H, W)
-                    B_i, T_img = images.shape[:2]
-
-                    # Check if images need to be normalized to [0,1]
-                    if images.max() > 1.0:
-                        images = images / 255.0
-
-                    # Flatten batch and time dimensions
-                    # (B*T_img, C, H, W)
-                    images_flat = images.reshape(-1, *images.shape[2:])
-
-                elif len(images.shape) == 4:  # (B, C, H, W) - only one timestep
-                    B_i = images.shape[0]
-                    T_img = 1
-
-                    # Check if images need to be normalized to [0,1]
-                    if images.max() > 1.0:
-                        images = images / 255.0
-
-                    # Already in the right format for processing
-                    images_flat = images
-
-                # Print shape for debugging
-                print(f"Processed image shape: {images_flat.shape}")
-
-                # Extract features using the image encoder
-                image_features_flat = image_encoder(images_flat)
-
-                # Handle the reshaping based on original shape
-                if len(images.shape) == 5:  # (B, T_img, C, H, W)
-                    # Reshape back to sequence format
-                    image_features_seq = image_features_flat.view(
-                        B_i, T_img, -1)
-                    # Last frame
-                    image_features = image_features_seq[:, -1]
-                else:  # (B, C, H, W)
-                    # Already flat, no need to take the last frame
-                    image_features = image_features_flat
-
-            # Calculate loss using the simplified critic loss computation
+            # --- Compute Critic Loss ---
             optimizer.zero_grad()
-            loss, accuracy = critic_model.compute_critic_loss(
-                positive_trajectories=positive_state_trajectory,
-                negative_trajectories=negative_state_trajectory,
-                image_features=image_features
+
+            # Configure noise parameters
+            noise_params = {
+                "base_noise_scale": base_noise_scale,
+                "noise_type": noise_type,
+                "noise_growth_factor": noise_growth_factor
+            }
+
+            # Pass normalized batch directly to the critic model
+            # The critic will handle image patching internally (ViT-like approach)
+            loss, accuracy = critic_model.compute_binary_classification_loss(
+                norm_batch=norm_batch,
+                noise_params=noise_params,
+                image_features=None  # No pre-encoded features, use raw images
             )
 
             # Backprop and optimize
@@ -366,8 +207,38 @@ def main():
     print(f"Training complete! Final model saved to {final_path}")
 
     # --- Save Config and Stats ---
-    # Save the critic config
-    config_dict = {k: v for k, v in critic_cfg.__dict__.items()}
+    # Save the critic config - handle non-serializable objects
+    config_dict = {}
+    for k, v in critic_cfg.__dict__.items():
+        # Handle special cases that aren't JSON serializable
+        if k == "image_features":
+            # Convert PolicyFeature objects to their string representations
+            image_features_dict = {}
+            for img_key, feature in v.items():
+                # Store the shape info if it's a tuple
+                if hasattr(feature, "shape"):
+                    image_features_dict[img_key] = list(feature.shape)
+                else:
+                    # Just store the string representation as fallback
+                    image_features_dict[img_key] = str(feature)
+            config_dict[k] = image_features_dict
+        elif k == "normalization_mapping":
+            # Convert enum values to strings
+            norm_dict = {}
+            for norm_key, norm_val in v.items():
+                norm_dict[norm_key] = str(norm_val)
+            config_dict[k] = norm_dict
+        else:
+            # Handle basic types that are JSON serializable
+            try:
+                # Test if the value is JSON serializable
+                import json
+                json.dumps(v)
+                config_dict[k] = v
+            except (TypeError, OverflowError):
+                # Fall back to string representation for non-serializable objects
+                config_dict[k] = str(v)
+
     with open(output_directory / "config.json", "w") as f:
         import json
         json.dump(config_dict, f, indent=4)
