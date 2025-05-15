@@ -152,9 +152,6 @@ class CombinedCriticPolicy(nn.Module):
         # Populate queues with the latest *normalized* observation
         self._queues = populate_queues(self._queues, processed_batch)
 
-        # Generate new action plan and trajectories
-        trajectories = []
-
         if len(self._queues["action"]) == 0:
             # Check if we have enough history to make a prediction
             required_obs = self.config.n_obs_steps
@@ -177,13 +174,10 @@ class CombinedCriticPolicy(nn.Module):
 
             try:
                 # Use our helper method to generate predicted states and actions all at once
-                actions, best_trajectory = self._generate_states_critic_actions(
+                actions = self._generate_states_critic_actions(
                     model_input_batch=model_input_batch,
                     batch_size=batch["observation.state"].shape[0]
                 )
-
-                # Add best trajectory to list
-                trajectories.append(best_trajectory)
 
                 # Unnormalize actions using our own or diffusion model's unnormalizer
                 if hasattr(self, 'unnormalize_action_output'):
@@ -222,7 +216,7 @@ class CombinedCriticPolicy(nn.Module):
 
         # Pop the next action from the queue
         next_action = self._queues["action"].popleft()
-        return next_action, trajectories
+        return next_action
 
     @torch.no_grad()
     def _generate_states_critic_actions(self, model_input_batch, batch_size):
@@ -248,50 +242,18 @@ class CombinedCriticPolicy(nn.Module):
         num_samples_to_generate = self.num_samples if self.critic_model is not None else 1
 
         # Prepare raw images for the critic if needed
-        critic_raw_images = None
-        if self.critic_model is not None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-            # model_input_batch contains normalized observation history.
-            # We need the "current" image context for the critic, typically the last image in the observation sequence.
-
-            # Assuming critic_model.image_features lists the keys for raw image observations
-            for key in self.critic_model.image_features.keys():
-                if key not in model_input_batch:
-                    raise ValueError(
-                        f"Image key '{key}' expected by critic model not in model_input_batch.")
-
-                # Should be (B, T_obs, C, H, W) or (B, C, H, W) if T_obs=1
-                img_tensor = model_input_batch[key]
-                # B, T_obs, C, H, W
-                if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
-                    # Get the last image frame
-                    critic_raw_images = img_tensor[:, -1]  # B, C, H, W
-                # B, C, H, W (implies T_obs=1 or single image context)
-                elif img_tensor.ndim == 4:
-                    critic_raw_images = img_tensor
-                else:
-                    raise ValueError(
-                        f"Unexpected shape for image key '{key}': {img_tensor.shape} in model_input_batch.")
-
-            if critic_raw_images is None:
-                raise ValueError(
-                    "No valid image data found in model_input_batch for critic.")
+        critic_raw_images = model_input_batch["observation.image"][:, 0, :]
 
         for _ in range(num_samples_to_generate):
             predicted_states = self.diffusion_model.conditional_sample(
                 batch_size=batch_size,
                 global_cond=global_cond,
             )
-            # Diffusion model predicts future states: (B, horizon, state_dim)
-            # Critic model horizon might be different or same as diffusion horizon
-            critic_horizon = self.critic_model.horizon if self.critic_model is not None and hasattr(
-                self.critic_model, 'horizon') else predicted_states.shape[1]
-            trajectory = predicted_states[:, :critic_horizon]
+
+            trajectory = predicted_states
             all_trajectories.append(trajectory)
 
             if self.critic_model is not None:
-                if critic_raw_images is None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-                    raise ValueError(
-                        "Critic requires raw images, but they were not prepared.")
 
                 score = self.critic_model.score(
                     trajectory_sequence=trajectory,
@@ -300,20 +262,38 @@ class CombinedCriticPolicy(nn.Module):
                 critic_scores.append(score)
 
         if self.critic_model is not None and len(critic_scores) > 0:
-            critic_scores_tensor = torch.stack(
-                critic_scores, dim=1)  # (B, num_samples)
-            best_indices = torch.argmax(critic_scores_tensor, dim=1)  # (B,)
-            # Select the best trajectory for each item in the batch
-            best_trajectory_list = []
-            for i in range(batch_size):
-                best_trajectory_list.append(
-                    all_trajectories[best_indices[i]][i])
-            best_trajectory = torch.stack(
-                best_trajectory_list, dim=0)  # (B, H, D_state)
+            # Handle the case where critic scores are scalar tensors
+            if critic_scores[0].dim() == 0:
+                # Convert list of scalar tensors to a tensor of shape [num_samples]
+                critic_scores_tensor = torch.stack(
+                    critic_scores)  # (num_samples,)
+                # Get the index of the best score
+                best_index = torch.argmax(
+                    critic_scores_tensor).item()  # scalar
+                # Select the best trajectory (same for all items in batch)
+                best_trajectory = all_trajectories[best_index]
+            else:
+                # Original logic for batched scores of shape [B, num_samples]
+                critic_scores_tensor = torch.stack(
+                    critic_scores, dim=1)  # (B, num_samples)
+                best_indices = torch.argmax(
+                    critic_scores_tensor, dim=1)  # (B,)
+                # Select the best trajectory for each item in the batch
+                best_trajectory_list = []
+                for i in range(batch_size):
+                    best_trajectory_list.append(
+                        all_trajectories[best_indices[i]][i])
+                best_trajectory = torch.stack(
+                    best_trajectory_list, dim=0)  # (B, H, D_state)
         else:
             best_trajectory = all_trajectories[0]
 
         actions_normalized = []
+
+        start = 0
+        end = 8
+
+        best_trajectory = best_trajectory[:, start:end]
         n_action_steps = best_trajectory.shape[1]
         current_s = best_trajectory[:, 0]
 
@@ -333,7 +313,7 @@ class CombinedCriticPolicy(nn.Module):
                 (batch_size, 0, action_dim), device=self.device)
         else:
             actions = torch.stack(actions_normalized, dim=1)
-        return actions, best_trajectory
+        return actions
 
     def compute_critic_loss(self, batch: dict, positive_trajectories: torch.Tensor, negative_trajectories: torch.Tensor) -> tuple[Tensor, Tensor]:
         if self.critic_model is None:

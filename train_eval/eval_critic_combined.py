@@ -231,7 +231,7 @@ def main():
         # The select_action method now returns both action and trajectories
         with torch.inference_mode():
             # Call our updated select_action method that uses the critic model
-            action, trajectories = combined_model.select_action(
+            action = combined_model.select_action(
                 curr_state=observation["observation.state"],
                 image=image
             )
