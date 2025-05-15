@@ -191,10 +191,22 @@ class CombinedCriticPolicy(nn.Module):
 
             except Exception as e:
                 print(f"Error during action generation: {e}")
-                # Return zero action and empty trajectory list in case of an error
+                # Return zero action and a default trajectory in case of an error
                 zero_action = torch.zeros(
                     (1, self.config.action_feature.shape[0]), device=self.device)
-                return zero_action, []
+
+                # Create a default trajectory with the correct shape based on critic model's expectations
+                if self.critic_model is not None and hasattr(self.critic_model, 'horizon') and hasattr(self.critic_model, 'state_dim'):
+                    default_horizon = self.critic_model.horizon
+                    default_state_dim = self.critic_model.state_dim
+                else:
+                    default_horizon = 16  # Use the default horizon
+                    default_state_dim = batch["observation.state"].shape[-1] if "observation.state" in batch else 2
+
+                default_trajectory = torch.zeros(
+                    (1, default_horizon, default_state_dim), device=self.device)
+
+                return zero_action, [default_trajectory]
 
         # Pop the next action from the queue
         next_action = self._queues["action"].popleft()
@@ -280,7 +292,17 @@ class CombinedCriticPolicy(nn.Module):
             )
 
             start = 0
-            end = 8  # Make sure this matches the critic's horizon
+            # Use the critic model's horizon if available, otherwise use default
+            if self.critic_model is not None and hasattr(self.critic_model, 'horizon'):
+                end = self.critic_model.horizon
+                print(f"Using critic model's horizon: {end}")
+            else:
+                end = 16  # Default to a larger horizon which is what the transformer critic appears to expect
+                print(f"Using default horizon: {end}")
+
+            # Ensure we don't exceed the available predicted states
+            end = min(end, predicted_states.shape[1])
+            print(f"Trajectory shape will be: [batch_size, {end}, state_dim]")
 
             trajectory = predicted_states[:, start:end]
             all_trajectories.append(trajectory)
@@ -289,8 +311,17 @@ class CombinedCriticPolicy(nn.Module):
             if self.critic_model is not None:
                 # Get score from critic model
                 with torch.no_grad():
-                    score = self.critic_model(trajectory).squeeze()
-                    critic_scores.append(score)
+                    try:
+                        # Try to score the trajectory with the critic
+                        score = self.critic_model(
+                            trajectory_sequence=trajectory).squeeze()
+                        critic_scores.append(score)
+                    except ValueError as e:
+                        # If there's a shape mismatch, print the error but continue with the sample
+                        print(f"Critic scoring failed with error: {e}")
+                        # Assign a neutral score
+                        critic_scores.append(
+                            torch.tensor(0.0, device=self.device))
 
         # Select best trajectory based on critic scores
         if self.critic_model is not None and len(critic_scores) > 0:

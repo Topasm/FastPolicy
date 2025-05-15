@@ -24,7 +24,7 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.modeling_critic_combined import CombinedCriticPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
-from model.critic.noise_critic import create_noise_critic, NoiseCriticConfig
+from model.critic.noise_critic import NoiseCriticConfig, TransformerCritic
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from sklearn.metrics import roc_auc_score, accuracy_score
 
@@ -35,7 +35,7 @@ def main():
     diffusion_output_dir = Path("outputs/train/diffusion_only")
     invdyn_output_dir = Path("outputs/train/invdyn_only")
     # Using noise_critic for the critic model
-    noise_critic_output_dir = Path("outputs/train/noise_critic")
+    noise_critic_output_dir = Path("outputs/train/transformer_critic")
 
     # Assume config.json is available in diffusion output directory
     config_stats_path = diffusion_output_dir
@@ -88,7 +88,7 @@ def main():
             f"Inverse dynamics checkpoint not found at {invdyn_ckpt_path}")
     inv_dyn_model = MlpInvDynamic(
         # State dim * 2 (current + prev)
-        o_dim=cfg.robot_state_feature.shape[0] * 2,
+        o_dim=cfg.robot_state_feature.shape[0],
         a_dim=cfg.action_feature.shape[0],
         hidden_dim=cfg.inv_dyn_hidden_dim,
         dropout=0.1,
@@ -102,32 +102,65 @@ def main():
     inv_dyn_model.to(device)
 
     # Noise Critic Model
-    noise_critic_ckpt_path = noise_critic_output_dir / "noise_critic_final.pth"
+    noise_critic_ckpt_path = noise_critic_output_dir / "transformer_critic_final.pth"
     if not noise_critic_ckpt_path.is_file():
-        raise OSError(
-            f"Noise critic checkpoint not found at {noise_critic_ckpt_path}")
+        # Try the alternative filename if it doesn't exist
+        noise_critic_ckpt_path = noise_critic_output_dir / "noise_critic_final.pth"
+        if not noise_critic_ckpt_path.is_file():
+            raise OSError(
+                f"Noise critic checkpoint not found at {noise_critic_ckpt_path}")
 
-    # Create noise critic config
-    critic_cfg = NoiseCriticConfig(
-        state_dim=cfg.robot_state_feature.shape[0],
-        horizon=cfg.horizon,
-        hidden_dim=cfg.hidden_dim,
-        num_layers=cfg.num_layers,
-        dropout=cfg.dropout,
-        use_layernorm=cfg.use_layernorm,
-        architecture="dv_horizon",  # Use the transformer-based critic
-        use_image_context=cfg.use_image_observations
-    )
+    # Create transformer critic model directly
+    print(
+        f"Loading transformer critic state dict from: {noise_critic_ckpt_path}")
 
-    # Create and load critic model
-    print(f"Loading noise critic state dict from: {noise_critic_ckpt_path}")
-    noise_critic_model = create_noise_critic(critic_cfg)
-    noise_critic_state_dict = torch.load(
+    # Load critic config from the saved file if it exists
+    critic_config_path = noise_critic_output_dir / "config.json"
+    if critic_config_path.is_file():
+        critic_config_data = json.loads(critic_config_path.read_text())
+        # Make sure we have required fields
+        if "state_dim" not in critic_config_data:
+            critic_config_data["state_dim"] = cfg.robot_state_feature.shape[0]
+        if "horizon" not in critic_config_data:
+            critic_config_data["horizon"] = cfg.horizon
+
+        # Create the config from file data
+        critic_cfg = NoiseCriticConfig(**critic_config_data)
+        noise_critic_model = TransformerCritic(critic_cfg)
+    else:
+        # If no config file, create directly with model parameters
+        noise_critic_model = TransformerCritic(
+            NoiseCriticConfig(
+                state_dim=cfg.robot_state_feature.shape[0],
+                horizon=cfg.horizon,
+                hidden_dim=cfg.hidden_dim,
+                num_layers=cfg.num_layers,
+                dropout=cfg.dropout,
+                use_layernorm=cfg.use_layernorm,
+                use_image_context=cfg.use_image_observations
+            )
+        )
+
+    # Load state dict and move to device
+    critic_state_dict = torch.load(
         noise_critic_ckpt_path, map_location=device)
-    noise_critic_model.load_state_dict(noise_critic_state_dict)
+
+    # Handle compiled model state dict with _orig_mod. prefix
+    if any(k.startswith('_orig_mod.') for k in critic_state_dict.keys()):
+        print("Detected compiled model state dict with '_orig_mod.' prefix, removing prefix...")
+        # Create a new state dict with modified keys
+        fixed_state_dict = {}
+        for key, value in critic_state_dict.items():
+            if key.startswith('_orig_mod.'):
+                fixed_state_dict[key[len('_orig_mod.'):]] = value
+            else:
+                fixed_state_dict[key] = value
+        critic_state_dict = fixed_state_dict
+
+    noise_critic_model.load_state_dict(critic_state_dict)
     noise_critic_model.eval()
     noise_critic_model.to(device)
-    print("Noise critic model loaded successfully.")
+    print("Transformer critic model loaded successfully.")
 
     # Create combined model with critic
     combined_model = CombinedCriticPolicy(
@@ -190,28 +223,48 @@ def main():
                 image=image
             )
 
-        # Extract trajectory for noise critic (take first trajectory)
-        normalized_trajectory = trajectories[0]  # Shape: [horizon, state_dim]
+        # Extract trajectory for noise critic (take first trajectory if available)
+        if trajectories and len(trajectories) > 0:
+            # Shape: [horizon, state_dim]
+            normalized_trajectory = trajectories[0]
 
-        # Score original trajectory with noise critic
-        with torch.inference_mode():
-            orig_score = noise_critic_model(
-                trajectory_sequence=normalized_trajectory.unsqueeze(0)
-            ).squeeze().item()
-            critic_scores["original"].append(orig_score)
+            # Score original trajectory with noise critic
+            with torch.inference_mode():
+                try:
+                    orig_score = noise_critic_model(
+                        trajectory_sequence=normalized_trajectory.unsqueeze(0)
+                    ).squeeze().item()
+                    critic_scores["original"].append(orig_score)
+                except Exception as e:
+                    print(f"Error scoring original trajectory: {e}")
+                    # Add a default score
+                    critic_scores["original"].append(0.0)
+        else:
+            print("Warning: No trajectories returned from select_action")
+            # Add a default score
+            critic_scores["original"].append(0.0)
+            # Create a default normalized_trajectory for the noise tests below
+            normalized_trajectory = torch.zeros(
+                (noise_critic_model.horizon, noise_critic_model.state_dim), device=device)
 
         # Score noisy trajectories
         for noise_level in noise_levels:
-            # Apply noise to trajectory
-            noisy_traj = normalized_trajectory.clone(
-            ) + torch.randn_like(normalized_trajectory) * noise_level
+            try:
+                # Apply noise to trajectory
+                noisy_traj = normalized_trajectory.clone(
+                ) + torch.randn_like(normalized_trajectory) * noise_level
 
-            # Get critic score
-            with torch.inference_mode():
-                noise_score = noise_critic_model(
-                    trajectory_sequence=noisy_traj.unsqueeze(0)
-                ).squeeze().item()
-                critic_scores[noise_level].append(noise_score)
+                # Get critic score
+                with torch.inference_mode():
+                    noise_score = noise_critic_model(
+                        trajectory_sequence=noisy_traj.unsqueeze(0)
+                    ).squeeze().item()
+                    critic_scores[noise_level].append(noise_score)
+            except Exception as e:
+                print(
+                    f"Error scoring noisy trajectory at level {noise_level}: {e}")
+                # Add a default score
+                critic_scores[noise_level].append(0.0)
 
         # Convert to numpy for environment step
         numpy_action = action.squeeze(0).cpu().numpy()

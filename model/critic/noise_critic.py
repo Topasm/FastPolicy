@@ -12,10 +12,14 @@ class NoiseCriticConfig:
     num_layers: int = 4  # Number of transformer layers or MLP blocks
     dropout: float = 0.1
     use_layernorm: bool = True
+    # Options: "mlp", "transformer", "gru", "dv_horizon"
+    architecture: str = "transformer"
     use_image_context: bool = False  # Whether to use image features as context
     image_feature_dim: int = 0  # Dimension of image features (if used)
-    # Parameters for transformer
+    # Additional parameters for DVHorizonCritic
     n_heads: int = 8  # Number of attention heads
+    # Norm type for DVTransformerBlock ("pre" or "post")
+    norm_type: str = "post"
 
 
 class TransformerCritic(nn.Module):
@@ -135,3 +139,77 @@ class TransformerCritic(nn.Module):
         score = self.forward(trajectory_sequence, image_features)
         self.train()
         return score
+
+
+class SinusoidalEmbedding(nn.Module):
+    """
+    Sinusoidal Positional Embedding module.
+    Creates position-dependent sinusoidal patterns for encoding sequence position information.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        embeddings = torch.zeros(x.shape[0], self.dim, device=device)
+        div_term = torch.exp(torch.arange(0, half_dim, 2, device=device).float() *
+                             -(torch.log(torch.tensor(10000.0)) / half_dim))
+        position = x.unsqueeze(1)
+        embeddings[:, 0::2] = torch.sin(position * div_term)
+        if self.dim % 2 != 0:  # For odd dimensions
+            embeddings[:, 1::2] = torch.cos(
+                position * div_term)[:, 0:embeddings[:, 1::2].shape[1]]
+        else:
+            embeddings[:, 1::2] = torch.cos(position * div_term)
+        return embeddings
+
+
+class DVTransformerBlock(nn.Module):
+    """
+    Transformer block used in DVHorizonCritic.
+    Implements both pre-layer normalization and post-layer normalization architectures.
+    """
+
+    def __init__(self, hidden_size: int, n_heads: int, dropout: float = 0.0, norm_type="post"):
+        super().__init__()
+        self.norm_type = norm_type
+
+        self.norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(
+            hidden_size, n_heads, dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6)
+
+        def approx_gelu(): return nn.GELU(approximate="tanh")
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            approx_gelu(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, hidden_size)
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.norm_type == "post":
+            # Post-LN: Sublayer -> Add -> Norm
+            attn_output, _ = self.attn(x, x, x)
+            x = self.norm1(x + attn_output)
+            x = self.norm2(x + self.mlp(x))
+        elif self.norm_type == "pre":
+            # Pre-LN: Norm -> Sublayer -> Add
+            # Self-Attention part
+            normed_x = self.norm1(x)
+            attn_output, _ = self.attn(normed_x, normed_x, normed_x)
+            x = x + attn_output
+            # MLP part
+            normed_x = self.norm2(x)
+            mlp_output = self.mlp(normed_x)
+            x = x + mlp_output
+        else:
+            raise NotImplementedError(
+                f"norm_type {self.norm_type} not implemented.")
+        return x
