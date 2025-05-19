@@ -204,14 +204,12 @@ def main():
         print("TransformerCritic model loaded successfully.")
 
     # Create combined model with the appropriate critic
-    # Important: Set use_modernbert to False for now, as the current implementation
-    # in CombinedCriticPolicy has an issue with ModernBertCritic
     combined_model = CombinedCriticPolicy(
         diffusion_model=diffusion_model,
         inv_dyn_model=inv_dyn_model,
-        critic_model=noise_critic_model,
+        critic_model=noise_critic_model,  # Pass the instantiated critic model
         num_samples=4,  # Generate 4 trajectory samples
-        use_modernbert=False  # Set to False to avoid the error with ModernBertCritic.score()
+        use_modernbert=True  # Tell policy this is a ModernBertCritic
     )
 
     # --- Environment Setup ---

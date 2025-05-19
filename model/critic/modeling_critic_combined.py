@@ -12,7 +12,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.invdynamics.invdyn import MlpInvDynamic
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.critic.ciritic_modules import TransformerCritic
-from model.critic.modernbert_critic import ModernBertCritic
+# We're accepting any critic model instance now, no need to import specific types
 
 
 class CombinedCriticPolicy(nn.Module):
@@ -29,9 +29,9 @@ class CombinedCriticPolicy(nn.Module):
 
         # Use ModernBertCritic if requested, otherwise use the provided critic_model
         self.use_modernbert = use_modernbert
-        if use_modernbert:
-            self.critic_model = ModernBertCritic
-        else:
+        # Store the critic model - ensure we have an instance, not a class
+        if isinstance(critic_model, torch.nn.Module):
+            # If we're given an instance, use it
             self.critic_model = critic_model
 
         self.num_samples = num_samples  # Number of trajectory samples to generate
@@ -263,8 +263,8 @@ class CombinedCriticPolicy(nn.Module):
             all_trajectories.append(trajectory)
 
             if self.critic_model is not None:
-
-                score = self.critic_model.score(
+                # Use the critic model's score method
+                score = self.critic_model(
                     trajectory_sequence=trajectory,
                     raw_images=critic_raw_images
                 ).squeeze()
@@ -338,23 +338,28 @@ class CombinedCriticPolicy(nn.Module):
             # Extract current raw image observations
             # The critic usually conditions on the "current" image context.
             # If norm_batch['observation.image'] has a time dimension (from obs history), take the last one.
-            for key in self.critic_model.image_features.keys():  # e.g. "observation.image"
-                if key not in norm_batch:
-                    raise ValueError(
-                        f"Image key '{key}' expected by critic model not in norm_batch.")
+            image_key = "observation.image"  # Default image key
+            # Try to get image_features dictionary if it exists
+            if hasattr(self.critic_model, 'image_features'):
+                # Get first key from the image_features dictionary
+                image_keys = list(self.critic_model.image_features.keys())
+                if image_keys:
+                    image_key = image_keys[0]
 
-                img_tensor = norm_batch[key]
+            if image_key in norm_batch:
+                img_tensor = norm_batch[image_key]
                 # B, T, C, H, W
                 if img_tensor.ndim == 5 and img_tensor.shape[1] > 0:
                     # Last image in the sequence
                     critic_raw_images = img_tensor[:, -1]  # B, C, H, W
-                    break
                 elif img_tensor.ndim == 4:  # B, C, H, W
                     critic_raw_images = img_tensor
-                    break
                 else:
                     raise ValueError(
-                        f"Unexpected shape for image key '{key}': {img_tensor.shape} in norm_batch.")
+                        f"Unexpected shape for image key '{image_key}': {img_tensor.shape} in norm_batch.")
+            else:
+                raise ValueError(
+                    f"Image key '{image_key}' expected by critic model not in norm_batch.")
 
             if critic_raw_images is None:
                 raise ValueError(
@@ -363,9 +368,16 @@ class CombinedCriticPolicy(nn.Module):
         positive_trajectories = positive_trajectories.to(self.device)
         negative_trajectories = negative_trajectories.to(self.device)
 
-        loss, accuracy = self.critic_model.compute_binary_classification_loss(
-            positive_trajectories=positive_trajectories,
-            negative_trajectories=negative_trajectories,
-            raw_images=critic_raw_images  # Pass raw images directly
-        )
+        # Call compute_binary_classification_loss on the critic instance
+        if hasattr(self.critic_model, 'compute_binary_classification_loss'):
+            loss, accuracy = self.critic_model.compute_binary_classification_loss(
+                positive_trajectories=positive_trajectories,
+                negative_trajectories=negative_trajectories,
+                raw_images=critic_raw_images  # Pass raw images directly
+            )
+        else:
+            # Fallback implementation
+            raise ValueError(
+                "Critic model missing compute_binary_classification_loss method")
+
         return loss, accuracy

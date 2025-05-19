@@ -31,7 +31,7 @@ def parse_args():
                         help="Batch size for training")
     parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Hidden dimension of the transformer")
-    parser.add_argument("--num_layers", type=int, default=6,
+    parser.add_argument("--num_layers", type=int, default=8,
                         help="Number of transformer layers")
     parser.add_argument("--num_heads", type=int, default=8,
                         help="Number of attention heads")
