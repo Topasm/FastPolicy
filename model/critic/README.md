@@ -4,11 +4,12 @@ This module implements a critic model that distinguishes between original trajec
 
 ## Models
 
-The implementation offers three different architectures for the noise critic model:
+The implementation offers four different architectures for the noise critic model:
 
 1. **MLP-based critic** - Flattens the trajectory and processes it through an MLP network.
 2. **Transformer-based critic** - Uses a transformer encoder to process the sequence of states.
 3. **GRU-based critic** - Uses a GRU to encode the sequence of states.
+4. **ModernBERT-based critic** - Uses a modern transformer encoder with SwiGLU activations, attention pooling, and pre-normalization architecture.
 
 All models can optionally incorporate image features as context to improve their discrimination capability.
 
@@ -88,3 +89,38 @@ The model is configured through the `NoiseCriticConfig` class, which specifies:
 - Hidden dimensions
 - Whether to use image context
 - And other hyperparameters
+
+## ModernBERT Critic
+
+The new ModernBERT-based critic implements several architectural improvements:
+
+- **SwiGLU activations** instead of traditional GELU for better performance
+- **Pre-normalization architecture** (norm_first=True) for improved training stability
+- **Attention pooling** for feature aggregation instead of simple CLS token extraction
+- **No bias in linear projections** following modern BERT practices
+- **Improved initialization** techniques for better convergence
+
+### Usage Example
+
+```python
+from model.critic.modernbert_critic import ModernBertCritic, ModernBertCriticConfig
+
+# Create configuration
+config = ModernBertCriticConfig(
+    state_dim=7,
+    horizon=16,
+    hidden_dim=768,
+    num_layers=8,
+    num_heads=12,
+    swiglu_intermediate_factor=4
+)
+
+# Initialize model
+critic = ModernBertCritic(config)
+
+# Score trajectories
+scores = critic.score(
+    trajectory_sequence=trajectories,
+    raw_images=images
+)
+```

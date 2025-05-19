@@ -12,6 +12,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.invdynamics.invdyn import MlpInvDynamic
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.critic.ciritic_modules import TransformerCritic
+from model.critic.modernbert_critic import ModernBertCritic
 
 
 class CombinedCriticPolicy(nn.Module):
@@ -20,11 +21,19 @@ class CombinedCriticPolicy(nn.Module):
     This class is a simple torch.nn.Module that doesn't require config_class.
     """
 
-    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic, critic_model=TransformerCritic, num_samples=4):
+    def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic,
+                 critic_model=TransformerCritic, num_samples=4, use_modernbert=False):
         super().__init__()
         self.diffusion_model = diffusion_model
         self.inv_dyn_model = inv_dyn_model
-        self.critic_model = critic_model
+
+        # Use ModernBertCritic if requested, otherwise use the provided critic_model
+        self.use_modernbert = use_modernbert
+        if use_modernbert:
+            self.critic_model = ModernBertCritic
+        else:
+            self.critic_model = critic_model
+
         self.num_samples = num_samples  # Number of trajectory samples to generate
         self.config = diffusion_model.config
         self.device = get_device_from_parameters(diffusion_model)

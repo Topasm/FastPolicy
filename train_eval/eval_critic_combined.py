@@ -24,9 +24,10 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.critic.modeling_critic_combined import CombinedCriticPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
-from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
+# Import both critic types for flexibility
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from sklearn.metrics import roc_auc_score, accuracy_score
+from model.critic.modernbert_critic import ModernBertCritic, ModernBertCriticConfig
+from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
 
 
 def main():
@@ -35,7 +36,7 @@ def main():
     diffusion_output_dir = Path("outputs/train/diffusion_only")
     invdyn_output_dir = Path("outputs/train/invdyn_only")
     # Using noise_critic for the critic model
-    noise_critic_output_dir = Path("outputs/train/transformer_critic")
+    noise_critic_output_dir = Path("outputs/train/modernbert_critic")
 
     # Assume config.json is available in diffusion output directory
     config_stats_path = diffusion_output_dir
@@ -102,17 +103,11 @@ def main():
     inv_dyn_model.to(device)
 
     # Noise Critic Model
-    noise_critic_ckpt_path = noise_critic_output_dir / "transformer_critic_final.pth"
-    if not noise_critic_ckpt_path.is_file():
-        # Try the alternative filename if it doesn't exist
-        noise_critic_ckpt_path = noise_critic_output_dir / "noise_critic_final.pth"
-        if not noise_critic_ckpt_path.is_file():
-            raise OSError(
-                f"Noise critic checkpoint not found at {noise_critic_ckpt_path}")
+    noise_critic_ckpt_path = noise_critic_output_dir / "modernbert_critic_weights.pth"
 
-    # Create transformer critic model directly
+    # Create ModernBert critic model
     print(
-        f"Loading transformer critic state dict from: {noise_critic_ckpt_path}")
+        f"Loading ModernBert critic state dict from: {noise_critic_ckpt_path}")
 
     # Load critic config from the saved file if it exists
     critic_config_path = noise_critic_output_dir / "config.json"
@@ -126,35 +121,28 @@ def main():
         if "image_feature_dim" not in critic_config_data:
             critic_config_data["image_feature_dim"] = cfg.hidden_dim
 
-        # Ensure use_image_context is always True
-        critic_config_data["use_image_context"] = True
+        # Add ModernBertCritic-specific fields if needed
+        if "num_heads" not in critic_config_data:
+            critic_config_data["num_heads"] = 8
+        if "swiglu_intermediate_factor" not in critic_config_data:
+            critic_config_data["swiglu_intermediate_factor"] = 4
 
-        # Make sure image_features is properly set
-        if "image_features" not in critic_config_data:
-            critic_config_data["image_features"] = {
-                "observation.image": (3, 84, 84)}
-        if "transformer_dim" not in critic_config_data:
-            critic_config_data["transformer_dim"] = critic_config_data.get(
-                "hidden_dim", 512)
-
-        # Create the config from file data
-        critic_cfg = NoiseCriticConfig(**critic_config_data)
-        noise_critic_model = TransformerCritic(critic_cfg)
+        # Create the config from file data and initialize ModernBertCritic
+        critic_cfg = ModernBertCriticConfig(**critic_config_data)
+        noise_critic_model = ModernBertCritic(critic_cfg)
     else:
         # If no config file, create directly with model parameters
-        noise_critic_model = TransformerCritic(
-            NoiseCriticConfig(
+        noise_critic_model = ModernBertCritic(
+            ModernBertCriticConfig(
                 state_dim=cfg.robot_state_feature.shape[0],
                 horizon=cfg.horizon,
                 hidden_dim=cfg.hidden_dim,
                 num_layers=cfg.num_layers,
                 dropout=cfg.dropout,
                 use_layernorm=cfg.use_layernorm,
-                use_image_context=True,  # Always use image context
                 image_feature_dim=cfg.hidden_dim,  # Use hidden_dim as image feature dimension
-                transformer_dim=cfg.hidden_dim,
-                image_features={"observation.image": (
-                    3, 84, 84)}  # Default image shape
+                num_heads=8,  # Default number of attention heads
+                swiglu_intermediate_factor=4  # Default SwiGLU factor
             )
         )
 
@@ -174,17 +162,56 @@ def main():
                 fixed_state_dict[key] = value
         critic_state_dict = fixed_state_dict
 
-    noise_critic_model.load_state_dict(critic_state_dict)
-    noise_critic_model.eval()
-    noise_critic_model.to(device)
-    print("Transformer critic model loaded successfully.")
+    try:
+        # Try loading ModernBert model
+        noise_critic_model.load_state_dict(critic_state_dict)
+        noise_critic_model.eval()
+        noise_critic_model.to(device)
+        print("ModernBert critic model loaded successfully.")
+    except RuntimeError as e:
+        print(f"Failed to load ModernBert model: {e}")
+        print("Falling back to TransformerCritic model...")
 
-    # Create combined model with critic
+        # Fallback to TransformerCritic
+        transformer_critic_path = Path(
+            "outputs/train/transformer_critic/transformer_critic_final.pth")
+        if not transformer_critic_path.is_file():
+            raise OSError(
+                f"TransformerCritic checkpoint not found at {transformer_critic_path}")
+
+        # Create TransformerCritic config
+        critic_cfg = NoiseCriticConfig(
+            state_dim=cfg.robot_state_feature.shape[0],
+            horizon=cfg.horizon,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+            use_layernorm=cfg.use_layernorm,
+            use_image_context=True,  # Always use image context
+            image_feature_dim=cfg.hidden_dim,  # Use hidden_dim as image feature dimension
+            transformer_dim=cfg.hidden_dim,
+            image_features={"observation.image": (
+                3, 84, 84)}  # Default image shape
+        )
+
+        # Create and load TransformerCritic model
+        noise_critic_model = TransformerCritic(critic_cfg)
+        transformer_state_dict = torch.load(
+            transformer_critic_path, map_location=device)
+        noise_critic_model.load_state_dict(transformer_state_dict)
+        noise_critic_model.eval()
+        noise_critic_model.to(device)
+        print("TransformerCritic model loaded successfully.")
+
+    # Create combined model with the appropriate critic
+    # Important: Set use_modernbert to False for now, as the current implementation
+    # in CombinedCriticPolicy has an issue with ModernBertCritic
     combined_model = CombinedCriticPolicy(
         diffusion_model=diffusion_model,
         inv_dyn_model=inv_dyn_model,
         critic_model=noise_critic_model,
-        num_samples=4  # Generate 5 trajectory samples
+        num_samples=4,  # Generate 4 trajectory samples
+        use_modernbert=False  # Set to False to avoid the error with ModernBertCritic.score()
     )
 
     # --- Environment Setup ---
@@ -228,13 +255,19 @@ def main():
             combined_model.reset()
 
         # Get action from the combined policy
-        # The select_action method now returns both action and trajectories
+        # The select_action method may return just action or (action, trajectories)
         with torch.inference_mode():
             # Call our updated select_action method that uses the critic model
-            action = combined_model.select_action(
+            result = combined_model.select_action(
                 curr_state=observation["observation.state"],
                 image=image
             )
+
+            # Handle both possible return types
+            if isinstance(result, tuple):
+                action, _ = result  # Ignore trajectories
+            else:
+                action = result
 
         # Convert to numpy for environment step
         numpy_action = action.squeeze(0).cpu().numpy()
