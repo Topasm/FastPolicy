@@ -70,24 +70,17 @@ def main():
 
     # Configure dataset based on features
     horizon = 16  # Default trajectory horizon length
-    image_key = "observation.image"
-    has_images = image_key in features
 
     # Get state dimension and set image feature dimension
     state_dim = features["observation.state"].shape[0]
-    image_feature_dim = args.hidden_dim if has_images else 0
 
     print(f"Using state dimension: {state_dim}, horizon: {horizon}")
-    print(f"Image features available: {has_images}")
 
     # Setup delta timestamps for trajectory features
     delta_timestamps = {
         "observation.state": [i / dataset_metadata.fps for i in range(horizon)],
+        "observation.image": [i / dataset_metadata.fps for i in range(horizon)]
     }
-
-    # Add image timestamp if available
-    if has_images:
-        delta_timestamps[image_key] = [0.0]  # Just use the current image
 
     # Initialize dataset
     print("Initializing dataset...")
@@ -118,12 +111,10 @@ def main():
         state_dim=state_dim,
         horizon=horizon,
         hidden_dim=args.hidden_dim,
-        image_feature_dim=image_feature_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         dropout=0.1,
         use_layernorm=True,
-        use_image_context=has_images,
         swiglu_intermediate_factor=4
     )
 
@@ -253,7 +244,6 @@ def main():
         'optimizer_state_dict': optimizer.state_dict(),
         'config': config.__dict__,
         'step': step,
-        'has_images': has_images
     }, final_path)
     print(f"Training complete! Final model saved to {final_path}")
 

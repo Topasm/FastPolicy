@@ -10,13 +10,10 @@ class ModernBertCriticConfig:
     state_dim: int  # Dimension of state
     horizon: int    # Sequence length (time steps) for state trajectory
     hidden_dim: int = 768  # Hidden dimension for transformer layers
-    # Dimension of image features (if pre-encoded)
-    image_feature_dim: int = 2048
     dropout: float = 0.1  # Dropout rate
     use_layernorm: bool = True  # Use LayerNorm in output heads
     num_layers: int = 8  # Number of transformer layers
     num_heads: int = 12  # Number of attention heads
-    use_image_context: bool = True  # Whether to use image context
     swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
 
 
