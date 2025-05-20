@@ -24,10 +24,9 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.critic.modeling_critic_combined import CombinedCriticPolicy
 from model.invdynamics.invdyn import MlpInvDynamic
-# Import both critic types for flexibility
+# Import ModernBertCritic
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.critic.modernbert_critic import ModernBertCritic, ModernBertCriticConfig
-from model.critic.ciritic_modules import NoiseCriticConfig, TransformerCritic
 
 
 def main():
@@ -42,7 +41,7 @@ def main():
     config_stats_path = diffusion_output_dir
 
     # Output directory for evaluation results
-    output_directory = Path("outputs/eval/noise_critic")
+    output_directory = Path("outputs/eval/modernbert_critic")
     output_directory.mkdir(parents=True, exist_ok=True)
 
     # Device setup
@@ -118,8 +117,6 @@ def main():
             critic_config_data["state_dim"] = cfg.robot_state_feature.shape[0]
         if "horizon" not in critic_config_data:
             critic_config_data["horizon"] = cfg.horizon
-        if "image_feature_dim" not in critic_config_data:
-            critic_config_data["image_feature_dim"] = cfg.hidden_dim
 
         # Add ModernBertCritic-specific fields if needed
         if "num_heads" not in critic_config_data:
@@ -136,12 +133,11 @@ def main():
             ModernBertCriticConfig(
                 state_dim=cfg.robot_state_feature.shape[0],
                 horizon=cfg.horizon,
-                hidden_dim=cfg.hidden_dim,
-                num_layers=cfg.num_layers,
+                hidden_dim=cfg.transformer_dim,  # Use transformer_dim instead of hidden_dim
+                num_layers=cfg.transformer_num_layers,  # Use transformer_num_layers
                 dropout=cfg.dropout,
-                use_layernorm=cfg.use_layernorm,
-                image_feature_dim=cfg.hidden_dim,  # Use hidden_dim as image feature dimension
-                num_heads=8,  # Default number of attention heads
+                use_layernorm=True,  # Default to True since it's used in the model
+                num_heads=cfg.transformer_num_heads,  # Use transformer_num_heads
                 swiglu_intermediate_factor=4  # Default SwiGLU factor
             )
         )
@@ -162,54 +158,19 @@ def main():
                 fixed_state_dict[key] = value
         critic_state_dict = fixed_state_dict
 
-    try:
-        # Try loading ModernBert model
-        noise_critic_model.load_state_dict(critic_state_dict)
-        noise_critic_model.eval()
-        noise_critic_model.to(device)
-        print("ModernBert critic model loaded successfully.")
-    except RuntimeError as e:
-        print(f"Failed to load ModernBert model: {e}")
-        print("Falling back to TransformerCritic model...")
+    # Load the ModernBert model
+    noise_critic_model.load_state_dict(critic_state_dict)
+    noise_critic_model.eval()
+    noise_critic_model.to(device)
+    print("ModernBert critic model loaded successfully.")
 
-        # Fallback to TransformerCritic
-        transformer_critic_path = Path(
-            "outputs/train/transformer_critic/transformer_critic_final.pth")
-        if not transformer_critic_path.is_file():
-            raise OSError(
-                f"TransformerCritic checkpoint not found at {transformer_critic_path}")
-
-        # Create TransformerCritic config
-        critic_cfg = NoiseCriticConfig(
-            state_dim=cfg.robot_state_feature.shape[0],
-            horizon=cfg.horizon,
-            hidden_dim=cfg.hidden_dim,
-            num_layers=cfg.num_layers,
-            dropout=cfg.dropout,
-            use_layernorm=cfg.use_layernorm,
-            use_image_context=True,  # Always use image context
-            image_feature_dim=cfg.hidden_dim,  # Use hidden_dim as image feature dimension
-            transformer_dim=cfg.hidden_dim,
-            image_features={"observation.image": (
-                3, 84, 84)}  # Default image shape
-        )
-
-        # Create and load TransformerCritic model
-        noise_critic_model = TransformerCritic(critic_cfg)
-        transformer_state_dict = torch.load(
-            transformer_critic_path, map_location=device)
-        noise_critic_model.load_state_dict(transformer_state_dict)
-        noise_critic_model.eval()
-        noise_critic_model.to(device)
-        print("TransformerCritic model loaded successfully.")
-
-    # Create combined model with the appropriate critic
+    # Create combined model with ModernBertCritic
     combined_model = CombinedCriticPolicy(
         diffusion_model=diffusion_model,
         inv_dyn_model=inv_dyn_model,
-        critic_model=noise_critic_model,  # Pass the instantiated critic model
+        critic_model=noise_critic_model,  # Pass the ModernBert critic model
         num_samples=4,  # Generate 4 trajectory samples
-        use_modernbert=True  # Tell policy this is a ModernBertCritic
+        use_modernbert=True  # Always use ModernBertCritic
     )
 
     # --- Environment Setup ---

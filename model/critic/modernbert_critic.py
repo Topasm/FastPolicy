@@ -15,6 +15,8 @@ class ModernBertCriticConfig:
     num_layers: int = 8  # Number of transformer layers
     num_heads: int = 12  # Number of attention heads
     swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
+    # Half-horizon for split sequence prediction (if None, uses horizon // 2)
+    half_horizon: int = None
 
 
 # --- SwiGLU Activation ---
@@ -93,6 +95,9 @@ class ModernBertCritic(nn.Module):
         self.state_dim = config.state_dim
         self.horizon = config.horizon
         self.hidden_dim = config.hidden_dim
+        # Set half_horizon to half of horizon if not provided
+        self.half_horizon = config.half_horizon if config.half_horizon is not None else self.horizon // 2
+        self.use_image_context = True  # Default to using image context
         use_bias = False  # ModernBERT: No bias in linear layers
 
         # Image parameters for ViT-like processing
@@ -131,16 +136,6 @@ class ModernBertCritic(nn.Module):
 
         # Calculate SwiGLU hidden dimension
         swiglu_hidden_dim = config.hidden_dim * config.swiglu_intermediate_factor
-
-        # Legacy image feature processing (for pre-encoded features)
-        self.img_encoder = nn.Sequential(
-            nn.Linear(config.image_feature_dim,
-                      config.hidden_dim, bias=use_bias),
-            nn.GELU(),  # Keep GELU for compatibility with older code
-            nn.LayerNorm(
-                config.hidden_dim) if config.use_layernorm else nn.Identity(),
-            nn.Dropout(config.dropout)
-        )
 
         # Transformer encoder with pre-normalization and modern design
         encoder_layer = nn.TransformerEncoderLayer(
@@ -228,24 +223,29 @@ class ModernBertCritic(nn.Module):
         # Return attention-pooled representation
         return self.attention_pooler(img_features, mask=cls_only_mask)
 
-    def forward(self, trajectory_sequence: torch.Tensor, raw_images: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, trajectory_sequence: torch.Tensor, raw_images: torch.Tensor = None, second_half: bool = False) -> torch.Tensor:
         """
         Args:
             trajectory_sequence: (B, H, D_state) tensor of state sequences.
-            raw_images: Optional (B, C, H, W) tensor of raw images. 
+            raw_images: Optional (B, C, H, W) tensor of raw images or (B, 2, C, H, W) for first and second half images.
+            second_half: Whether this is the second half of the sequence (for positional embedding indexing)
 
         Returns:
             (B, 1) tensor of scores.
         """
         B, H, D = trajectory_sequence.shape
-        if H != self.horizon or D != self.state_dim:
+
+        # When we're doing next sequence prediction, we need to handle both full sequences
+        # and half sequences (half_horizon length)
+        # Only validate the state dimension (D) not the sequence length (H)
+        if D != self.state_dim:
             raise ValueError(
-                f"Input shape mismatch. Expected (B, {self.horizon}, {self.state_dim}), got {(B, H, D)}")
+                f"Input state dimension mismatch. Expected state dim {self.state_dim}, got {D}")
 
-        # Process images
+        # Process images - handle different image formats
         if raw_images is not None:
+            # Process the image and get embedding
             img_embedding = self.process_raw_images(raw_images).unsqueeze(1)
-
         elif not self.use_image_context:
             # If image context is not used, create a learnable dummy token instead
             img_embedding = self.cls_token.expand(B, 1, -1)
@@ -257,8 +257,17 @@ class ModernBertCritic(nn.Module):
         state_embeddings = self.state_embedding(
             trajectory_sequence)  # (B, H, hidden_dim)
 
-        # Add positional embeddings to state embeddings
-        state_embeddings = state_embeddings + self.pos_embedding
+        # Add positional embeddings to state embeddings - adjust for second half
+        if second_half:
+            # For second half, use position embeddings from the second half of the full sequence
+            # When processing half_horizon length sequences, this would be positions half_horizon to horizon-1
+            pos_embeddings_to_use = self.pos_embedding[:,
+                                                       self.half_horizon:self.half_horizon+trajectory_sequence.shape[1], :]
+            state_embeddings = state_embeddings + pos_embeddings_to_use
+        else:
+            # For first half or full sequence, use the beginning of the position embeddings
+            state_embeddings = state_embeddings + \
+                self.pos_embedding[:, :trajectory_sequence.shape[1], :]
 
         # Combine image embedding with state embeddings
         sequence_for_transformer = torch.cat(
@@ -279,18 +288,95 @@ class ModernBertCritic(nn.Module):
         score = self.output_head(pooled_output)
         return score
 
-    @torch.no_grad()
-    def score(self, trajectory_sequence: torch.Tensor, raw_images: torch.Tensor = None) -> torch.Tensor:
+    def score(self, trajectory_sequence: torch.Tensor, raw_images: torch.Tensor = None, second_half: bool = False) -> torch.Tensor:
         """
-        Inference entrypoint.
+        Scoring entrypoint. This will maintain gradients in training mode or disable them in eval mode.
 
         Args:
             trajectory_sequence: (B, H, D_state) tensor of state sequences.
-            raw_images: Optional (B, C, H, W) tensor of raw images.
+            raw_images: Optional (B, C, H, W) tensor of raw images or (B, 2, C, H, W) for first and second half images.
+            second_half: Whether this is the second half of the sequence (for positional embedding indexing)
         """
-        self.eval()
-        score = self.forward(trajectory_sequence, raw_images)
+        score = self.forward(trajectory_sequence, raw_images, second_half)
         return score
+
+    def score_next_sequence(self, first_half: torch.Tensor, second_half: torch.Tensor,
+                            raw_images: torch.Tensor = None) -> torch.Tensor:
+        """
+        Score how likely the second half sequence is a correct continuation of the first half.
+
+        Args:
+            first_half: (B, H/2, D_state) tensor of first half state sequences
+            second_half: (B, H/2, D_state) tensor of second half state sequences
+            raw_images: (B, 2, C, H, W) tensor with images for first and second half
+                        or (B, C, H, W) tensor with a single image used for both halves
+
+        Returns:
+            (B, 1) tensor of scores, higher means more likely to be correct continuation
+        """
+        # Note: This function must maintain gradients for training
+
+        # Prepare images if we only have one image per sequence
+        if raw_images is not None and raw_images.ndim == 4:
+            # Duplicate the image for both first and second half
+            raw_images = torch.stack(
+                [raw_images, raw_images], dim=1)  # B, 2, C, H, W        # Get scores for first half using first image - raw_images should be (B, 2, C, H, W)
+        if raw_images is not None:
+            if raw_images.ndim != 5:
+                raise ValueError(
+                    f"Expected raw_images to be (B, 2, C, H, W), got shape {raw_images.shape}")
+            first_image = raw_images[:, 0]  # (B, C, H, W)
+            second_image = raw_images[:, 1]  # (B, C, H, W)
+        else:
+            first_image = None
+            second_image = None
+
+        # Forward pass with gradient tracking (no @torch.no_grad decorator)
+        first_scores = self.forward(
+            first_half, raw_images=first_image, second_half=False)
+        second_scores = self.forward(
+            second_half, raw_images=second_image, second_half=True)
+
+        # Combine scores (average)
+        combined_scores = (first_scores + second_scores) / 2
+
+        return combined_scores
+
+    def extract_images_from_batch(self, norm_batch):
+        """
+        Extract images for first and second half from the normalized batch.
+
+        Args:
+            norm_batch: Batch dictionary containing observation.image
+
+        Returns:
+            Tuple of (first_half_img, second_half_img) - each is (B, C, H, W)
+        """
+        if "observation.image" not in norm_batch:
+            return None, None
+
+        img_tensor = norm_batch["observation.image"]
+
+        # Extract images for first and second halves
+        if img_tensor.ndim == 5:  # B, T_img, C, H, W
+            # Take images at timestep 0 and timestep half_horizon
+            # Make sure we're within bounds
+            first_idx = 0
+            second_idx = min(self.half_horizon, img_tensor.shape[1]-1)
+
+            first_half_img = img_tensor[:,
+                                        first_idx].contiguous()  # B, C, H, W
+            second_half_img = img_tensor[:,
+                                         second_idx].contiguous()  # B, C, H, W
+        elif img_tensor.ndim == 4:  # B, C, H, W - only single image
+            # Use the same image for both halves
+            first_half_img = img_tensor
+            second_half_img = img_tensor
+        else:
+            raise ValueError(
+                f"Unsupported image tensor shape: {img_tensor.shape}")
+
+        return first_half_img, second_half_img
 
     def compute_binary_classification_loss(
         self,
@@ -301,18 +387,18 @@ class ModernBertCritic(nn.Module):
         norm_batch: dict = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes binary classification loss with provided positive and negative trajectories.
-        Positive trajectories are labeled 1, negative trajectories are labeled 0.
+        Computes binary classification loss for next sequence prediction task.
+        First half sequences (0-7) are used to predict if second half sequences (8-16) are correct continuations.
+        Positive trajectories are labeled 1 (correct next sequence), negative trajectories are labeled 0 (incorrect).
+
+        Uses only two image frames (at timesteps 0 and 8) to reduce memory usage.
 
         Args:
-            positive_trajectories: (B_pos, H, D_state) tensor of positive state sequences.
-            negative_trajectories: (B_neg, H, D_state) tensor of negative state sequences.
-            raw_images: (B, C, H, W) tensor of raw images.
-            noise_params: Optional dictionary with noise parameters to apply:
-                - base_noise_scale: Base scale of noise
-                - noise_type: Type of noise ("progressive", "diffusion", "uniform")
-                - noise_growth_factor: Factor for progressive noise
-            norm_batch: Optional normalized batch dictionary. If provided, extracts trajectories and images from it.
+            positive_trajectories: (B_pos, H, D_state) tensor of positive state sequences (for legacy support).
+            negative_trajectories: (B_neg, H, D_state) tensor of negative state sequences (for legacy support).
+            raw_images: (B, 2, C, H, W) tensor of raw images for first (idx 0) and second half (idx 1).
+            noise_params: Optional dictionary with noise parameters to apply to create negative samples.
+            norm_batch: Normalized batch dictionary. If provided, extracts trajectories and images from it.
 
         Returns:
             tuple with (loss, accuracy)
@@ -320,72 +406,101 @@ class ModernBertCritic(nn.Module):
         # Extract trajectories and images from norm_batch if provided
         if norm_batch is not None:
             if "observation.state" in norm_batch:
-                # Extract trajectories from the normalized batch
+                # Extract full trajectories from the normalized batch
                 trajectories = norm_batch["observation.state"][:,
                                                                :self.horizon]
 
-                # Use trajectories as both positive and negative (will add noise to negative)
-                positive_trajectories = trajectories.clone()
-                negative_trajectories = trajectories.clone()
+                # Split into first half and second half
+                first_half = trajectories[:, :self.half_horizon]
+                second_half = trajectories[:, self.half_horizon:self.horizon]
 
-                # Get raw images from norm_batch
-                if raw_images is None and "observation.image" in norm_batch:
-                    img_tensor = norm_batch["observation.image"]
-                    # Handle different image tensor shapes
-                    if img_tensor.ndim == 5:  # B, T_img, C, H, W
-                        # Take the first image in sequence
-                        raw_images = img_tensor[:, 0]  # B, C, H, W
-                    elif img_tensor.ndim == 4:  # B, C, H, W
-                        raw_images = img_tensor
+                # Create positive samples - true second half sequences
+                positive_first_half = first_half.clone()
+                positive_second_half = second_half.clone()
+
+                # For negative samples, we'll use the same first half but noised second half
+                negative_first_half = first_half.clone()
+                negative_second_half = second_half.clone()
+
+                # Get images for first and second half
+                if raw_images is None:
+                    # Use extract_images_from_batch to handle image processing
+                    first_img, second_img = self.extract_images_from_batch(
+                        norm_batch)
+                    if first_img is not None and second_img is not None:
+                        # Stack for score_next_sequence which expects [B, 2, C, H, W]
+                        raw_images = torch.stack(
+                            [first_img, second_img], dim=1)  # B, 2, C, H, W
+
             else:
                 raise ValueError(
                     "norm_batch is provided but does not contain 'observation.state'")
-        elif positive_trajectories is None or negative_trajectories is None:
+        else:
             raise ValueError(
-                "Either norm_batch or both positive_trajectories and negative_trajectories must be provided")
+                "norm_batch must be provided for next sequence prediction")
 
-        device = positive_trajectories.device
+        device = positive_first_half.device
+        B = positive_first_half.shape[0]
 
-        # Apply noise to negative trajectories if noise_params is provided
+        # Apply noise to negative second half trajectories if noise_params is provided
         if noise_params is not None:
             base_noise_scale = noise_params.get("base_noise_scale", 0.05)
             noise_type = noise_params.get("noise_type", "progressive")
             noise_growth_factor = noise_params.get("noise_growth_factor", 1.2)
 
-            # Clone to ensure we don't modify the original
-            negative_trajectories = negative_trajectories.clone()
-
-            # Add progressive noise to negative trajectories (skip the first step)
-            horizon = negative_trajectories.shape[1]
-            for t_step in range(1, horizon):
+            # Add noise to each timestep in the negative second half
+            for t_idx in range(negative_second_half.shape[1]):
+                relative_step = t_idx + 1  # Start from 1 for noise progression
                 current_noise = base_noise_scale
 
                 if noise_type == "progressive":
-                    current_noise *= (noise_growth_factor ** (t_step - 1))
+                    current_noise *= (noise_growth_factor **
+                                      (relative_step - 1))
                 elif noise_type == "diffusion":
-                    timestep_fraction = t_step / \
-                        (horizon - 1) if horizon > 1 else 0
+                    timestep_fraction = relative_step / \
+                        self.half_horizon if self.half_horizon > 1 else 0
                     current_noise *= (1.0 + 10 * timestep_fraction**2)
 
                 noise = torch.randn_like(
-                    negative_trajectories[:, t_step]) * current_noise
-                negative_trajectories[:, t_step] += noise
+                    negative_second_half[:, t_idx]) * current_noise
+                negative_second_half[:, t_idx] += noise
 
+        # Randomly shuffle some of the negative second halves for more variety
+        if torch.rand(1).item() < 0.5:  # 50% chance to apply shuffling
+            # 70% of batch gets shuffled
+            shuffle_mask = torch.rand(B, device=device) < 0.7
+
+            if shuffle_mask.any():
+                shuffle_indices = torch.randperm(B, device=device)
+                for i in range(B):
+                    if shuffle_mask[i]:
+                        # Get a different index to swap with
+                        j = shuffle_indices[i]
+                        if j == i:  # Avoid self-swap
+                            j = (j + 1) % B
+                        negative_second_half[i] = second_half[j].clone()
+
+        # Compute model predictions
         if raw_images is not None:
-            positive_scores = self.forward(
-                positive_trajectories, raw_images=raw_images)
-            negative_scores = self.forward(
-                negative_trajectories, raw_images=raw_images)
+            # Score the positive pairs (first half -> true second half)
+            positive_scores = self.score_next_sequence(
+                positive_first_half, positive_second_half, raw_images=raw_images)
+
+            # Score the negative pairs (first half -> noised/shuffled second half)
+            negative_scores = self.score_next_sequence(
+                negative_first_half, negative_second_half, raw_images=raw_images)
         else:
             raise ValueError(
-                "Either raw_images must be provided")
+                "raw_images must be provided for next sequence prediction")
 
+        # Combine positive and negative scores and create labels
         all_scores = torch.cat([positive_scores, negative_scores], dim=0)
 
         positive_labels = torch.ones_like(positive_scores, device=device)
         negative_labels = torch.zeros_like(negative_scores, device=device)
         all_labels = torch.cat([positive_labels, negative_labels], dim=0)
 
+        # Calculate loss and accuracy
         loss_fn = nn.BCEWithLogitsLoss()
         loss = loss_fn(all_scores, all_labels)
 

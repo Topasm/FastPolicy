@@ -24,7 +24,7 @@ from model.critic.modernbert_critic import ModernBertCritic, ModernBertCriticCon
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a ModernBERT Critic model")
+        description="Train a ModernBERT Critic model for next sequence prediction")
     parser.add_argument("--dataset", type=str, default="lerobot/pusht",
                         help="Name of the dataset to use")
     parser.add_argument("--batch_size", type=int, default=32,
@@ -51,7 +51,9 @@ def parse_args():
                         help="How often to log training metrics")
     parser.add_argument("--save_freq", type=int, default=1000,
                         help="How often to save model checkpoints")
-    # Simplifying arguments to match transformer training code
+    # New arguments for next sequence prediction
+    parser.add_argument("--half_horizon", type=int, default=8,
+                        help="Length of half trajectory for next sequence prediction")
     return parser.parse_args()
 
 
@@ -70,11 +72,13 @@ def main():
 
     # Configure dataset based on features
     horizon = 16  # Default trajectory horizon length
+    half_horizon = args.half_horizon  # Half-horizon for next sequence prediction
 
     # Get state dimension and set image feature dimension
     state_dim = features["observation.state"].shape[0]
 
-    print(f"Using state dimension: {state_dim}, horizon: {horizon}")
+    print(
+        f"Using state dimension: {state_dim}, full horizon: {horizon}, half horizon: {half_horizon}")
 
     # Setup delta timestamps for trajectory features
     delta_timestamps = {
@@ -106,7 +110,7 @@ def main():
 
     # --- Model Setup ---
     # Create and configure ModernBert critic model
-    print("Creating ModernBERT critic model...")
+    print("Creating ModernBERT critic model with next sequence prediction capability...")
     config = ModernBertCriticConfig(
         state_dim=state_dim,
         horizon=horizon,
@@ -115,7 +119,8 @@ def main():
         num_heads=args.num_heads,
         dropout=0.1,
         use_layernorm=True,
-        swiglu_intermediate_factor=4
+        swiglu_intermediate_factor=4,
+        half_horizon=half_horizon  # Set half-horizon for next sequence prediction
     )
 
     # Save config for future reference
@@ -155,7 +160,8 @@ def main():
     # Train model
     model.train()
 
-    print(f"Starting ModernBERT critic training ({args.steps} steps)...")
+    print(
+        f"Starting ModernBERT critic training for next sequence prediction ({args.steps} steps)...")
     print(
         f"Base noise scale: {args.base_noise_scale}, Growth factor: {args.noise_growth_factor}")
 
