@@ -22,17 +22,34 @@ class CombinedCriticPolicy(nn.Module):
     """
 
     def __init__(self, diffusion_model: MyDiffusionModel, inv_dyn_model: MlpInvDynamic,
-                 critic_model=TransformerCritic, num_samples=4, use_modernbert=False):
+                 critic_model=TransformerCritic, num_samples=4):
         super().__init__()
         self.diffusion_model = diffusion_model
         self.inv_dyn_model = inv_dyn_model
 
-        # Use ModernBertCritic if requested, otherwise use the provided critic_model
-        self.use_modernbert = use_modernbert
         # Store the critic model - ensure we have an instance, not a class
         if isinstance(critic_model, torch.nn.Module):
             # If we're given an instance, use it
             self.critic_model = critic_model
+        else:
+            raise ValueError(
+                "critic_model must be an instance of torch.nn.Module")
+
+        # Check if the critic model supports half_horizon (for sequence splitting)
+        self.supports_half_horizon = hasattr(self.critic_model, 'half_horizon')
+
+        if self.supports_half_horizon:
+            print(
+                f"Detected critic model with half_horizon={self.critic_model.half_horizon}")
+
+            # Ensure half_horizon attribute is correctly set
+            if hasattr(self.critic_model, 'horizon') and not hasattr(self.critic_model, 'half_horizon'):
+                # Set it automatically based on horizon
+                self.critic_model.half_horizon = self.critic_model.horizon // 2
+                print(
+                    f"Setting half_horizon to {self.critic_model.half_horizon}")
+        else:
+            print("Using standard critic model without half-sequence capability")
 
         self.num_samples = num_samples  # Number of trajectory samples to generate
         self.config = diffusion_model.config
@@ -92,6 +109,11 @@ class CombinedCriticPolicy(nn.Module):
     def select_action(self, curr_state=None, prev_state=None, image=None, batch=None) -> tuple[Tensor, list[Tensor]]:
         """
         Selects an action using the combined policy.
+
+        For ModernBertCritic models with next sequence prediction:
+        - Generates full trajectories (16 steps)
+        - Splits them into first half (0-7) and second half (8-15) for critic scoring
+        - Uses only the first half (0-7) for action prediction via inverse dynamics
 
         Args:
             curr_state: Current state tensor (optional)
@@ -253,24 +275,107 @@ class CombinedCriticPolicy(nn.Module):
         # Prepare raw images for the critic if needed
         critic_raw_images = model_input_batch["observation.image"][:, 0, :]
 
-        for _ in range(num_samples_to_generate):
+        for i in range(num_samples_to_generate):
             predicted_states = self.diffusion_model.conditional_sample(
                 batch_size=batch_size,
                 global_cond=global_cond,
             )
 
             trajectory = predicted_states
+            # Add debugging information about trajectory shape
+            if i == 0:  # Only print for the first sample to avoid spam
+                print(f"Generated trajectory shape: {trajectory.shape}, "
+                      f"Expected half_horizon: {self.critic_model.half_horizon if hasattr(self.critic_model, 'half_horizon') else 'N/A'}")
+
             all_trajectories.append(trajectory)
 
             if self.critic_model is not None:
-                # Use the critic model's score method
-                score = self.critic_model(
-                    trajectory_sequence=trajectory,
-                    raw_images=critic_raw_images
-                ).squeeze()
+                # Get trajectory dimensions
+                full_horizon = trajectory.shape[1]
+
+                # Determine if we should use half-horizon based scoring
+                if self.supports_half_horizon:
+                    half_horizon = self.critic_model.half_horizon
+
+                    # Prepare the trajectory for scoring based on its length
+                    if full_horizon >= half_horizon:
+                        # We have enough steps for at least the first half
+                        first_half = trajectory[:, :half_horizon]
+
+                        # Print diagnostic info for trajectory structure
+                        if i == 0:  # Only print for first sample
+                            print(
+                                f"Trajectory split: Full len={full_horizon}, Using first {half_horizon} steps")
+
+                            # If we have a full trajectory, also check continuity
+                            if full_horizon >= 2 * half_horizon:
+                                second_half = trajectory[:,
+                                                         half_horizon:2*half_horizon]
+                                first_end = first_half[:, -1, 0].item()
+                                second_start = second_half[:, 0, 0].item()
+                                print(
+                                    f"First half ends at: {first_end:.4f}, Second half starts at: {second_start:.4f}")
+
+                        try:
+                            # Use the score method if available, otherwise fallback to direct call
+                            if hasattr(self.critic_model, 'score'):
+                                score = self.critic_model.score(
+                                    trajectory_sequence=first_half,
+                                    raw_images=critic_raw_images,
+                                    second_half=False
+                                ).squeeze()
+                                print(
+                                    f"Using score method with first {half_horizon} steps")
+                            else:
+                                score = self.critic_model(
+                                    trajectory_sequence=first_half,
+                                    raw_images=critic_raw_images,
+                                    second_half=False
+                                ).squeeze()
+                                print(
+                                    f"Using direct call with first {half_horizon} steps")
+                        except Exception as e:
+                            # Handle any errors in the scoring process
+                            print(f"Error in critic scoring: {e}")
+                            # Fallback to standard scoring with full trajectory
+                            score = self.critic_model(
+                                trajectory_sequence=trajectory,
+                                raw_images=critic_raw_images
+                            ).squeeze()
+                            print(
+                                "Falling back to full trajectory scoring due to error")
+                    else:
+                        # Trajectory too short, use what we have
+                        print(
+                            f"Short trajectory ({full_horizon} steps), using entire trajectory")
+                        score = self.critic_model(
+                            trajectory_sequence=trajectory,
+                            raw_images=critic_raw_images,
+                            second_half=False  # Treat as first half
+                        ).squeeze()
+                else:
+                    # Standard scoring for models without half-horizon support
+                    if hasattr(self.critic_model, 'score'):
+                        # Use score method if available
+                        score = self.critic_model.score(
+                            trajectory_sequence=trajectory,
+                            raw_images=critic_raw_images
+                        ).squeeze()
+                    else:
+                        # Fall back to direct call
+                        score = self.critic_model(
+                            trajectory_sequence=trajectory,
+                            raw_images=critic_raw_images
+                        ).squeeze()
                 critic_scores.append(score)
 
         if self.critic_model is not None and len(critic_scores) > 0:
+            # Print critic scores for debugging
+            scores_for_print = [s.item() if isinstance(s, torch.Tensor) and s.numel() == 1
+                                else s.mean().item() if isinstance(s, torch.Tensor)
+                                else s for s in critic_scores]
+            print(f"Critic scores: {[f'{s:.4f}' for s in scores_for_print]}")
+
             # Handle the case where critic scores are scalar tensors
             if critic_scores[0].dim() == 0:
                 # Convert list of scalar tensors to a tensor of shape [num_samples]
@@ -281,6 +386,8 @@ class CombinedCriticPolicy(nn.Module):
                     critic_scores_tensor).item()  # scalar
                 # Select the best trajectory (same for all items in batch)
                 best_trajectory = all_trajectories[best_index]
+                print(
+                    f"Selected best trajectory at index {best_index} with score {critic_scores_tensor[best_index].item():.4f}")
             else:
                 # Original logic for batched scores of shape [B, num_samples]
                 critic_scores_tensor = torch.stack(
@@ -292,6 +399,8 @@ class CombinedCriticPolicy(nn.Module):
                 for i in range(batch_size):
                     best_trajectory_list.append(
                         all_trajectories[best_indices[i]][i])
+                    print(
+                        f"Batch item {i}: Selected trajectory {best_indices[i]} with score {critic_scores_tensor[i, best_indices[i]].item():.4f}")
                 best_trajectory = torch.stack(
                     best_trajectory_list, dim=0)  # (B, H, D_state)
         else:
@@ -299,10 +408,49 @@ class CombinedCriticPolicy(nn.Module):
 
         actions_normalized = []
 
-        start = 0
-        end = 8
+        # Get the full trajectory length and check if we need to handle partial trajectories
+        full_horizon = best_trajectory.shape[1]
+        print(
+            f"Best trajectory shape before processing: {best_trajectory.shape}")
 
-        best_trajectory = best_trajectory[:, start:end]
+        # Process the best trajectory for action prediction
+        if self.supports_half_horizon:
+            half_horizon = self.critic_model.half_horizon
+
+            # Use the first half of the trajectory for action prediction
+            if full_horizon >= half_horizon:
+                print(
+                    f"Using first {half_horizon} steps for action prediction")
+
+                # For action prediction, we only need the first half
+                action_trajectory = best_trajectory[:, :half_horizon]
+
+                # For debugging, log trajectory information
+                if full_horizon >= 2 * half_horizon:
+                    # We have both halves, check for continuity
+                    first_half = best_trajectory[:, :half_horizon]
+                    second_half = best_trajectory[:,
+                                                  half_horizon:2*half_horizon]
+                    print(
+                        f"First half: {first_half[:, 0, 0].item():.4f} to {first_half[:, -1, 0].item():.4f}")
+                    print(
+                        f"Second half: {second_half[:, 0, 0].item():.4f} to {second_half[:, -1, 0].item():.4f}")
+
+                best_trajectory = action_trajectory
+            else:
+                # We have less than half_horizon, use what we have
+                print(
+                    f"Using all {full_horizon} steps (less than ideal {half_horizon})")
+        else:
+            # Standard processing - use a fixed range for action prediction (typically 8 steps)
+            # Default to 8 steps if available
+            action_horizon = min(8, full_horizon)
+            best_trajectory = best_trajectory[:, :action_horizon]
+            print(f"Using first {action_horizon} steps out of {full_horizon}")
+
+        print(
+            f"Processed trajectory shape for action generation: {best_trajectory.shape}")
+
         n_action_steps = best_trajectory.shape[1]
         current_s = best_trajectory[:, 0]
 
@@ -370,11 +518,39 @@ class CombinedCriticPolicy(nn.Module):
 
         # Call compute_binary_classification_loss on the critic instance
         if hasattr(self.critic_model, 'compute_binary_classification_loss'):
-            loss, accuracy = self.critic_model.compute_binary_classification_loss(
-                positive_trajectories=positive_trajectories,
-                negative_trajectories=negative_trajectories,
-                raw_images=critic_raw_images  # Pass raw images directly
-            )
+            # Check if the critic model supports the norm_batch API (advanced critics)
+            if hasattr(self.critic_model, 'half_horizon') and hasattr(self.critic_model, 'compute_binary_classification_loss'):
+                # For advanced critics with half_horizon support, use norm_batch with raw images
+                if critic_raw_images is not None:
+                    # Prepare images in the format expected by the critic
+                    norm_batch["observation.image"] = critic_raw_images
+
+                # Verify the trajectory shape before passing to critic
+                if "observation.state" in norm_batch:
+                    traj = norm_batch["observation.state"]
+                    print(f"Trajectory shape: {traj.shape}")
+
+                    # Check if we have enough timesteps
+                    if hasattr(self.critic_model, 'horizon') and traj.ndim == 3 and traj.shape[1] < self.critic_model.horizon:
+                        print(
+                            f"Warning: Trajectory has only {traj.shape[1]} steps, model expects {self.critic_model.horizon}")
+
+                # Pass noise parameters for creating negative examples
+                loss, accuracy = self.critic_model.compute_binary_classification_loss(
+                    norm_batch=norm_batch,
+                    noise_params={
+                        "base_noise_scale": 0.05,
+                        "noise_type": "progressive",
+                        "noise_growth_factor": 1.2
+                    }
+                )
+            else:
+                # For standard critics, pass trajectories directly
+                loss, accuracy = self.critic_model.compute_binary_classification_loss(
+                    positive_trajectories=positive_trajectories,
+                    negative_trajectories=negative_trajectories,
+                    raw_images=critic_raw_images  # Pass raw images directly
+                )
         else:
             # Fallback implementation
             raise ValueError(

@@ -261,13 +261,47 @@ class ModernBertCritic(nn.Module):
         if second_half:
             # For second half, use position embeddings from the second half of the full sequence
             # When processing half_horizon length sequences, this would be positions half_horizon to horizon-1
-            pos_embeddings_to_use = self.pos_embedding[:,
-                                                       self.half_horizon:self.half_horizon+trajectory_sequence.shape[1], :]
+            seq_len = trajectory_sequence.shape[1]
+
+            # Ensure we don't exceed the available position embeddings
+            start_idx = self.half_horizon
+            end_idx = min(self.half_horizon + seq_len, self.horizon)
+
+            if end_idx - start_idx < seq_len:
+                print(
+                    f"Warning: Position embeddings truncated. Need {seq_len} positions starting at {start_idx}, but only have {end_idx-start_idx}")
+
+            # Use position embeddings from half_horizon onward
+            pos_embeddings_to_use = self.pos_embedding[:, start_idx:end_idx, :]
+
+            # Handle case where sequence is longer than available positions
+            if pos_embeddings_to_use.shape[1] < seq_len:
+                # Pad with the last position embedding
+                last_pos = self.pos_embedding[:, -1:,
+                                              :].expand(-1, seq_len - pos_embeddings_to_use.shape[1], -1)
+                pos_embeddings_to_use = torch.cat(
+                    [pos_embeddings_to_use, last_pos], dim=1)
+
             state_embeddings = state_embeddings + pos_embeddings_to_use
         else:
             # For first half or full sequence, use the beginning of the position embeddings
-            state_embeddings = state_embeddings + \
-                self.pos_embedding[:, :trajectory_sequence.shape[1], :]
+            seq_len = trajectory_sequence.shape[1]
+
+            # Ensure we don't exceed available position embeddings
+            if seq_len <= self.pos_embedding.shape[1]:
+                # Standard case - enough position embeddings
+                pos_embeddings_to_use = self.pos_embedding[:, :seq_len, :]
+            else:
+                # Sequence is longer than available positions - use what we have and pad
+                available_pos = self.pos_embedding.shape[1]
+                pos_embeddings_to_use = self.pos_embedding
+                # Pad with the last position embedding
+                last_pos = self.pos_embedding[:, -1:,
+                                              :].expand(-1, seq_len - available_pos, -1)
+                pos_embeddings_to_use = torch.cat(
+                    [pos_embeddings_to_use, last_pos], dim=1)
+
+            state_embeddings = state_embeddings + pos_embeddings_to_use
 
         # Combine image embedding with state embeddings
         sequence_for_transformer = torch.cat(
@@ -286,24 +320,110 @@ class ModernBertCritic(nn.Module):
 
         # Output head
         score = self.output_head(pooled_output)
+
+        # Ensure the score has shape [B, 1] for easier processing
+        if score.ndim == 1:
+            score = score.unsqueeze(-1)  # Convert [B] to [B, 1]
+
         return score
 
     def score(self, trajectory_sequence: torch.Tensor, raw_images: torch.Tensor = None, second_half: bool = False) -> torch.Tensor:
         """
-        Scoring entrypoint. This will maintain gradients in training mode or disable them in eval mode.
+        Scoring entrypoint. This maintains gradients for proper backpropagation during training.
+
+        For inference use cases, uses only the first half of the trajectory for scoring, because:
+        1. The second half contains noisy predictions that make it less reliable
+        2. The previous half would use previous observations/states in a queue-like manner
 
         Args:
             trajectory_sequence: (B, H, D_state) tensor of state sequences.
             raw_images: Optional (B, C, H, W) tensor of raw images or (B, 2, C, H, W) for first and second half images.
             second_half: Whether this is the second half of the sequence (for positional embedding indexing)
         """
-        score = self.forward(trajectory_sequence, raw_images, second_half)
-        return score
+        # Check trajectory dimensions
+        B, H, D = trajectory_sequence.shape
+
+        # First verify that it's a valid trajectory
+        if D != self.state_dim:
+            raise ValueError(f"Expected state dim {self.state_dim}, got {D}")
+
+        # If we're in training mode, use both halves for next sequence prediction
+        if self.training:
+            # Check if this is a full sequence that should be split (exact match with horizon)
+            if not second_half and H == self.horizon:
+                # This is a full sequence, so we should use score_next_sequence for consistency
+                first_half = trajectory_sequence[:, :self.half_horizon]
+                second_half = trajectory_sequence[:,
+                                                  self.half_horizon:2*self.half_horizon]
+
+                # Prepare images for next sequence prediction if provided
+                if raw_images is not None:
+                    if raw_images.ndim == 4:  # B, C, H, W
+                        raw_images_stacked = torch.stack(
+                            [raw_images, raw_images], dim=1)
+                    else:
+                        raw_images_stacked = raw_images
+                    return self.score_next_sequence(first_half, second_half, raw_images_stacked)
+                else:
+                    return self.score_next_sequence(first_half, second_half)
+            # Check if it's potentially a full sequence that could be split (at least 2*half_horizon)
+            elif not second_half and H >= 2 * self.half_horizon:
+                # This might be a variable-length trajectory that's at least full length
+                first_half = trajectory_sequence[:, :self.half_horizon]
+                second_half = trajectory_sequence[:,
+                                                  self.half_horizon:self.half_horizon*2]
+
+                # Log that we're splitting a non-standard length trajectory
+                print(
+                    f"Splitting non-standard length trajectory: {H} steps into {self.half_horizon} + {self.half_horizon}")
+
+                # Prepare images for next sequence prediction
+                if raw_images is not None:
+                    if raw_images.ndim == 4:  # B, C, H, W
+                        raw_images_stacked = torch.stack(
+                            [raw_images, raw_images], dim=1)
+                    else:
+                        raw_images_stacked = raw_images
+                    return self.score_next_sequence(first_half, second_half, raw_images_stacked)
+                else:
+                    return self.score_next_sequence(first_half, second_half)
+        # For inference, use only the first half regardless of whether this is a full trajectory
+        elif not second_half and H >= self.half_horizon:
+            # Use only the first half of the trajectory for scoring during inference
+            first_half = trajectory_sequence[:, :self.half_horizon]
+            print(
+                f"Inference mode: Using only first half ({self.half_horizon} steps) for scoring")
+
+            # Add more diagnostic info for debugging
+            if H > self.half_horizon:
+                print(
+                    f"Truncating trajectory from {H} steps to {self.half_horizon} steps for inference scoring")
+                # Use the first element of the batch for printing example values
+                print(
+                    f"Example from first batch element - First value: {trajectory_sequence[0, 0, 0].item():.4f}, Last value used: {trajectory_sequence[0, self.half_horizon-1, 0].item():.4f}")
+
+            # Process this as a first half trajectory
+            score = self.forward(first_half, raw_images, second_half=False)
+            return score
+        else:
+            # For shorter trajectories or when explicitly marked as second half
+            print(
+                f"Using trajectory as-is (length {H}, second_half={second_half})")
+            score = self.forward(trajectory_sequence, raw_images, second_half)
+
+            # Ensure score has shape [B, 1] for consistent handling
+            if score.ndim == 1:
+                score = score.unsqueeze(-1)  # Convert [B] to [B, 1]
+
+            return score
 
     def score_next_sequence(self, first_half: torch.Tensor, second_half: torch.Tensor,
                             raw_images: torch.Tensor = None) -> torch.Tensor:
         """
         Score how likely the second half sequence is a correct continuation of the first half.
+
+        During training: Uses both halves and combines their scores.
+        During inference: Uses only the first half for scoring.
 
         Args:
             first_half: (B, H/2, D_state) tensor of first half state sequences
@@ -314,13 +434,24 @@ class ModernBertCritic(nn.Module):
         Returns:
             (B, 1) tensor of scores, higher means more likely to be correct continuation
         """
-        # Note: This function must maintain gradients for training
+        # Validate trajectory shapes
+        if first_half.shape[1] != self.half_horizon:
+            if not self.training:
+                print(
+                    f"Warning: First half trajectory with {first_half.shape[1]} steps (expected {self.half_horizon})")
+
+            # For inference with non-standard lengths, make sure we're not exceeding half_horizon
+            if not self.training and first_half.shape[1] > self.half_horizon:
+                print(
+                    f"Truncating first half from {first_half.shape[1]} to {self.half_horizon} steps")
+                first_half = first_half[:, :self.half_horizon]
 
         # Prepare images if we only have one image per sequence
         if raw_images is not None and raw_images.ndim == 4:
             # Duplicate the image for both first and second half
             raw_images = torch.stack(
-                [raw_images, raw_images], dim=1)  # B, 2, C, H, W        # Get scores for first half using first image - raw_images should be (B, 2, C, H, W)
+                [raw_images, raw_images], dim=1)  # B, 2, C, H, W
+
         if raw_images is not None:
             if raw_images.ndim != 5:
                 raise ValueError(
@@ -329,18 +460,23 @@ class ModernBertCritic(nn.Module):
             second_image = raw_images[:, 1]  # (B, C, H, W)
         else:
             first_image = None
+            # For inference, use only the first half (more reliable)
             second_image = None
+            if not self.training:
+                print("Inference mode: Using only first half for scoring_next_sequence")
+                first_scores = self.forward(
+                    first_half, raw_images=first_image, second_half=False)
+                return first_scores
+            else:
+                # For training, use both halves as before
+                first_scores = self.forward(
+                    first_half, raw_images=first_image, second_half=False)
+                second_scores = self.forward(
+                    second_half, raw_images=second_image, second_half=True)
 
-        # Forward pass with gradient tracking (no @torch.no_grad decorator)
-        first_scores = self.forward(
-            first_half, raw_images=first_image, second_half=False)
-        second_scores = self.forward(
-            second_half, raw_images=second_image, second_half=True)
-
-        # Combine scores (average)
-        combined_scores = (first_scores + second_scores) / 2
-
-        return combined_scores
+                # Combine scores (average)
+                combined_scores = (first_scores + second_scores) / 2
+                return combined_scores
 
     def extract_images_from_batch(self, norm_batch):
         """
@@ -353,28 +489,76 @@ class ModernBertCritic(nn.Module):
             Tuple of (first_half_img, second_half_img) - each is (B, C, H, W)
         """
         if "observation.image" not in norm_batch:
+            print("No 'observation.image' key found in norm_batch")
+            # Try checking for other possible image keys
+            possible_keys = [
+                k for k in norm_batch.keys() if "image" in k.lower()]
+            if possible_keys:
+                print(f"Found potential image keys: {possible_keys}")
             return None, None
 
         img_tensor = norm_batch["observation.image"]
+        print(f"Image tensor shape: {img_tensor.shape}")
 
         # Extract images for first and second halves
         if img_tensor.ndim == 5:  # B, T_img, C, H, W
             # Take images at timestep 0 and timestep half_horizon
             # Make sure we're within bounds
             first_idx = 0
-            second_idx = min(self.half_horizon, img_tensor.shape[1]-1)
+
+            # For second half, try to use an image at half_horizon if available,
+            # otherwise use the last available image
+            if img_tensor.shape[1] > self.half_horizon:
+                second_idx = self.half_horizon
+            else:
+                second_idx = img_tensor.shape[1] - 1
+                print(
+                    f"Warning: Image sequence too short for ideal second half index. Using index {second_idx} instead of {self.half_horizon}")
 
             first_half_img = img_tensor[:,
                                         first_idx].contiguous()  # B, C, H, W
             second_half_img = img_tensor[:,
                                          second_idx].contiguous()  # B, C, H, W
+
+            print(
+                f"Using image indices {first_idx} and {second_idx} from sequence of length {img_tensor.shape[1]}")
         elif img_tensor.ndim == 4:  # B, C, H, W - only single image
             # Use the same image for both halves
             first_half_img = img_tensor
             second_half_img = img_tensor
+            print("Using single image for both halves")
+        # B, V, T, C, H, W (multi-view)
+        elif img_tensor.ndim == 6 and img_tensor.shape[1] > 0:
+            # Handle multi-view images - take first view
+            print(
+                f"Detected multi-view image format with {img_tensor.shape[1]} views")
+            view_img = img_tensor[:, 0]  # B, T, C, H, W (first view)
+
+            # Now handle as regular time sequence
+            first_idx = 0
+            second_idx = min(self.half_horizon, view_img.shape[1]-1)
+
+            first_half_img = view_img[:, first_idx].contiguous()  # B, C, H, W
+            second_half_img = view_img[:,
+                                       second_idx].contiguous()  # B, C, H, W
         else:
-            raise ValueError(
-                f"Unsupported image tensor shape: {img_tensor.shape}")
+            print(
+                f"Warning: Unexpected image tensor shape: {img_tensor.shape}, attempting to adapt")
+            # Try to adapt the tensor to the expected format
+            if img_tensor.ndim >= 3:
+                # Take the first dimensions until we get to B, C, H, W
+                while img_tensor.ndim > 4:
+                    img_tensor = img_tensor[:, 0]
+
+                if img_tensor.ndim == 4:  # Successfully reduced to B, C, H, W
+                    first_half_img = img_tensor
+                    second_half_img = img_tensor
+                else:
+                    raise ValueError(
+                        f"Failed to adapt image tensor of shape {img_tensor.shape}")
+            else:
+                raise ValueError(
+                    f"Unsupported image tensor shape: {img_tensor.shape}")
 
         return first_half_img, second_half_img
 
@@ -406,13 +590,46 @@ class ModernBertCritic(nn.Module):
         # Extract trajectories and images from norm_batch if provided
         if norm_batch is not None:
             if "observation.state" in norm_batch:
-                # Extract full trajectories from the normalized batch
-                trajectories = norm_batch["observation.state"][:,
-                                                               :self.horizon]
+                # Extract trajectories from the normalized batch
+                trajectories = norm_batch["observation.state"]
 
-                # Split into first half and second half
-                first_half = trajectories[:, :self.half_horizon]
-                second_half = trajectories[:, self.half_horizon:self.horizon]
+                # Check if we received time-series data with a time dimension
+                if trajectories.ndim == 3:  # [B, T, D]
+                    # Use up to self.horizon steps
+                    horizon_to_use = min(trajectories.shape[1], self.horizon)
+                    trajectories = trajectories[:, :horizon_to_use]
+
+                    # Log shape information for debugging
+                    print(
+                        f"Trajectory shape from batch: {trajectories.shape}, using horizon: {horizon_to_use}")
+                    print(f"Half-horizon value: {self.half_horizon}")
+
+                    # Check if we have enough steps for splitting
+                    if trajectories.shape[1] < self.horizon:
+                        print(
+                            f"Warning: Received trajectory with {trajectories.shape[1]} steps, but expected {self.horizon}")
+
+                # Ensure we have enough timesteps for splitting
+                if trajectories.shape[1] >= 2 * self.half_horizon:
+                    # Split into first half and second half
+                    first_half = trajectories[:, :self.half_horizon]
+                    second_half = trajectories[:,
+                                               self.half_horizon:self.half_horizon*2]
+                elif trajectories.shape[1] > self.half_horizon:
+                    # We have more than half but less than full
+                    first_half = trajectories[:, :self.half_horizon]
+                    # Just use what we have for second half, will be shorter than expected
+                    second_half = trajectories[:, self.half_horizon:]
+                    # Pad second half if needed to match half_horizon length
+                    if second_half.shape[1] < self.half_horizon:
+                        pad_size = self.half_horizon - second_half.shape[1]
+                        pad = torch.zeros((second_half.shape[0], pad_size, second_half.shape[2]),
+                                          device=second_half.device, dtype=second_half.dtype)
+                        second_half = torch.cat([second_half, pad], dim=1)
+                else:
+                    # Not enough steps for proper splitting
+                    raise ValueError(
+                        f"Trajectory too short ({trajectories.shape[1]} steps) for next sequence prediction task (needs at least {self.half_horizon+1} steps)")
 
                 # Create positive samples - true second half sequences
                 positive_first_half = first_half.clone()
@@ -435,9 +652,25 @@ class ModernBertCritic(nn.Module):
             else:
                 raise ValueError(
                     "norm_batch is provided but does not contain 'observation.state'")
+        elif positive_trajectories is not None and negative_trajectories is not None:
+            # Legacy support for explicitly provided trajectories
+            # Verify shapes
+            if positive_trajectories.shape[1] < 2 * self.half_horizon or negative_trajectories.shape[1] < 2 * self.half_horizon:
+                raise ValueError(
+                    f"Trajectory too short for next sequence prediction task (needs {2*self.half_horizon} steps)")
+
+            # Split positive trajectories
+            positive_first_half = positive_trajectories[:, :self.half_horizon]
+            positive_second_half = positive_trajectories[:,
+                                                         self.half_horizon:2*self.half_horizon]
+
+            # Split negative trajectories
+            negative_first_half = negative_trajectories[:, :self.half_horizon]
+            negative_second_half = negative_trajectories[:,
+                                                         self.half_horizon:2*self.half_horizon]
         else:
             raise ValueError(
-                "norm_batch must be provided for next sequence prediction")
+                "Either norm_batch or positive_trajectories/negative_trajectories must be provided")
 
         device = positive_first_half.device
         B = positive_first_half.shape[0]
@@ -478,33 +711,44 @@ class ModernBertCritic(nn.Module):
                         j = shuffle_indices[i]
                         if j == i:  # Avoid self-swap
                             j = (j + 1) % B
+                        # Make sure we clone from the original second half, not the already noised one
                         negative_second_half[i] = second_half[j].clone()
 
         # Compute model predictions
-        if raw_images is not None:
-            # Score the positive pairs (first half -> true second half)
-            positive_scores = self.score_next_sequence(
-                positive_first_half, positive_second_half, raw_images=raw_images)
+        # Score the positive pairs (first half -> true second half)
+        positive_scores = self.score_next_sequence(
+            positive_first_half, positive_second_half, raw_images=raw_images)
 
-            # Score the negative pairs (first half -> noised/shuffled second half)
-            negative_scores = self.score_next_sequence(
-                negative_first_half, negative_second_half, raw_images=raw_images)
-        else:
-            raise ValueError(
-                "raw_images must be provided for next sequence prediction")
+        # Score the negative pairs (first half -> noised/shuffled second half)
+        negative_scores = self.score_next_sequence(
+            negative_first_half, negative_second_half, raw_images=raw_images)
 
         # Combine positive and negative scores and create labels
         all_scores = torch.cat([positive_scores, negative_scores], dim=0)
 
+        # Create labels: 1 for positive pairs, 0 for negative pairs
         positive_labels = torch.ones_like(positive_scores, device=device)
         negative_labels = torch.zeros_like(negative_scores, device=device)
         all_labels = torch.cat([positive_labels, negative_labels], dim=0)
 
-        # Calculate loss and accuracy
+        # Calculate binary cross entropy loss
+        # Ensure scores are properly shaped for loss calculation
+        if all_scores.ndim > 2:
+            all_scores = all_scores.view(all_scores.size(0), -1)
+            print(
+                f"Warning: Reshaped all_scores from complex shape to shape {all_scores.shape}")
+
         loss_fn = nn.BCEWithLogitsLoss()
         loss = loss_fn(all_scores, all_labels)
 
+        # Calculate accuracy
+        # Threshold at 0 since we're using BCEWithLogitsLoss
         predictions = (all_scores > 0.0).float()
         accuracy = (predictions == all_labels).float().mean()
+
+        # Print some diagnostic information during training
+        if torch.rand(1).item() < 0.01:  # Only print occasionally
+            print(f"Batch size: {B}, Pos mean score: {positive_scores.mean().item():.4f}, "
+                  f"Neg mean score: {negative_scores.mean().item():.4f}, Accuracy: {accuracy.item():.4f}")
 
         return loss, accuracy

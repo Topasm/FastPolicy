@@ -129,18 +129,23 @@ def main():
         noise_critic_model = ModernBertCritic(critic_cfg)
     else:
         # If no config file, create directly with model parameters
-        noise_critic_model = ModernBertCritic(
-            ModernBertCriticConfig(
-                state_dim=cfg.robot_state_feature.shape[0],
-                horizon=cfg.horizon,
-                hidden_dim=cfg.transformer_dim,  # Use transformer_dim instead of hidden_dim
-                num_layers=cfg.transformer_num_layers,  # Use transformer_num_layers
-                dropout=cfg.dropout,
-                use_layernorm=True,  # Default to True since it's used in the model
-                num_heads=cfg.transformer_num_heads,  # Use transformer_num_heads
-                swiglu_intermediate_factor=4  # Default SwiGLU factor
-            )
+        critic_config = ModernBertCriticConfig(
+            state_dim=cfg.robot_state_feature.shape[0],
+            horizon=cfg.horizon,
+            hidden_dim=cfg.transformer_dim,  # Map transformer_dim to hidden_dim
+            num_layers=cfg.transformer_num_layers,
+            dropout=cfg.dropout,
+            use_layernorm=True,
+            num_heads=cfg.transformer_num_heads,
+            swiglu_intermediate_factor=4
         )
+
+        # Print critic config for debugging
+        print(f"ModernBertCritic config: state_dim={critic_config.state_dim}, "
+              f"horizon={critic_config.horizon}, hidden_dim={critic_config.hidden_dim}, "
+              f"half_horizon={critic_config.half_horizon}")
+
+        noise_critic_model = ModernBertCritic(critic_config)
 
     # Load state dict and move to device
     critic_state_dict = torch.load(
@@ -164,13 +169,12 @@ def main():
     noise_critic_model.to(device)
     print("ModernBert critic model loaded successfully.")
 
-    # Create combined model with ModernBertCritic
+    # Create combined model with critic
     combined_model = CombinedCriticPolicy(
         diffusion_model=diffusion_model,
         inv_dyn_model=inv_dyn_model,
-        critic_model=noise_critic_model,  # Pass the ModernBert critic model
+        critic_model=noise_critic_model,  # Pass the critic model
         num_samples=4,  # Generate 4 trajectory samples
-        use_modernbert=True  # Always use ModernBertCritic
     )
 
     # --- Environment Setup ---
