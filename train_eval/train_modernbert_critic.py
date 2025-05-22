@@ -43,6 +43,12 @@ def parse_args():
                         help="Base noise scale for negative samples")
     parser.add_argument("--noise_growth_factor", type=float, default=1.2,
                         help="Growth factor for noise per timestep")
+    parser.add_argument("--noise_schedule", type=str, default="none", choices=["none", "linear", "cosine", "exponential"],
+                        help="Noise scheduling strategy for decreasing noise over training")
+    parser.add_argument("--initial_noise_multiplier", type=float, default=2.0,
+                        help="Multiplier for noise at start of training (when using noise scheduling)")
+    parser.add_argument("--final_noise_multiplier", type=float, default=0.5,
+                        help="Multiplier for noise at end of training (when using noise scheduling)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use for training")
     parser.add_argument("--output_dir", type=str, default="outputs/train/modernbert_critic",
@@ -165,12 +171,21 @@ def main():
     print(
         f"Base noise scale: {args.base_noise_scale}, Growth factor: {args.noise_growth_factor}")
 
-    # Configure noise parameters
+    # Configure base noise parameters
     noise_params = {
         "base_noise_scale": args.base_noise_scale,
         "noise_type": "progressive",
-        "noise_growth_factor": args.noise_growth_factor
+        "noise_growth_factor": args.noise_growth_factor,
+        "noise_schedule": args.noise_schedule,
+        "initial_noise_multiplier": args.initial_noise_multiplier,
+        "final_noise_multiplier": args.final_noise_multiplier,
+        "current_step": 0,
+        "total_steps": args.steps
     }
+
+    # Log the noise scheduling configuration
+    if args.noise_schedule != "none":
+        print(f"Using {args.noise_schedule} noise scheduling: {args.initial_noise_multiplier}x → {args.final_noise_multiplier}x over {args.steps} steps")
 
     pbar = tqdm(range(args.steps), desc="Training ModernBERT Critic")
     step = 0
@@ -187,6 +202,9 @@ def main():
                 v, torch.Tensor) else v for k, v in batch.items()}
             norm_batch["observation.state"] = norm_state_batch["observation.state"].to(
                 device)
+
+            # Update current step in noise parameters
+            noise_params["current_step"] = step
 
             # Compute loss and update model
             optimizer.zero_grad()

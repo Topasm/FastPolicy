@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from dataclasses import dataclass
 
 
@@ -680,6 +681,45 @@ class ModernBertCritic(nn.Module):
             base_noise_scale = noise_params.get("base_noise_scale", 0.05)
             noise_type = noise_params.get("noise_type", "progressive")
             noise_growth_factor = noise_params.get("noise_growth_factor", 1.2)
+
+            # Get noise scheduling parameters
+            noise_schedule = noise_params.get("noise_schedule", "none")
+            initial_multiplier = noise_params.get(
+                "initial_noise_multiplier", 2.0)
+            final_multiplier = noise_params.get("final_noise_multiplier", 0.5)
+            current_step = noise_params.get("current_step", 0)
+            total_steps = noise_params.get("total_steps", 10000)
+
+            # Calculate current noise multiplier based on training progress
+            noise_multiplier = initial_multiplier
+
+            if noise_schedule != "none" and total_steps > 0:
+                progress = min(current_step / total_steps, 1.0)
+
+                if noise_schedule == "linear":
+                    # Linear decay from initial_multiplier to final_multiplier
+                    noise_multiplier = initial_multiplier + progress * \
+                        (final_multiplier - initial_multiplier)
+
+                elif noise_schedule == "cosine":
+                    # Cosine decay from initial_multiplier to final_multiplier
+                    cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
+                    noise_multiplier = final_multiplier + \
+                        (initial_multiplier - final_multiplier) * cosine_factor
+
+                elif noise_schedule == "exponential":
+                    # Exponential decay from initial_multiplier to final_multiplier
+                    decay_rate = np.log(final_multiplier / initial_multiplier)
+                    noise_multiplier = initial_multiplier * \
+                        np.exp(decay_rate * progress)
+
+            # Apply the noise multiplier to the base noise scale
+            base_noise_scale *= noise_multiplier
+
+            # Log the current noise level occasionally
+            if torch.rand(1).item() < 0.01:  # Only log about 1% of the time
+                print(
+                    f"Current noise multiplier: {noise_multiplier:.4f}x, Effective base noise: {base_noise_scale:.6f}")
 
             # Add noise to each timestep in the negative second half
             for t_idx in range(negative_second_half.shape[1]):

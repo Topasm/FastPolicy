@@ -65,3 +65,10 @@ pip install -e ".[aloha, pusht]"
 Replace `aloha, pusht` with the environments you need.
 
 ---
+
+
+python train_eval/train_modernbert_critic.py \
+    --noise_schedule=cosine \
+    --initial_noise_multiplier=3.0 \
+    --final_noise_multiplier=0.1 \
+    --steps=20000

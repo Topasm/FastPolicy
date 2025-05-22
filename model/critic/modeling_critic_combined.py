@@ -160,26 +160,6 @@ class CombinedCriticPolicy(nn.Module):
         # Process image features - required for TransformerCritic
         processed_batch = dict(norm_batch)
 
-        # Handle different ways images may be provided
-        if "observation.image" in norm_batch:
-            # Image already present in the right format
-            pass
-        elif self.config.image_features and all(key in norm_batch for key in self.config.image_features):
-            # Stack multiple camera views
-            processed_batch["observation.image"] = torch.stack(
-                [norm_batch[key] for key in self.config.image_features], dim=-4
-            )
-        else:
-            # If no image is available but critic requires it, warn
-            if self.critic_model is not None and hasattr(self.critic_model, 'use_image_context') and self.critic_model.use_image_context:
-                print(
-                    "WARNING: TransformerCritic requires image features, but none provided in input batch!")
-                # What image keys are available vs what we need
-                if self.config.image_features:
-                    print(
-                        f"Required image features: {self.config.image_features}")
-                print(f"Available batch keys: {list(norm_batch.keys())}")
-
         # Populate queues with the latest *normalized* observation
         self._queues = populate_queues(self._queues, processed_batch)
 
