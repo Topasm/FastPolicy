@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# filepath: /home/ahrilab/Desktop/FastPolicy/train_eval/train_multistep_future.py
+# filepath: /home/ahrilab/Desktop/FastPolicy/train_eval/train_multimodal_future.py
 
 import argparse
 import torch
@@ -20,12 +20,12 @@ except ImportError:
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize
-from model.critic.modernbert_critic import ModernBertCritic, ModernBertCriticConfig
+from model.predictor.multimodal_future_predictor import MultimodalFuturePredictor, MultimodalFuturePredictorConfig
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a ModernBERT Critic for multi-step future trajectory prediction with uncertainty")
+        description="Train a MultimodalFuturePredictor for future trajectory prediction with uncertainty")
 
     parser.add_argument("--dataset", type=str, default="lerobot/pusht",
                         help="Name of the dataset to use")
@@ -60,7 +60,7 @@ def parse_args():
 
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use for training")
-    parser.add_argument("--output_dir", type=str, default="outputs/train/modernbert_multistep_future",
+    parser.add_argument("--output_dir", type=str, default="outputs/train/multimodal_future",
                         help="Directory to save model and logs")
     parser.add_argument("--log_freq", type=int, default=50,
                         help="How often to log training metrics")
@@ -108,13 +108,11 @@ def main():
     features = dataset_to_policy_features(dataset_metadata.features)
 
     # Configure dataset based on features
-    # Length of past trajectory to use as context
     context_horizon = args.context_horizon
-    future_steps = args.future_steps  # Number of steps into future to predict
+    future_steps = args.future_steps
 
     # Total steps needed = context_horizon + future_steps
     if args.multi_step and args.num_future_steps > 1:
-        # Need context + all future steps
         total_horizon = context_horizon + \
             max(future_steps, args.num_future_steps)
     else:
@@ -135,12 +133,10 @@ def main():
         print("Uncertainty prediction enabled")
 
     # Setup delta timestamps for trajectory features
-    # We need the context window and multiple future points for training
     timestamps = [i / dataset_metadata.fps for i in range(total_horizon)]
 
     delta_timestamps = {
         "observation.state": timestamps,
-        # Current, endpoints plus some intermediate frames if needed
         "observation.image": [timestamps[0], timestamps[context_horizon], timestamps[-1]]
     }
 
@@ -164,13 +160,13 @@ def main():
         {"observation.state": features["observation.state"],
          "observation.image": features["observation.image"]},
         {"observation.state": "standard",
-         "observation.image": "none"},  # Images shouldn't be normalized
+         "observation.image": "none"},
         dataset_metadata.stats
     )
 
     # --- Model Setup ---
-    print("Creating ModernBERT model with multi-step future trajectory prediction capability...")
-    config = ModernBertCriticConfig(
+    print("Creating MultimodalFuturePredictor model...")
+    config = MultimodalFuturePredictorConfig(
         state_dim=state_dim,
         horizon=total_horizon,
         hidden_dim=args.hidden_dim,
@@ -179,8 +175,8 @@ def main():
         dropout=0.1,
         use_layernorm=True,
         swiglu_intermediate_factor=4,
-        predict_future=True,                  # Enable future prediction
-        future_steps=args.future_steps,       # Steps into future to predict
+        predict_future=True,
+        future_steps=args.future_steps,
         predict_future_image=args.predict_image,
         predict_future_state=args.predict_state,
         multi_step_prediction=args.multi_step,
@@ -193,10 +189,9 @@ def main():
         json.dump(config.__dict__, f, indent=2)
 
     # Initialize model and move to device
-    model = ModernBertCritic(config).to(device)
+    model = MultimodalFuturePredictor(config).to(device)
     num_params = sum(p.numel() for p in model.parameters())
-    print(
-        f"Created ModernBERT future predictor with {num_params:,} parameters")
+    print(f"Created MultimodalFuturePredictor with {num_params:,} parameters")
 
     # Try to optimize with torch.compile if available (PyTorch 2.0+)
     if hasattr(torch, "compile"):
@@ -209,11 +204,10 @@ def main():
             print("Continuing with standard model execution")
 
     # --- Optimizer Setup ---
-    # Create optimizer and learning rate scheduler
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=0.01,  # Common weight decay for transformers
+        weight_decay=0.01,
         betas=(0.9, 0.999)
     )
 
@@ -225,12 +219,11 @@ def main():
     # Train model
     model.train()
 
-    print(
-        f"Starting ModernBERT multi-step future prediction training ({args.steps} steps)...")
+    print(f"Starting training ({args.steps} steps)...")
 
     # Define loss functions
     state_loss_fn = torch.nn.MSELoss()
-    image_loss_fn = torch.nn.L1Loss()  # L1 often works better for images
+    image_loss_fn = torch.nn.L1Loss()
 
     # Create metrics dict to track progress
     metrics = {
@@ -253,22 +246,19 @@ def main():
                           for k, v in norm_batch.items()}
 
             # Extract the states and images
-            states = norm_batch["observation.state"]  # [B, H, D_state]
-            images = norm_batch["observation.image"]  # [B, T_img, C, H, W]
+            states = norm_batch["observation.state"]
+            images = norm_batch["observation.image"]
 
             B = states.shape[0]
 
             # Split into context and future
-            # [B, context_horizon, D_state]
             context_states = states[:, :context_horizon]
-            # [B, future_steps, D_state]
             future_states = states[:,
                                    context_horizon:context_horizon+future_steps]
 
             # Get current and future images
-            # Assuming images are ordered as [current, midpoint, future]
-            current_image = images[:, 0]  # [B, C, H, W]
-            target_future_image = images[:, 2]  # [B, C, H, W]
+            current_image = images[:, 0]
+            target_future_image = images[:, 2]
 
             # Reset gradients
             optimizer.zero_grad()
@@ -286,11 +276,8 @@ def main():
                     last_state = future_states[:, -1:].expand(-1, padding, -1)
                     padded_future_states = torch.cat(
                         [future_states, last_state], dim=1)
-                    # [B, num_future_steps, D_state]
                     target_future_states = padded_future_states
                 else:
-                    # Use available future states up to num_future_steps
-                    # [B, num_future_steps, D_state]
                     target_future_states = future_states[:,
                                                          :args.num_future_steps]
             else:
@@ -298,8 +285,7 @@ def main():
                 predicted_states, predicted_future_image, state_uncertainties, image_uncertainty = model.predict_future_trajectory(
                     context_states, current_image)
 
-                # Target is the last future state if not multi-step
-                target_future_states = future_states[:, -1]  # [B, D_state]
+                target_future_states = future_states[:, -1]
 
             # Calculate losses
             total_loss = 0.0
@@ -309,9 +295,7 @@ def main():
 
             if args.predict_state:
                 if args.multi_step:
-                    # For multi-step prediction, compute loss across all predicted steps
                     if args.predict_uncertainty and state_uncertainties is not None:
-                        # Use NLL loss with uncertainty
                         uncertainty_loss = negative_log_likelihood_loss(
                             predicted_states.reshape(
                                 B * args.num_future_steps, -1),
@@ -324,15 +308,12 @@ def main():
                         metrics['uncertainty_losses'].append(
                             uncertainty_loss.item())
                     else:
-                        # Standard MSE loss
                         state_loss = state_loss_fn(
                             predicted_states, target_future_states)
                         total_loss += state_loss
                         metrics['state_losses'].append(state_loss.item())
                 else:
-                    # For single-step prediction
                     if args.predict_uncertainty and state_uncertainties is not None:
-                        # Use NLL loss with uncertainty
                         uncertainty_loss = negative_log_likelihood_loss(
                             predicted_states, target_future_states, state_uncertainties
                         )
@@ -340,7 +321,6 @@ def main():
                         metrics['uncertainty_losses'].append(
                             uncertainty_loss.item())
                     else:
-                        # Standard MSE loss
                         state_loss = state_loss_fn(
                             predicted_states, target_future_states)
                         total_loss += state_loss
@@ -357,32 +337,24 @@ def main():
                     )
 
                 # Normalize target image to match prediction range if using tanh
-                # Assuming predictions are in range [-1, 1] from tanh
                 if target_future_image.min() >= 0 and target_future_image.max() <= 1:
-                    # Convert [0, 1] to [-1, 1]
                     target_future_image = target_future_image * 2 - 1
 
-                # Image loss
                 if args.predict_uncertainty and image_uncertainty is not None:
-                    # Flatten spatial dimensions for NLL loss
                     pred_img_flat = predicted_future_image.view(B, -1)
                     target_img_flat = target_future_image.view(B, -1)
                     img_uncertainty_flat = image_uncertainty.view(B, -1)
 
-                    # Use NLL loss with uncertainty
                     img_uncertainty_loss = negative_log_likelihood_loss(
                         pred_img_flat, target_img_flat, img_uncertainty_flat
                     )
-                    # Weight image loss to balance with state loss
                     img_loss_weight = 0.05
                     total_loss += img_uncertainty_loss * img_loss_weight
                     metrics['uncertainty_losses'].append(
                         img_uncertainty_loss.item())
                 else:
-                    # Standard L1 loss for images
                     image_loss = image_loss_fn(
                         predicted_future_image, target_future_image)
-                    # Weight image loss to balance with state loss
                     image_loss_weight = 0.1
                     total_loss += image_loss * image_loss_weight
                     metrics['image_losses'].append(image_loss.item())
@@ -390,7 +362,7 @@ def main():
             # Backprop and update
             total_loss.backward()
 
-            # Gradient clipping to prevent exploding gradients
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
@@ -402,7 +374,6 @@ def main():
 
             # Log progress
             if step % args.log_freq == 0:
-                # Calculate running averages
                 recent_total_losses = metrics['total_losses'][-args.log_freq:]
                 avg_total_loss = sum(recent_total_losses) / \
                     len(recent_total_losses)
@@ -438,7 +409,6 @@ def main():
 
             # Save checkpoint
             if step % args.save_freq == 0 and step > 0:
-                # Save with metrics included
                 checkpoint_path = output_dir / f"model_step_{step}.pt"
                 torch.save({
                     'step': step,
@@ -457,7 +427,7 @@ def main():
                 break
 
     # --- Save Final Model ---
-    final_path = output_dir / "modernbert_multistep_final.pt"
+    final_path = output_dir / "multimodal_future_final.pt"
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -467,10 +437,9 @@ def main():
     print(f"Training complete! Final model saved to {final_path}")
 
     # Also save just the model weights for easy loading
-    torch.save(model.state_dict(), output_dir /
-               "modernbert_multistep_weights.pt")
+    torch.save(model.state_dict(), output_dir / "multimodal_future_weights.pt")
     print(
-        f"Model weights saved to: {output_dir / 'modernbert_multistep_weights.pt'}")
+        f"Model weights saved to: {output_dir / 'multimodal_future_weights.pt'}")
 
     # --- Save Normalization Stats ---
     print("Saving dataset statistics for future normalization...")
