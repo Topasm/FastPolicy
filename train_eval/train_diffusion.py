@@ -34,18 +34,52 @@ def validate_dataset_indices(dataloader, all_state_indices, image_indices):
             f"WARNING: Required max image index {max_required_img_idx} exceeds available images {image_seq_length-1}")
         return False
 
+    print("Dataset validation successful")
     return True
 
 
 def get_random_keyframe_config():
-    """Generate a random keyframe configuration."""
-    config_idx = random.randint(0, 2)
-    if config_idx == 0:
-        return 8, "dense", [8]  # Short horizon: 8 frames
-    elif config_idx == 1:
-        return 16, "skip_even", [16]  # Medium horizon: 16 frames
+    """Generate a random keyframe configuration with variable horizon length and adaptive keyframes."""
+    # Choose a random horizon length between 4 and 32
+    horizon = random.randint(4, 32)
+
+    # Select appropriate interpolation mode based on horizon length
+    if horizon <= 8:
+        mode = "dense"
+    elif horizon <= 16:
+        mode = "skip_even"
     else:
-        return 32, "sparse", [32]  # Long horizon: 32 frames
+        mode = "sparse"
+
+    # Generate adaptive keyframes based on horizon length
+    keyframes = []
+
+    # Always include the horizon as the furthest keyframe
+    keyframes.append(horizon)
+
+    # For medium to long horizons, add intermediate keyframes
+    if horizon > 12:
+        # Add a midpoint keyframe
+        mid_point = horizon // 2
+        keyframes.append(mid_point)
+
+        # For very long horizons, add another intermediate point
+        if horizon > 24:
+            quarter_point = horizon // 4
+            keyframes.append(quarter_point)
+
+    # Sort keyframes to ensure they're in ascending order
+    keyframes.sort()
+
+    # Choose interpolation method with dynamic probability
+    # For longer horizons, favor cubic interpolation for smoother transitions
+    cubic_prob = 0.3  # Base probability
+    if horizon > 16:
+        cubic_prob = 0.5  # Increase probability for long horizons
+
+    interp_method = "cubic" if random.random() < cubic_prob else "linear"
+
+    return horizon, mode, keyframes, interp_method
 
 
 def main():
@@ -72,7 +106,7 @@ def main():
     }
 
     # Initial configuration (will be updated dynamically during training)
-    horizon, interpolation_mode, keyframe_indices = get_random_keyframe_config()
+    horizon, interpolation_mode, keyframe_indices, interp_method = get_random_keyframe_config()
 
     cfg = DiffusionConfig(
         input_features=input_features,
@@ -81,6 +115,7 @@ def main():
         horizon=horizon,
         interpolation_mode=interpolation_mode,
         keyframe_indices=keyframe_indices,
+        interpolation_method=interp_method,
     )
 
     # --- Model ---
@@ -93,16 +128,20 @@ def main():
         cfg.input_features, cfg.normalization_mapping, dataset_metadata.stats)
 
     # --- Dataset ---
-    # Define max indices we might need for all configuration options
-    max_keyframe_indices = [-1, 0, 8, 16, 32]  # All possible keyframes
-    dense_target_indices = list(range(8))
-    skip_even_target_indices = list(range(0, 16, 2))
-    sparse_target_indices = list(range(0, 32, 4))
+    # Define keyframe indices and target indices for all possible configurations
+    # Standard keyframe indices for conditioning
+    keyframe_indices = [-1, 0]  # History keyframes
 
-    # Combine all target indices and keyframe indices
-    all_target_indices = list(
-        set(dense_target_indices + skip_even_target_indices + sparse_target_indices))
-    all_state_indices = list(set(max_keyframe_indices + all_target_indices))
+    # Add future keyframes for the largest possible horizon
+    max_horizon = 32
+    keyframe_indices.extend(list(range(1, max_horizon + 1)))
+
+    # For target indices, we need all possible indices that could be used
+    # by any interpolation mode for any horizon in the range 4-32
+    target_indices = list(range(max_horizon + 1))
+
+    # Combine all indices and remove duplicates
+    all_state_indices = list(set(keyframe_indices + target_indices))
     all_state_indices.sort()
 
     # Create a range of state indices to request from the dataset
@@ -142,17 +181,18 @@ def main():
     while not done:
         for batch in dataloader:
             # Randomly select configuration for this batch
-            batch_horizon, batch_mode, batch_keyframes = get_random_keyframe_config()
+            batch_horizon, batch_mode, batch_keyframes, batch_interp_method = get_random_keyframe_config()
 
             # Update the model configuration for this batch
             diffusion_model.config.horizon = batch_horizon
             diffusion_model.config.interpolation_mode = batch_mode
             diffusion_model.config.keyframe_indices = batch_keyframes
+            diffusion_model.config.interpolation_method = batch_interp_method
 
             # Only print config at the start and when logging
             if step % log_freq == 0:
                 print(
-                    f"Batch config: horizon={batch_horizon}, mode={batch_mode}, keyframes={batch_keyframes}")
+                    f"Batch config: horizon={batch_horizon}, mode={batch_mode}, keyframes={batch_keyframes}, interp={batch_interp_method}")
 
             # --- Normalize the batch and move to device ---
             norm_batch = normalize_inputs(batch)

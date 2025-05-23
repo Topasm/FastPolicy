@@ -97,6 +97,7 @@ class DiffusionConfig(PreTrainedConfig):
     # Keyframe indices for interpolation (relative to current state at time 0)
     keyframe_indices: list[int] = field(default_factory=lambda: [8, 16, 32])
     interpolation_mode: str = "dense"  # "dense", "skip_even", "sparse"
+    interpolation_method: str = "auto"  # "linear", "cubic", "adaptive", "auto"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

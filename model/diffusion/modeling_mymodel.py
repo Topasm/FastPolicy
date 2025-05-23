@@ -15,6 +15,11 @@ from model.diffusion.diffusion_modules import (
     DiffusionRgbEncoder,
     DiffusionTransformer,
 )
+from model.diffusion.interpolation_utils import (
+    linear_interpolate_states,
+    cubic_interpolate_states,
+    smart_interpolate_states,
+)
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.utils import (
@@ -585,27 +590,20 @@ class MyDiffusionModel(nn.Module):
         # Get target indices based on interpolation mode and horizon
         target_indices = self.config.interpolation_target_indices
 
-        # Extract target states for interpolation
-        target_states = []
-        max_idx = full_state_sequence.shape[1] - 1
+        # Use improved interpolation for smoother results
+        # First, create time values for each keyframe
+        keyframe_times = torch.tensor(
+            keyframe_indices, device=full_state_sequence.device)
+        target_times = torch.tensor(
+            target_indices, device=full_state_sequence.device)
 
-        for idx in target_indices:
-            abs_idx = idx + self.config.n_obs_steps - 1
+        # Use smart interpolation based on config setting
+        interpolated_targets = smart_interpolate_states(
+            keyframe_states, keyframe_times, target_times,
+            method=self.config.interpolation_method)
 
-            # Clamp to valid range if out of bounds
-            if abs_idx < 0:
-                abs_idx = 0
-                print(
-                    f"Warning: Target index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
-            elif abs_idx > max_idx:
-                abs_idx = max_idx
-                print(
-                    f"Warning: Target index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
-
-            target_states.append(full_state_sequence[:, abs_idx:abs_idx+1, :])
-
-        # (B, output_horizon, D)
-        clean_targets = torch.cat(target_states, dim=1)
+        # Use the interpolated states as clean targets
+        clean_targets = interpolated_targets
 
         # Flatten targets for diffusion model: (B, output_horizon * D)
         B, output_horizon, D = clean_targets.shape
@@ -1053,28 +1051,31 @@ class MyDiffusionModel(nn.Module):
         B, T, D_pair = all_pairs.shape
         flat_pairs = all_pairs.reshape(B * T, D_pair)
 
-        # Debug dimensions
-        print(f"State pair shape: {all_pairs.shape}")
-        print(
-            f"Expected input to inv_dyn: {self.state_dim * 2}, actual: {D_pair}")
-        print(
-            f"inv_dyn_model first layer weight shape: {inv_dyn_model.net[0].weight.shape}")
-
-        # Create compatible model if needed
+        # Check if inverse dynamics model input dimension matches state pair dimension
         if inv_dyn_model.net[0].weight.shape[1] != D_pair:
             print(
                 f"Creating compatible inverse dynamics model (input dim {D_pair})")
-            compatible_model = MlpInvDynamic(
-                o_dim=D_pair // 2,  # Divide by 2 since o_dim refers to a single state dimension
-                a_dim=self.action_dim,
-                hidden_dim=512,  # Use a standard hidden dim
-                dropout=0.1,
-                use_layernorm=True,
-                out_activation=torch.nn.Tanh(),
-            )
-            compatible_model = compatible_model.to(flat_pairs.device)
-            # Replace the original model
-            inv_dyn_model = compatible_model
+
+            # Cache compatible models to avoid recreating them
+            if not hasattr(self, '_compatible_inv_dyn_models'):
+                self._compatible_inv_dyn_models = {}
+
+            # Create or retrieve cached model with matching dimensions
+            cache_key = f"{D_pair}_{self.action_dim}"
+            if cache_key not in self._compatible_inv_dyn_models:
+                compatible_model = MlpInvDynamic(
+                    o_dim=D_pair // 2,  # Divide by 2 since o_dim refers to a single state dimension
+                    a_dim=self.action_dim,
+                    hidden_dim=512,  # Use a standard hidden dim
+                    dropout=0.1,
+                    use_layernorm=True,
+                    out_activation=torch.nn.Tanh(),
+                )
+                compatible_model = compatible_model.to(flat_pairs.device)
+                self._compatible_inv_dyn_models[cache_key] = compatible_model
+
+            # Use the cached compatible model
+            inv_dyn_model = self._compatible_inv_dyn_models[cache_key]
 
         # Predict actions from state pairs
         flat_actions = inv_dyn_model(flat_pairs)
