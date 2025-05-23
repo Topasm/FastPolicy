@@ -18,6 +18,15 @@ class ModernBertCriticConfig:
     swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
     # Half-horizon for split sequence prediction (if None, uses horizon // 2)
     half_horizon: int = None
+    # Future prediction parameters
+    predict_future: bool = False  # Enable future prediction mode
+    future_steps: int = 8  # Number of steps to predict into the future
+    predict_future_image: bool = True  # Whether to predict future images
+    predict_future_state: bool = True  # Whether to predict future states
+    multi_step_prediction: bool = False  # Whether to predict multiple future steps
+    # Number of future steps to predict if multi_step_prediction is True
+    num_future_steps: int = 1
+    predict_uncertainty: bool = False  # Whether to predict uncertainty in predictions
 
 
 # --- SwiGLU Activation ---
@@ -169,6 +178,128 @@ class ModernBertCritic(nn.Module):
             nn.Linear(config.hidden_dim, 1, bias=use_bias)
         )
 
+        # Add future prediction components
+        if hasattr(config, "predict_future") and config.predict_future:
+            self.predict_future = config.predict_future
+            self.future_steps = config.future_steps
+            self.predict_future_image = getattr(
+                config, "predict_future_image", True)
+            self.predict_future_state = getattr(
+                config, "predict_future_state", True)
+            self.multi_step_prediction = getattr(
+                config, "multi_step_prediction", False)
+            self.num_future_steps = getattr(
+                config, "num_future_steps", 1)
+            self.predict_uncertainty = getattr(
+                config, "predict_uncertainty", False)
+
+            # For future state prediction
+            if self.predict_future_state:
+                state_pred_hidden = config.hidden_dim // 2
+
+                if self.multi_step_prediction:
+                    # For multi-step prediction, output num_future_steps states
+                    self.future_state_decoder = nn.Sequential(
+                        SwiGLU(config.hidden_dim,
+                               hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                        nn.LayerNorm(
+                            config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                        nn.Linear(config.hidden_dim,
+                                  state_pred_hidden, bias=use_bias),
+                        nn.ReLU(),
+                        nn.Linear(state_pred_hidden,
+                                  config.state_dim * self.num_future_steps, bias=use_bias)
+                    )
+                else:
+                    # Standard single-step prediction
+                    self.future_state_decoder = nn.Sequential(
+                        SwiGLU(config.hidden_dim,
+                               hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                        nn.LayerNorm(
+                            config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                        nn.Linear(config.hidden_dim,
+                                  state_pred_hidden, bias=use_bias),
+                        nn.ReLU(),
+                        nn.Linear(state_pred_hidden,
+                                  config.state_dim, bias=use_bias)
+                    )
+
+                # Add uncertainty estimation head if enabled
+                if self.predict_uncertainty:
+                    if self.multi_step_prediction:
+                        # Predict uncertainty for each state dimension at each future step
+                        self.state_uncertainty_head = nn.Sequential(
+                            SwiGLU(config.hidden_dim,
+                                   hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                            nn.LayerNorm(
+                                config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                            nn.Linear(config.hidden_dim,
+                                      state_pred_hidden, bias=use_bias),
+                            nn.ReLU(),
+                            nn.Linear(state_pred_hidden,
+                                      config.state_dim * self.num_future_steps, bias=use_bias),
+                            nn.Softplus()  # Ensure positive values for variance
+                        )
+                    else:
+                        # Predict uncertainty for each state dimension
+                        self.state_uncertainty_head = nn.Sequential(
+                            SwiGLU(config.hidden_dim,
+                                   hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                            nn.LayerNorm(
+                                config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                            nn.Linear(config.hidden_dim,
+                                      state_pred_hidden, bias=use_bias),
+                            nn.ReLU(),
+                            nn.Linear(state_pred_hidden,
+                                      config.state_dim, bias=use_bias),
+                            nn.Softplus()  # Ensure positive values for variance
+                        )
+
+            # For future image prediction
+            if self.predict_future_image:
+                # Image decoder components (ViT-style)
+                img_decoder_dim = config.hidden_dim
+                self.img_decoder_token = nn.Parameter(
+                    torch.zeros(1, 1, img_decoder_dim))
+                self.img_decoder_pos_embed = nn.Parameter(
+                    torch.zeros(1, self.num_patches + 1, img_decoder_dim)
+                )
+
+                # Image decoder (simplified ViT structure)
+                decoder_layer = nn.TransformerDecoderLayer(
+                    d_model=img_decoder_dim,
+                    nhead=config.num_heads // 2,  # Use fewer heads for the decoder
+                    dim_feedforward=img_decoder_dim * 2,
+                    dropout=config.dropout,
+                    activation='gelu',
+                    batch_first=True,
+                    norm_first=True
+                )
+                self.img_decoder = nn.TransformerDecoder(
+                    decoder_layer=decoder_layer,
+                    num_layers=4  # Use fewer layers for the decoder
+                )
+
+                # Image reconstruction head
+                self.img_reconstruction_head = nn.Sequential(
+                    nn.Linear(img_decoder_dim, img_decoder_dim),
+                    nn.GELU(),
+                    nn.Linear(img_decoder_dim, self.patch_size **
+                              2 * self.in_channels)
+                )
+
+                # Add image uncertainty prediction if enabled
+                if self.predict_uncertainty:
+                    self.img_uncertainty_head = nn.Sequential(
+                        nn.Linear(img_decoder_dim, img_decoder_dim),
+                        nn.GELU(),
+                        nn.Linear(img_decoder_dim, self.patch_size **
+                                  2 * self.in_channels),
+                        nn.Softplus()  # Ensure positive values for variance
+                    )
+        else:
+            self.predict_future = False
+
         self._init_weights()
 
     def _init_weights(self):
@@ -176,6 +307,28 @@ class ModernBertCritic(nn.Module):
         # Normal initialization for embeddings and parameters with std=0.02
         for param in [self.pos_embedding, self.img_pos_embedding, self.cls_token]:
             nn.init.normal_(param, mean=0.0, std=0.02)
+
+        # Initialize future prediction parameters if present
+        if hasattr(self, "predict_future") and self.predict_future:
+            if self.predict_future_image:
+                nn.init.normal_(self.img_decoder_token, mean=0.0, std=0.02)
+                nn.init.normal_(self.img_decoder_pos_embed, mean=0.0, std=0.02)
+
+            # Initialize uncertainty heads if present
+            if hasattr(self, "predict_uncertainty") and self.predict_uncertainty:
+                if hasattr(self, "state_uncertainty_head"):
+                    for m in self.state_uncertainty_head.modules():
+                        if isinstance(m, nn.Linear):
+                            nn.init.xavier_uniform_(m.weight)
+                            if m.bias is not None:
+                                nn.init.zeros_(m.bias)
+
+                if hasattr(self, "img_uncertainty_head"):
+                    for m in self.img_uncertainty_head.modules():
+                        if isinstance(m, nn.Linear):
+                            nn.init.xavier_uniform_(m.weight)
+                            if m.bias is not None:
+                                nn.init.zeros_(m.bias)
 
         # Xavier uniform for linear and conv layers
         for m in self.modules():
@@ -792,3 +945,181 @@ class ModernBertCritic(nn.Module):
                   f"Neg mean score: {negative_scores.mean().item():.4f}, Accuracy: {accuracy.item():.4f}")
 
         return loss, accuracy
+
+    def predict_future_trajectory(self, current_trajectory: torch.Tensor, current_image: torch.Tensor = None) -> tuple:
+        """
+        Predicts future state (t+future_steps) and image based on current trajectory and image.
+
+        Args:
+            current_trajectory: (B, H_current, D_state) tensor of current state trajectory
+            current_image: (B, C, H, W) tensor of current image frame
+
+        Returns:
+            tuple containing prediction outputs:
+            - If multi_step_prediction=False (default):
+                (future_state, future_image, state_uncertainty, image_uncertainty)
+                - future_state: (B, D_state) tensor of predicted state at t+future_steps
+                - future_image: (B, C, H, W) tensor of predicted image at t+future_steps or None
+                - state_uncertainty: (B, D_state) tensor of predicted state uncertainty or None
+                - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
+
+            - If multi_step_prediction=True:
+                (future_states, future_image, state_uncertainties, image_uncertainty)
+                - future_states: (B, num_future_steps, D_state) tensor of predicted states
+                - future_image: (B, C, H, W) tensor of predicted image at t+future_steps or None
+                - state_uncertainties: (B, num_future_steps, D_state) tensor of predicted 
+                  state uncertainties or None
+                - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
+        """
+        if not hasattr(self, "predict_future") or not self.predict_future:
+            raise ValueError(
+                "This model was not configured for future prediction. Set predict_future=True in config.")
+
+        B, H, D = current_trajectory.shape
+
+        # Validate input dimensions
+        if D != self.state_dim:
+            raise ValueError(f"Expected state dim {self.state_dim}, got {D}")
+
+        # Process current image
+        if current_image is not None:
+            img_embedding = self.process_raw_images(current_image).unsqueeze(1)
+        elif not self.use_image_context:
+            img_embedding = self.cls_token.expand(B, 1, -1)
+        else:
+            raise ValueError("Image must be provided for future prediction")
+
+        # Embed current trajectory
+        state_embeddings = self.state_embedding(current_trajectory)
+
+        # Add positional embeddings
+        seq_len = current_trajectory.shape[1]
+        if seq_len <= self.pos_embedding.shape[1]:
+            pos_embeddings = self.pos_embedding[:, :seq_len, :]
+        else:
+            # Handle case where sequence is longer than available positions
+            available_pos = self.pos_embedding.shape[1]
+            pos_embeddings = self.pos_embedding
+            # Pad with the last position embedding
+            last_pos = self.pos_embedding[:, -1:,
+                                          :].expand(-1, seq_len - available_pos, -1)
+            pos_embeddings = torch.cat([pos_embeddings, last_pos], dim=1)
+
+        state_embeddings = state_embeddings + pos_embeddings
+
+        # Combine image and state embeddings
+        sequence_for_transformer = torch.cat(
+            [img_embedding, state_embeddings], dim=1)  # (B, H+1, hidden_dim)
+
+        # Pass through transformer
+        transformer_output = self.transformer_encoder(sequence_for_transformer)
+
+        # Get pooled representation for future prediction
+        pooled_output = self.attention_pooler(transformer_output)
+
+        # Initialize return values
+        future_state = None
+        future_image = None
+        state_uncertainty = None
+        image_uncertainty = None
+
+        # Predict future state if enabled
+        if self.predict_future_state:
+            if hasattr(self, "multi_step_prediction") and self.multi_step_prediction:
+                # For multi-step prediction
+                future_state_flat = self.future_state_decoder(pooled_output)
+
+                # Reshape to [B, num_future_steps, state_dim]
+                future_state = future_state_flat.view(
+                    B, self.num_future_steps, self.state_dim)
+
+                # Predict uncertainty if enabled
+                if hasattr(self, "predict_uncertainty") and self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
+                    state_uncertainty_flat = self.state_uncertainty_head(
+                        pooled_output)
+                    state_uncertainty = state_uncertainty_flat.view(
+                        B, self.num_future_steps, self.state_dim)
+            else:
+                # Standard single-step prediction
+                future_state = self.future_state_decoder(pooled_output)
+
+                # Predict uncertainty if enabled
+                if hasattr(self, "predict_uncertainty") and self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
+                    state_uncertainty = self.state_uncertainty_head(
+                        pooled_output)
+
+        # Predict future image if enabled
+        if self.predict_future_image and current_image is not None:
+            # Get image encoder memory
+            B = current_image.shape[0]
+
+            # Resize images if they don't match expected size
+            if current_image.shape[2] != self.img_size or current_image.shape[3] != self.img_size:
+                current_image = F.interpolate(
+                    current_image,
+                    size=(self.img_size, self.img_size),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            # Get image encoder memory
+            patch_embs = self.patch_embedding(current_image)
+            patch_embeddings = patch_embs.transpose(1, 2)
+
+            # Create decoder tokens with position embedding
+            decoder_tokens = self.img_decoder_token.expand(
+                B, self.num_patches + 1, -1)
+            decoder_tokens = decoder_tokens + self.img_decoder_pos_embed
+
+            # Add pooled feature as a condition
+            decoder_tokens[:, 0] = pooled_output
+
+            # No need for causal mask as this isn't autoregressive generation
+            tgt_mask = None
+            memory_mask = None
+
+            # Decode future image patches
+            decoded_patches = self.img_decoder(
+                tgt=decoder_tokens,
+                memory=patch_embeddings,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask
+            )
+
+            # Skip the first token (condition token) and reconstruct patches
+            decoded_patches = decoded_patches[:, 1:, :]
+
+            # Apply reconstruction head to get pixel values for each patch
+            patch_pixels = self.img_reconstruction_head(decoded_patches)
+            patch_pixels = patch_pixels.reshape(
+                B, self.num_patches, self.patch_size, self.patch_size, self.in_channels
+            )
+
+            # Rearrange to image
+            patches_per_side = int(np.sqrt(self.num_patches))
+            future_image = patch_pixels.permute(0, 1, 4, 2, 3).reshape(
+                B, self.in_channels,
+                patches_per_side * self.patch_size,
+                patches_per_side * self.patch_size
+            )
+
+            # Apply tanh to normalize pixel values to [-1, 1]
+            future_image = torch.tanh(future_image)
+
+            # Predict image uncertainty if enabled
+            if hasattr(self, "predict_uncertainty") and self.predict_uncertainty and hasattr(self, "img_uncertainty_head"):
+                patch_uncertainties = self.img_uncertainty_head(
+                    decoded_patches)
+                patch_uncertainties = patch_uncertainties.reshape(
+                    B, self.num_patches, self.patch_size, self.patch_size, self.in_channels
+                )
+
+                # Rearrange to image
+                image_uncertainty = patch_uncertainties.permute(0, 1, 4, 2, 3).reshape(
+                    B, self.in_channels,
+                    patches_per_side * self.patch_size,
+                    patches_per_side * self.patch_size
+                )
+
+        # Return predictions and uncertainties
+        return future_state, future_image, state_uncertainty, image_uncertainty
