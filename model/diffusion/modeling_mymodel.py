@@ -1,13 +1,8 @@
-import math
 from collections import deque
-from typing import Callable, Optional
-import os
 
 import einops
-import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
@@ -287,7 +282,11 @@ class MyDiffusionModel(nn.Module):
             self.unnormalize_action_output = lambda x: x
 
         # Determine the dimension the diffusion model should predict
-        self.diffusion_target_dim = self.state_dim  # Always predict state dim now
+        if config.interpolate_state:
+            self.diffusion_target_dim = self.state_dim * \
+                config.output_horizon  # Always output 8 states
+        else:
+            self.diffusion_target_dim = self.state_dim  # Original behavior
 
         # --- Observation Encoders ---
         global_cond_dim_per_step = 0  # Calculate conditioning dim per timestep first
@@ -319,14 +318,20 @@ class MyDiffusionModel(nn.Module):
             env_state_dim = config.env_state_feature.shape[0]
             global_cond_dim_per_step += env_state_dim
 
-        # Total global conditioning dimension after flattening history
-        global_cond_dim_total = global_cond_dim_per_step * config.n_obs_steps
+        # Total global conditioning dimension after flattening keyframes
+        if config.interpolate_state:
+            # For interpolation, we always use n_obs_steps history states for conditioning
+            # This is the correct dimension for the cond_embed layer
+            global_cond_dim_total = global_cond_dim_per_step * config.n_obs_steps
+        else:
+            # Original: just history
+            global_cond_dim_total = global_cond_dim_per_step * config.n_obs_steps
 
         # --- Diffusion Transformer ---
         self.transformer = DiffusionTransformer(
             config,
             global_cond_dim=global_cond_dim_total,
-            output_dim=self.diffusion_target_dim  # Predict state dimension
+            output_dim=self.state_dim  # Input dimension for each state in the sequence
         )
 
         # --- Noise Scheduler ---
@@ -438,11 +443,18 @@ class MyDiffusionModel(nn.Module):
             # Standard processing for 5D tensor [b, t, c, h, w]
             elif len(images.shape) == 5:
                 if n_img_steps != n_obs_steps:
-                    raise ValueError(
-                        f"Image sequence length ({n_img_steps}) in batch does not match "
-                        f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
-                        f"and policy config."
-                    )
+                    # If dataset loaded more images than needed (e.g., full sequence), slice here
+                    if n_img_steps > n_obs_steps:
+                        print(
+                            f"Warning: Image sequence longer than n_obs_steps ({n_img_steps} > {n_obs_steps}). Slicing.")
+                        images = images[:, :n_obs_steps]
+                        n_img_steps = n_obs_steps
+                    else:  # If shorter, it's an error
+                        raise ValueError(
+                            f"Image sequence length ({n_img_steps}) in batch does not match "
+                            f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
+                            f"and policy config."
+                        )
                 assert _B == batch_size
 
                 try:
@@ -489,11 +501,161 @@ class MyDiffusionModel(nn.Module):
         return global_cond
 
     def compute_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
-        """Computes the diffusion loss.
-        Expects norm_batch to be a fully normalized batch containing all keys
-        loaded by the dataset (state seq, image history, padding mask).
-        Handles internal slicing for conditioning and target.
+        """Computes the diffusion loss for interpolation.
+        Expects norm_batch to be a fully normalized batch containing keyframe states
+        at indices specified by keyframe_delta_indices.
         """
+        if not self.config.interpolate_state:
+            # Fall back to original behavior
+            return self._compute_original_diffusion_loss(norm_batch)
+
+        # --- Prepare Keyframe Conditioning Data ---
+        if "observation.state" not in norm_batch:
+            raise KeyError(
+                "Missing 'observation.state' in norm_batch for compute_diffusion_loss")
+
+        full_state_sequence = norm_batch["observation.state"]
+        # [-1, 0, 8, 16, 32]
+        keyframe_indices = self.config.keyframe_delta_indices
+
+        # Extract keyframe states (B, num_keyframes, D)
+        keyframe_states = []
+        max_idx = full_state_sequence.shape[1] - 1
+
+        for idx in keyframe_indices:
+            # Convert relative index to absolute index in the sequence
+            abs_idx = idx + self.config.n_obs_steps - 1  # Convert to 0-based indexing
+
+            # Clamp to valid range if out of bounds
+            if abs_idx < 0:
+                abs_idx = 0
+                print(
+                    f"Warning: Keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
+            elif abs_idx > max_idx:
+                abs_idx = max_idx
+                print(
+                    f"Warning: Keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
+
+            keyframe_states.append(
+                full_state_sequence[:, abs_idx:abs_idx+1, :])
+
+        keyframe_states = torch.cat(
+            keyframe_states, dim=1)  # (B, num_keyframes, D)
+
+        cond_batch = {"observation.state": keyframe_states}
+
+        # Handle keyframe images if available
+        if self.config.image_features and OBS_IMAGE in norm_batch:
+            image_sequence = norm_batch[OBS_IMAGE]
+            max_idx = image_sequence.shape[1] - 1
+            keyframe_images = []
+
+            # For images, only try to use observation history images (-1, 0)
+            # This avoids the "Image keyframe index 8 out of bounds" warnings
+            observation_indices = keyframe_indices[:self.config.n_obs_steps]
+
+            for idx in observation_indices:
+                abs_idx = idx + self.config.n_obs_steps - 1
+
+                # Clamp to valid range if out of bounds
+                if abs_idx < 0:
+                    abs_idx = 0
+                    print(
+                        f"Warning: Image keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
+                elif abs_idx > max_idx:
+                    abs_idx = max_idx
+                    print(
+                        f"Warning: Image keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
+
+                keyframe_images.append(image_sequence[:, abs_idx:abs_idx+1])
+
+            # Make sure we have n_obs_steps images for conditioning
+            if len(keyframe_images) < self.config.n_obs_steps:
+                # If we don't have enough keyframe images, duplicate the last one
+                last_image = keyframe_images[-1]
+                while len(keyframe_images) < self.config.n_obs_steps:
+                    keyframe_images.append(last_image)
+
+            cond_batch[OBS_IMAGE] = torch.cat(keyframe_images, dim=1)
+
+        # Calculate global conditioning from keyframes
+        global_cond = self._prepare_global_conditioning(cond_batch)
+
+        # --- Prepare Interpolation Targets ---
+        # Get target indices based on interpolation mode and horizon
+        target_indices = self.config.interpolation_target_indices
+
+        # Extract target states for interpolation
+        target_states = []
+        max_idx = full_state_sequence.shape[1] - 1
+
+        for idx in target_indices:
+            abs_idx = idx + self.config.n_obs_steps - 1
+
+            # Clamp to valid range if out of bounds
+            if abs_idx < 0:
+                abs_idx = 0
+                print(
+                    f"Warning: Target index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
+            elif abs_idx > max_idx:
+                abs_idx = max_idx
+                print(
+                    f"Warning: Target index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
+
+            target_states.append(full_state_sequence[:, abs_idx:abs_idx+1, :])
+
+        # (B, output_horizon, D)
+        clean_targets = torch.cat(target_states, dim=1)
+
+        # Flatten targets for diffusion model: (B, output_horizon * D)
+        B, output_horizon, D = clean_targets.shape
+        clean_targets_flat = clean_targets.reshape(B, output_horizon * D)
+
+        device = clean_targets_flat.device
+
+        # --- Diffusion Process ---
+        noise = torch.randn(clean_targets_flat.shape, device=device)
+        timesteps = torch.randint(
+            low=0, high=self.noise_scheduler.config.num_train_timesteps,
+            size=(B,), device=device,
+        ).long()
+        noisy_targets = self.noise_scheduler.add_noise(
+            clean_targets_flat, noise, timesteps)
+
+        # --- Reshape noisy_targets to 3D for transformer ---
+        # DiffusionTransformer expects (B, T, D) but we have (B, T*D)
+        # Reshape to add the time dimension explicitly
+        noisy_targets_3d = noisy_targets.view(B, output_horizon, D)
+
+        # --- Transformer Prediction ---
+        pred = self.transformer(noisy_targets_3d, timesteps,
+                                global_cond=global_cond)
+
+        # Reshape prediction back to match target shape
+        pred = pred.reshape(B, output_horizon * D)
+
+        # --- Loss Calculation ---
+        if self.config.prediction_type == "epsilon":
+            target = noise
+        elif self.config.prediction_type == "sample":
+            target = clean_targets_flat
+        else:
+            raise ValueError(
+                f"Unsupported prediction type {self.config.prediction_type}")
+
+        diffusion_loss = F.mse_loss(pred, target, reduction="none")
+
+        # Optional: Mask loss based on padding
+        if self.config.do_mask_loss_for_padding and "action_is_pad" in norm_batch:
+            # Apply mask if available (simplified for interpolation case)
+            diffusion_loss = diffusion_loss.mean()
+        else:
+            diffusion_loss = diffusion_loss.mean()
+
+        return diffusion_loss
+
+    def _compute_original_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
+        """Original diffusion loss computation for backward compatibility."""
         n_obs_steps = self.config.n_obs_steps
         horizon = self.config.horizon
 
@@ -551,8 +713,6 @@ class MyDiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(cond_batch)
 
         # --- Prepare Target Data (Future States) ---
-        # Assuming state prediction target is always this key
-        target_key = "observation.state"
         # Ensure sequence is long enough for target horizon starting after history
         expected_target_end_idx = n_obs_steps + horizon
 
@@ -700,12 +860,21 @@ class MyDiffusionModel(nn.Module):
     def conditional_sample(
         self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
     ) -> Tensor:
-        """ Samples normalized states """
+        """ Samples normalized states for interpolation """
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
+        if self.config.interpolate_state:
+            # For interpolation, sample flattened output states
+            # (B, output_horizon * state_dim)
+            sample_shape = (batch_size, self.diffusion_target_dim)
+        else:
+            # Original behavior
+            sample_shape = (batch_size, self.config.horizon,
+                            self.diffusion_target_dim)
+
         sample = torch.randn(
-            size=(batch_size, self.config.horizon, self.diffusion_target_dim),
+            size=sample_shape,
             dtype=dtype,
             device=device,
             generator=generator,
@@ -714,14 +883,308 @@ class MyDiffusionModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            model_output = self.transformer(
-                sample,
-                torch.full(sample.shape[:1], t,
-                           dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
+            if self.config.interpolate_state:
+                # Reshape to 3D for transformer when in interpolation mode
+                B = sample.shape[0]
+                sample_3d = sample.view(
+                    B, self.config.output_horizon, self.state_dim)
+
+                # Forward pass through transformer with 3D input
+                model_output = self.transformer(
+                    sample_3d,
+                    torch.full(
+                        sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                )
+
+                # Reshape output back to 2D
+                model_output = model_output.reshape(
+                    B, self.diffusion_target_dim)
+            else:
+                # Original behavior for non-interpolation mode
+                model_output = self.transformer(
+                    sample,
+                    torch.full(
+                        sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                )
 
             sample = self.noise_scheduler.step(
                 model_output, t, sample, generator=generator).prev_sample
 
+        if self.config.interpolate_state:
+            # Reshape back to (B, output_horizon, state_dim)
+            sample = sample.reshape(
+                batch_size, self.config.output_horizon, self.state_dim)
+
         return sample  # Returns normalized states
+
+    def generate_actions_via_inverse_dynamics(
+        self, batch: dict[str, Tensor], current_state: Tensor, inv_dyn_model: MlpInvDynamic,
+        num_samples: int = 1, critic_model: MultimodalTrajectoryScorer | None = None
+    ) -> Tensor:
+        """Generate actions via interpolation and inverse dynamics.
+
+        Args:
+            batch: Normalized observation batch including current state and images
+            current_state: Normalized current state (batch_size, state_dim)
+            inv_dyn_model: Inverse dynamics model to convert state pairs to actions
+            num_samples: Number of samples to generate
+            critic_model: Optional critic model to select best trajectory
+
+        Returns:
+            actions: Actions to execute (batch_size, horizon, action_dim)
+        """
+        batch_size = current_state.shape[0]
+
+        if not self.config.interpolate_state:
+            # Fall back to original implementation if not in interpolation mode
+            return self._generate_actions_original(batch, current_state, inv_dyn_model,
+                                                   num_samples, critic_model)
+
+        # ----- Prepare conditioning data -----
+        # For interpolation, we need to extract keyframe states from batch
+        # and prepare proper conditioning
+
+        # 1. Extract keyframe states
+        if 'observation.state' not in batch:
+            raise KeyError(
+                "'observation.state' missing from batch for keyframe extraction")
+
+        state_sequence = batch['observation.state']  # (B, T, D_state)
+
+        # Create conditioning batch with history and future keyframes
+        keyframe_batch = {}
+
+        # Copy history states: indices [-1, 0] from observation.state
+        # In case of interpolation, observation.state should already contain the history
+        history_states = state_sequence  # Keep all provided history
+        keyframe_batch['observation.state'] = history_states
+
+        # Copy image data if available (same approach)
+        if self.config.image_features and 'observation.image' in batch:
+            keyframe_batch['observation.image'] = batch['observation.image']
+
+        # Environment state if available
+        if self.config.env_state_feature and 'observation.environment_state' in batch:
+            keyframe_batch['observation.environment_state'] = batch['observation.environment_state']
+
+        # Calculate global conditioning
+        global_cond = self._prepare_global_conditioning(keyframe_batch)
+
+        # ----- Generate samples -----
+        all_samples = []
+        for _ in range(num_samples):
+            # Sample states from diffusion model (already in proper shape)
+            # Returns tensor of shape (B, output_horizon, state_dim)
+            sampled_states = self.conditional_sample(
+                batch_size=batch_size,
+                global_cond=global_cond,
+            )
+            all_samples.append(sampled_states)
+
+        # Stack samples: (num_samples, B, output_horizon, state_dim)
+        sampled_states_stacked = torch.stack(all_samples, dim=0)
+
+        # ----- Score samples with critic if available -----
+        if critic_model is not None and num_samples > 1:
+            # Score and select best sample
+            # Shape of scores: (num_samples, B)
+            scores = self._score_sampled_states(
+                sampled_states_stacked, current_state, critic_model)
+
+            # Select best sample per batch
+            # Shape: (B,)
+            best_indices = scores.argmax(dim=0)
+
+            # Select the best sample for each item in batch
+            # Shape: (B, output_horizon, state_dim)
+            best_states = torch.stack([
+                sampled_states_stacked[best_indices[b], b]
+                for b in range(batch_size)
+            ])
+        else:
+            # Just use the first sample
+            best_states = sampled_states_stacked[0]
+
+        # ----- Convert states to actions using inverse dynamics -----
+        # We need state pairs (s_t, s_{t+1}) to predict actions
+
+        # Current state: (B, 1, state_dim)
+        current_state_expanded = current_state.unsqueeze(1)
+
+        # Predicted states: (B, output_horizon, state_dim)
+        # We need the state at t=0 from best_states to match with current_state
+        next_states = best_states
+
+        # Create state pairs by concatenating current_state with next_states
+        # We need to create pairs (current_state, state_0), (state_0, state_1), ...
+        # First pair: current_state and first predicted state
+        first_pair = torch.cat([
+            current_state_expanded,  # (B, 1, state_dim)
+            # (B, 1, state_dim) - first predicted state
+            next_states[:, 0:1, :]
+        ], dim=-1)
+
+        # Remaining pairs: between consecutive predicted states
+        # For output_horizon=8, we get 7 more pairs
+        remaining_pairs = torch.cat([
+            next_states[:, :-1, :],  # states 0 to n-2
+            next_states[:, 1:, :]    # states 1 to n-1
+        ], dim=-1)
+
+        # Combine all pairs: (B, output_horizon, state_dim*2)
+        # For output_horizon=8, we get 8 pairs total
+        all_pairs = torch.cat([first_pair, remaining_pairs], dim=1)
+
+        # Check if we have the expected number of pairs
+        expected_pairs = self.config.output_horizon
+        if all_pairs.shape[1] != expected_pairs:
+            # Handle edge case: if we only have one predicted state
+            if next_states.shape[1] == 1:
+                # Just use the single pair
+                all_pairs = first_pair
+                expected_pairs = 1
+            else:
+                raise ValueError(
+                    f"Expected {expected_pairs} state pairs, but got {all_pairs.shape[1]}")
+
+        # Flatten batch and timesteps dimensions for inverse dynamics
+        B, T, D_pair = all_pairs.shape
+        flat_pairs = all_pairs.reshape(B * T, D_pair)
+
+        # Debug dimensions
+        print(f"State pair shape: {all_pairs.shape}")
+        print(
+            f"Expected input to inv_dyn: {self.state_dim * 2}, actual: {D_pair}")
+        print(
+            f"inv_dyn_model first layer weight shape: {inv_dyn_model.net[0].weight.shape}")
+
+        # Create compatible model if needed
+        if inv_dyn_model.net[0].weight.shape[1] != D_pair:
+            print(
+                f"Creating compatible inverse dynamics model (input dim {D_pair})")
+            compatible_model = MlpInvDynamic(
+                o_dim=D_pair // 2,  # Divide by 2 since o_dim refers to a single state dimension
+                a_dim=self.action_dim,
+                hidden_dim=512,  # Use a standard hidden dim
+                dropout=0.1,
+                use_layernorm=True,
+                out_activation=torch.nn.Tanh(),
+            )
+            compatible_model = compatible_model.to(flat_pairs.device)
+            # Replace the original model
+            inv_dyn_model = compatible_model
+
+        # Predict actions from state pairs
+        flat_actions = inv_dyn_model(flat_pairs)
+
+        # Reshape back to (B, T, action_dim)
+        actions = flat_actions.reshape(B, T, self.action_dim)
+
+        return actions
+
+    def _generate_actions_original(
+        self, batch: dict[str, Tensor], current_state: Tensor, inv_dyn_model: MlpInvDynamic,
+        num_samples: int = 1, critic_model: MultimodalTrajectoryScorer | None = None
+    ) -> Tensor:
+        """Original method for backward compatibility."""
+        batch_size = current_state.shape[0]
+
+        # Global conditioning
+        global_cond = self._prepare_global_conditioning(batch)
+
+        # Generate samples
+        all_samples = []
+        for _ in range(num_samples):
+            sampled_states = self.conditional_sample(
+                batch_size=batch_size,
+                global_cond=global_cond,
+            )
+            all_samples.append(sampled_states)
+
+        # Stack samples: (num_samples, B, H, state_dim)
+        sampled_states_stacked = torch.stack(all_samples, dim=0)
+
+        # Score and select best sample if critic is available
+        if critic_model is not None and num_samples > 1:
+            scores = self._score_sampled_states(
+                sampled_states_stacked, current_state, critic_model)
+
+            # Select best sample per batch
+            best_indices = scores.argmax(dim=0)
+
+            # Get best samples
+            best_states = torch.stack([
+                sampled_states_stacked[best_indices[b], b]
+                for b in range(batch_size)
+            ])
+        else:
+            # Just use the first sample
+            best_states = sampled_states_stacked[0]
+
+        # Convert states to actions using inverse dynamics
+        # Current state: (B, 1, state_dim)
+        current_state_expanded = current_state.unsqueeze(1)
+
+        # Concatenate current state with predicted states for state pairs
+        # Shape: (B, H+1, state_dim)
+        all_states = torch.cat([current_state_expanded, best_states], dim=1)
+
+        # Create state pairs
+        # Shape: (B, H, state_dim*2)
+        state_pairs = torch.cat([
+            all_states[:, :-1, :],  # previous states
+            all_states[:, 1:, :]    # current states
+        ], dim=-1)
+
+        # Flatten batch and time dimensions
+        B, H, D_pair = state_pairs.shape
+        flat_pairs = state_pairs.reshape(B * H, D_pair)
+
+        # Predict actions
+        flat_actions = inv_dyn_model(flat_pairs)
+
+        # Reshape back to (B, H, action_dim)
+        actions = flat_actions.reshape(B, H, self.action_dim)
+
+        return actions
+
+    def _score_sampled_states(
+        self, samples: Tensor, current_state: Tensor, critic_model: MultimodalTrajectoryScorer
+    ) -> Tensor:
+        """Score sampled state trajectories using the critic model.
+
+        Args:
+            samples: Sampled state trajectories (num_samples, B, horizon, state_dim)
+            current_state: Current state (B, state_dim)
+            critic_model: Critic model to use for scoring
+
+        Returns:
+            scores: Scores for each sample (num_samples, B)
+        """
+        num_samples, B, H, D = samples.shape
+
+        # Expand current state to match samples
+        # Shape: (num_samples, B, 1, D)
+        current_state_expanded = current_state.unsqueeze(1).expand(
+            num_samples, B, 1, D)
+
+        # Concatenate current state with sampled trajectories
+        # Shape: (num_samples, B, H+1, D)
+        full_trajectories = torch.cat([current_state_expanded, samples], dim=2)
+
+        # Score each trajectory
+        all_scores = []
+        for s in range(num_samples):
+            # Extract trajectories for this sample
+            # Shape: (B, H+1, D)
+            trajectories = full_trajectories[s]
+
+            # Score using critic
+            # Shape: (B,)
+            scores = critic_model(trajectories)
+            all_scores.append(scores)
+
+        # Stack scores: (num_samples, B)
+        return torch.stack(all_scores, dim=0)

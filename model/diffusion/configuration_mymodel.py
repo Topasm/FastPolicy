@@ -85,13 +85,18 @@ class DiffusionConfig(PreTrainedConfig):
         do_mask_loss_for_padding: Whether to mask loss for padded targets (actions or states).
     """
     type: str = field(init=True, default="mydiffusion")
-    # Prediction mode
-    predict_state: bool = False
+    # Interpolation mode - interpolate between given keyframe states
+    interpolate_state: bool = True
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 16
+    n_obs_steps: int = 2  # Always use states at -1, 0
+    horizon: int = 16  # Variable horizon (8, 16, or 32)
+    output_horizon: int = 8  # Always output 8 states
     n_action_steps: int = 8
+
+    # Keyframe indices for interpolation (relative to current state at time 0)
+    keyframe_indices: list[int] = field(default_factory=lambda: [8, 16, 32])
+    interpolation_mode: str = "dense"  # "dense", "skip_even", "sparse"
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -149,32 +154,25 @@ class DiffusionConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
         # Validation logic
-        if self.predict_state:
-            # Check if a state key exists for prediction target
-            # Allow 'observation.state' itself to be the target key
+        if self.interpolate_state:
+            # Check if a state key exists for interpolation target
             state_keys = [
                 k for k in self.output_features if k.endswith("state")]
             if not state_keys:
                 raise ValueError(
-                    "When predict_state is True, output_features must contain at least one key ending with 'state' (e.g., 'observation.state' or 'next_observation.state') to be used as the diffusion target."
+                    "When interpolate_state is True, output_features must contain at least one key ending with 'state' (e.g., 'observation.state') to be used as the interpolation target."
                 )
             # Ensure action is still in output_features for the final policy output
             if "action" not in self.output_features:
                 raise ValueError(
-                    "'action' must be included in output_features even when predict_state is True, as it is the final policy output."
+                    "'action' must be included in output_features even when interpolate_state is True, as it is the final policy output."
                 )
         else:
-            # Ensure action is the only output if not predicting state
-            # Allow other keys if needed, but action must be present
+            # Ensure action is the only output if not interpolating state
             if "action" not in self.output_features:
                 raise ValueError(
-                    "When predict_state is False, 'action' must be included in output_features."
+                    "When interpolate_state is False, 'action' must be included in output_features."
                 )
-            # Original check (might be too strict depending on use case):
-            # if list(self.output_features.keys()) != ["action"]:
-            #     raise ValueError(
-            #         "When predict_state is False, 'action' should be the only key in output_features."
-            #     )
 
         # Validate horizon vs n_action_steps and n_obs_steps
         if self.transformer_dim % self.transformer_num_heads != 0:
@@ -281,12 +279,40 @@ class DiffusionConfig(PreTrainedConfig):
         return list(range(start_index, end_index))
 
     @property
+    def keyframe_delta_indices(self) -> list:
+        """Indices for keyframe states used in interpolation.
+        Returns indices -1, 0, and the keyframe indices (8, 16, 32 by default).
+        """
+        # History indices
+        history_indices = list(range(1 - self.n_obs_steps, 1))  # [-1, 0]
+        # Add keyframe indices
+        return history_indices + self.keyframe_indices
+
+    @property
+    def interpolation_target_indices(self) -> list:
+        """Target indices for interpolation output.
+        Returns different indices based on interpolation mode and horizon.
+        """
+        if self.interpolation_mode == "dense" or self.horizon == 8:
+            # Dense output: 0, 1, 2, 3, 4, 5, 6, 7
+            return list(range(self.output_horizon))
+        elif self.interpolation_mode == "skip_even" or self.horizon == 16:
+            # Skip even: 0, 2, 4, 6, 8, 10, 12, 14
+            return list(range(0, 16, 2))
+        elif self.interpolation_mode == "sparse" or self.horizon == 32:
+            # Sparse: 0, 4, 8, 12, 16, 20, 24, 28
+            return list(range(0, 32, 4))
+        else:
+            raise ValueError(
+                f"Unsupported interpolation mode: {self.interpolation_mode} with horizon: {self.horizon}")
+
+    @property
     def reward_delta_indices(self) -> None:
         return None
 
     @property
     def diffusion_target_key(self) -> str:
-        if self.predict_state:
+        if self.interpolate_state:
             # Find state keys in output_features
             state_keys = [
                 k for k in self.output_features if k.endswith("state")]

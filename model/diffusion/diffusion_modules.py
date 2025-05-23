@@ -400,7 +400,7 @@ class DiffusionTransformer(nn.Module):
         Returns:
             (B, T_horizon, output_dim) Predicted noise or clean data.
         """
-        B, T, _ = noisy_input.shape
+        B, T, D = noisy_input.shape
         device = noisy_input.device
 
         # 1. Embeddings
@@ -413,8 +413,22 @@ class DiffusionTransformer(nn.Module):
 
         # (B, T, transformer_dim)
         input_emb = self.input_embed(noisy_input)
+
+        # Add positional embedding - handle variable sequence length
+        # If T differs from the pos_embed sequence length, interpolate or truncate
+        if T != self.pos_embed.shape[1]:
+            # Interpolate the positional embedding to match the sequence length
+            pos_embed = F.interpolate(
+                self.pos_embed.transpose(1, 2),  # [1, d_model, seq_len]
+                size=T,
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)  # [1, seq_len, d_model]
+        else:
+            pos_embed = self.pos_embed
+
         # Add positional embedding
-        x = input_emb + self.pos_embed  # Uses broadcasting
+        x = input_emb + pos_embed  # Uses broadcasting
 
         # 2. Apply Transformer blocks
         for block in self.blocks:
