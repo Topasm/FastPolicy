@@ -337,8 +337,9 @@ class DiffusionTransformer(nn.Module):
             transformer_dim + global_cond_dim, transformer_dim)
 
         # Learnable positional embedding for the target sequence
+        # Use horizon + 1 to match the saved model (includes extra position for conditioning)
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, config.horizon, transformer_dim))
+            torch.zeros(1, config.horizon + 1, transformer_dim))
 
         # 2. Transformer Blocks
         self.blocks = nn.ModuleList([
@@ -415,17 +416,18 @@ class DiffusionTransformer(nn.Module):
         input_emb = self.input_embed(noisy_input)
 
         # Add positional embedding - handle variable sequence length
-        # If T differs from the pos_embed sequence length, interpolate or truncate
-        if T != self.pos_embed.shape[1]:
-            # Interpolate the positional embedding to match the sequence length
+        # pos_embed is now [1, horizon+1, transformer_dim], take first T positions
+        if T <= self.pos_embed.shape[1]:
+            # Use the first T positions from the position embedding
+            pos_embed = self.pos_embed[:, :T, :]
+        else:
+            # If T is larger than available positions, interpolate
             pos_embed = F.interpolate(
                 self.pos_embed.transpose(1, 2),  # [1, d_model, seq_len]
                 size=T,
                 mode='linear',
                 align_corners=False
             ).transpose(1, 2)  # [1, seq_len, d_model]
-        else:
-            pos_embed = self.pos_embed
 
         # Add positional embedding
         x = input_emb + pos_embed  # Uses broadcasting
