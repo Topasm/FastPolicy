@@ -39,16 +39,12 @@ def parse_args():
                         help="Learning rate for training")
     parser.add_argument("--steps", type=int, default=10000,
                         help="Number of training steps")
-    parser.add_argument("--base_noise_scale", type=float, default=0.05,
-                        help="Base noise scale for negative samples")
-    parser.add_argument("--noise_growth_factor", type=float, default=1.2,
-                        help="Growth factor for noise per timestep")
-    parser.add_argument("--noise_schedule", type=str, default="none", choices=["none", "linear", "cosine", "exponential"],
-                        help="Noise scheduling strategy for decreasing noise over training")
-    parser.add_argument("--initial_noise_multiplier", type=float, default=2.0,
-                        help="Multiplier for noise at start of training (when using noise scheduling)")
-    parser.add_argument("--final_noise_multiplier", type=float, default=0.5,
-                        help="Multiplier for noise at end of training (when using noise scheduling)")
+    parser.add_argument("--base_noise_scale", type=float, default=0.02,
+                        help="Base noise scale for negative samples (starting noise for t=0)")
+    parser.add_argument("--noise_growth_factor", type=float, default=1.5,
+                        help="Growth factor for noise per future timestep (t=7 gets more noise)")
+    parser.add_argument("--final_noise_multiplier", type=float, default=1.0,
+                        help="Global multiplier to adjust overall noise magnitude")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use for training")
     parser.add_argument("--output_dir", type=str, default="outputs/train/modernbert_critic",
@@ -60,6 +56,10 @@ def parse_args():
     # New arguments for next sequence prediction
     parser.add_argument("--half_horizon", type=int, default=8,
                         help="Length of half trajectory for next sequence prediction")
+    parser.add_argument("--apply_gaussian_smoothing", action="store_true",
+                        help="Apply Gaussian smoothing after adding noise to make trajectories smoother")
+    parser.add_argument("--gaussian_sigma", type=float, default=1.0,
+                        help="Sigma parameter for Gaussian smoothing (higher = smoother)")
     return parser.parse_args()
 
 
@@ -126,7 +126,10 @@ def main():
         dropout=0.1,
         use_layernorm=True,
         swiglu_intermediate_factor=4,
-        half_horizon=half_horizon  # Set half-horizon for next sequence prediction
+        half_horizon=half_horizon,  # Set half-horizon for next sequence prediction
+        # Whether to apply Gaussian smoothing
+        apply_gaussian_smoothing=args.apply_gaussian_smoothing,
+        gaussian_sigma=args.gaussian_sigma  # Sigma parameter for Gaussian filter
     )
 
     # Save config for future reference
@@ -171,21 +174,16 @@ def main():
     print(
         f"Base noise scale: {args.base_noise_scale}, Growth factor: {args.noise_growth_factor}")
 
-    # Configure base noise parameters
+    # Configure simplified noise parameters
     noise_params = {
         "base_noise_scale": args.base_noise_scale,
-        "noise_type": "progressive",
         "noise_growth_factor": args.noise_growth_factor,
-        "noise_schedule": args.noise_schedule,
-        "initial_noise_multiplier": args.initial_noise_multiplier,
-        "final_noise_multiplier": args.final_noise_multiplier,
-        "current_step": 0,
-        "total_steps": args.steps
+        "final_noise_multiplier": args.final_noise_multiplier
     }
 
-    # Log the noise scheduling configuration
-    if args.noise_schedule != "none":
-        print(f"Using {args.noise_schedule} noise scheduling: {args.initial_noise_multiplier}x → {args.final_noise_multiplier}x over {args.steps} steps")
+    # Log the noise configuration
+    print(
+        f"Noise configuration: base_scale={args.base_noise_scale}, growth_factor={args.noise_growth_factor}, multiplier={args.final_noise_multiplier}")
 
     pbar = tqdm(range(args.steps), desc="Training ModernBERT Critic")
     step = 0
@@ -202,9 +200,6 @@ def main():
                 v, torch.Tensor) else v for k, v in batch.items()}
             norm_batch["observation.state"] = norm_state_batch["observation.state"].to(
                 device)
-
-            # Update current step in noise parameters
-            noise_params["current_step"] = step
 
             # Compute loss and update model
             optimizer.zero_grad()

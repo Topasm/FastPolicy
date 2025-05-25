@@ -5,6 +5,59 @@ import numpy as np
 from dataclasses import dataclass
 
 
+def gaussian_smoothing_1d(trajectory, sigma=1.0):
+    """
+    Apply Gaussian smoothing to a batch of trajectories along the time dimension.
+
+    Args:
+        trajectory: Tensor of shape [B, T, D] where:
+            - B is the batch size
+            - T is the sequence length
+            - D is the dimension of state
+        sigma: Standard deviation for the Gaussian kernel
+
+    Returns:
+        Smoothed trajectory of the same shape
+    """
+    if sigma <= 0:
+        return trajectory
+
+    # Keep original shape
+    original_shape = trajectory.shape
+    B, T, D = original_shape
+    device = trajectory.device
+
+    # Calculate kernel size (odd number)
+    kernel_size = max(3, int(2 * round(3 * sigma) + 1))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # Create 1D Gaussian kernel
+    x = torch.arange(-(kernel_size // 2), kernel_size //
+                     2 + 1, dtype=torch.float, device=device)
+    kernel = torch.exp(-0.5 * (x / sigma).pow(2))
+    kernel = kernel / kernel.sum()  # Normalize
+
+    # Reshape for batch conv1d: [1, 1, kernel_size]
+    kernel = kernel.view(1, 1, kernel_size)
+
+    # Process each state dimension separately to maintain independence
+    smoothed_trajectory = torch.zeros_like(trajectory)
+
+    for dim in range(D):
+        # Extract the dimension and reshape for conv1d: [B, 1, T]
+        dim_data = trajectory[:, :, dim].reshape(B, 1, T)
+
+        # Apply 1D convolution with padding='same' to maintain sequence length
+        padding = kernel_size // 2
+        smoothed_dim = F.conv1d(dim_data, kernel, padding=padding)
+
+        # Put back the smoothed dimension
+        smoothed_trajectory[:, :, dim] = smoothed_dim.squeeze(1)
+
+    return smoothed_trajectory
+
+
 @dataclass
 class ModernBertCriticConfig:
     """Configuration for ModernBertCritic - inspired by ModernBERT architecture"""
@@ -18,6 +71,10 @@ class ModernBertCriticConfig:
     swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
     # Half-horizon for split sequence prediction (if None, uses horizon // 2)
     half_horizon: int = None
+    # Whether to apply Gaussian smoothing after adding noise
+    apply_gaussian_smoothing: bool = True
+    # Sigma parameter for Gaussian smoothing
+    gaussian_sigma: float = 1.0
 
 
 # --- SwiGLU Activation ---
@@ -247,12 +304,12 @@ class ModernBertCritic(nn.Module):
         if raw_images is not None:
             # Process the image and get embedding
             img_embedding = self.process_raw_images(raw_images).unsqueeze(1)
-        elif not self.use_image_context:
-            # If image context is not used, create a learnable dummy token instead
-            img_embedding = self.cls_token.expand(B, 1, -1)
         else:
-            raise ValueError(
-                "Either image_features or raw_images must be provided when use_image_context=True")
+            # Use a learnable dummy token if raw_images is None
+            img_embedding = self.cls_token.expand(B, 1, -1)
+            if self.use_image_context:
+                print(
+                    "Warning: No raw_images provided but use_image_context=True. Using learnable token instead.")
 
         # Embed states to hidden dimension
         state_embeddings = self.state_embedding(
@@ -457,23 +514,37 @@ class ModernBertCritic(nn.Module):
             if raw_images.ndim != 5:
                 raise ValueError(
                     f"Expected raw_images to be (B, 2, C, H, W), got shape {raw_images.shape}")
-            first_image = raw_images[:, 0]  # (B, C, H, W)
-            second_image = raw_images[:, 1]  # (B, C, H, W)
+            # Extract images for first and second half
+            first_half_image = raw_images[:, 0]  # (B, C, H, W)
+            second_half_image = raw_images[:, 1]  # (B, C, H, W)
+
+            # Process based on training or inference mode
+            if not self.training:
+                print("Inference mode: Using only first half with image")
+                return self.forward(first_half, raw_images=first_half_image, second_half=False)
+            else:
+                # Use both halves with their respective images
+                print("Training mode: Using both halves with images")
+                first_scores = self.forward(
+                    first_half, raw_images=first_half_image, second_half=False)
+                second_scores = self.forward(
+                    second_half, raw_images=second_half_image, second_half=True)
+                combined_scores = (first_scores + second_scores) / 2
+                return combined_scores
         else:
-            first_image = None
-            # For inference, use only the first half (more reliable)
-            second_image = None
+            # Handle the case when raw_images is None
             if not self.training:
                 print("Inference mode: Using only first half for scoring_next_sequence")
                 first_scores = self.forward(
-                    first_half, raw_images=first_image, second_half=False)
+                    first_half, raw_images=None, second_half=False)
                 return first_scores
             else:
-                # For training, use both halves as before
+                # For training, use both halves
+                print("Training mode: Using both halves for scoring without images")
                 first_scores = self.forward(
-                    first_half, raw_images=first_image, second_half=False)
+                    first_half, raw_images=None, second_half=False)
                 second_scores = self.forward(
-                    second_half, raw_images=second_image, second_half=True)
+                    second_half, raw_images=None, second_half=True)
 
                 # Combine scores (average)
                 combined_scores = (first_scores + second_scores) / 2
@@ -676,67 +747,69 @@ class ModernBertCritic(nn.Module):
         device = positive_first_half.device
         B = positive_first_half.shape[0]
 
-        # Apply noise to negative second half trajectories if noise_params is provided
+        # Apply noise to negative first half trajectories (0-7 sequence)
+        # with more noise on future states (0 is current, 7 is future)
         if noise_params is not None:
             base_noise_scale = noise_params.get("base_noise_scale", 0.05)
-            noise_type = noise_params.get("noise_type", "progressive")
             noise_growth_factor = noise_params.get("noise_growth_factor", 1.2)
 
-            # Get noise scheduling parameters
-            noise_schedule = noise_params.get("noise_schedule", "none")
-            initial_multiplier = noise_params.get(
-                "initial_noise_multiplier", 2.0)
-            final_multiplier = noise_params.get("final_noise_multiplier", 0.5)
-            current_step = noise_params.get("current_step", 0)
-            total_steps = noise_params.get("total_steps", 10000)
-
-            # Calculate current noise multiplier based on training progress
-            noise_multiplier = initial_multiplier
-
-            if noise_schedule != "none" and total_steps > 0:
-                progress = min(current_step / total_steps, 1.0)
-
-                if noise_schedule == "linear":
-                    # Linear decay from initial_multiplier to final_multiplier
-                    noise_multiplier = initial_multiplier + progress * \
-                        (final_multiplier - initial_multiplier)
-
-                elif noise_schedule == "cosine":
-                    # Cosine decay from initial_multiplier to final_multiplier
-                    cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
-                    noise_multiplier = final_multiplier + \
-                        (initial_multiplier - final_multiplier) * cosine_factor
-
-                elif noise_schedule == "exponential":
-                    # Exponential decay from initial_multiplier to final_multiplier
-                    decay_rate = np.log(final_multiplier / initial_multiplier)
-                    noise_multiplier = initial_multiplier * \
-                        np.exp(decay_rate * progress)
+            # Get noise scheduling parameter (just final multiplier)
+            final_multiplier = noise_params.get("final_noise_multiplier", 1.0)
 
             # Apply the noise multiplier to the base noise scale
-            base_noise_scale *= noise_multiplier
+            effective_noise = base_noise_scale * final_multiplier
 
-            # Log the current noise level occasionally
+            # Log the noise parameters occasionally
             if torch.rand(1).item() < 0.01:  # Only log about 1% of the time
                 print(
-                    f"Current noise multiplier: {noise_multiplier:.4f}x, Effective base noise: {base_noise_scale:.6f}")
+                    f"Noise base scale: {effective_noise:.6f}, Growth factor: {noise_growth_factor:.2f}")
 
-            # Add noise to each timestep in the negative second half
-            for t_idx in range(negative_second_half.shape[1]):
-                relative_step = t_idx + 1  # Start from 1 for noise progression
-                current_noise = base_noise_scale
+            # Create a copy of the trajectories before applying noise (for diagnostics)
+            negative_first_half_original = negative_first_half.clone()
 
-                if noise_type == "progressive":
-                    current_noise *= (noise_growth_factor **
-                                      (relative_step - 1))
-                elif noise_type == "diffusion":
-                    timestep_fraction = relative_step / \
-                        self.half_horizon if self.half_horizon > 1 else 0
-                    current_noise *= (1.0 + 10 * timestep_fraction**2)
+            # Apply progressively more noise to future timesteps
+            # This implements the core requirement: more noise for future states
+            for t_idx in range(negative_first_half.shape[1]):
+                # Calculate current noise level based on timestep
+                # t_idx=0 is present, t_idx=(half_horizon-1) is future
+                # Use exponential growth to increase noise for future states
+                current_noise = effective_noise * \
+                    (noise_growth_factor ** t_idx)
 
+                # Generate and apply noise
                 noise = torch.randn_like(
-                    negative_second_half[:, t_idx]) * current_noise
-                negative_second_half[:, t_idx] += noise
+                    negative_first_half[:, t_idx]) * current_noise
+                negative_first_half[:, t_idx] += noise
+
+            # Apply optional Gaussian smoothing
+            if hasattr(self, 'apply_gaussian_smoothing') and self.apply_gaussian_smoothing:
+                # Use the configured sigma value
+                sigma = self.gaussian_sigma if hasattr(
+                    self, 'gaussian_sigma') else 1.0
+
+                # Apply smoothing function
+                negative_first_half = gaussian_smoothing_1d(
+                    negative_first_half, sigma=sigma)
+
+                # Log occasionally
+                if torch.rand(1).item() < 0.01:
+                    print(f"Applied Gaussian smoothing with sigma={sigma:.2f}")
+
+            # Diagnostic logging: compare original vs noised trajectory
+            if torch.rand(1).item() < 0.005:  # Very occasional logging
+                avg_noise = (negative_first_half -
+                             negative_first_half_original).abs().mean().item()
+                max_noise = (negative_first_half -
+                             negative_first_half_original).abs().max().item()
+                print(
+                    f"Trajectory noise stats - Avg: {avg_noise:.6f}, Max: {max_noise:.6f}")
+
+                # Log noise per timestep to verify increasing noise in future states
+                if torch.rand(1).item() < 0.2:  # Very rare detailed logging
+                    for t in range(negative_first_half.shape[1]):
+                        t_noise = (
+                            negative_first_half[:, t] - negative_first_half_original[:, t]).abs().mean().item()
+                        print(f"  Timestep {t} noise magnitude: {t_noise:.6f}")
 
         # Randomly shuffle some of the negative second halves for more variety
         if torch.rand(1).item() < 0.5:  # 50% chance to apply shuffling
@@ -759,7 +832,7 @@ class ModernBertCritic(nn.Module):
         positive_scores = self.score_next_sequence(
             positive_first_half, positive_second_half, raw_images=raw_images)
 
-        # Score the negative pairs (first half -> noised/shuffled second half)
+        # Score the negative pairs (first half -> noised second half)
         negative_scores = self.score_next_sequence(
             negative_first_half, negative_second_half, raw_images=raw_images)
 
