@@ -45,6 +45,8 @@ def parse_args():
     # Future prediction specific arguments
     parser.add_argument("--future_steps", type=int, default=8,
                         help="Number of steps into future to predict")
+    parser.add_argument("--use_gpt2_style", action="store_true", default=True,
+                        help="Whether to use GPT2-style architecture")
     parser.add_argument("--context_horizon", type=int, default=8,
                         help="Length of trajectory context used for prediction")
     parser.add_argument("--predict_image", action="store_true", default=True,
@@ -174,7 +176,8 @@ def main():
         num_heads=args.num_heads,
         dropout=0.1,
         use_layernorm=True,
-        swiglu_intermediate_factor=4,
+        mlp_intermediate_factor=4,
+        use_gpt2_style=args.use_gpt2_style,
         predict_future=True,
         future_steps=args.future_steps,
         predict_future_image=args.predict_image,

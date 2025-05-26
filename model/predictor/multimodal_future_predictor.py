@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
+from model.predictor.gpt2_blocks import GPT2Block, GPT2MLP
 
 
 @dataclass
@@ -17,7 +18,8 @@ class MultimodalFuturePredictorConfig:
     use_layernorm: bool = True  # Use LayerNorm in output heads
     num_layers: int = 8  # Number of transformer layers
     num_heads: int = 12  # Number of attention heads
-    swiglu_intermediate_factor: int = 4  # Factor for SwiGLU intermediate dim
+    mlp_intermediate_factor: int = 4  # Factor for MLP intermediate dimension
+    use_gpt2_style: bool = True  # Whether to use GPT2-style architecture
 
     # Future prediction parameters
     # Enable future prediction mode (default is now True)
@@ -31,21 +33,8 @@ class MultimodalFuturePredictorConfig:
     predict_uncertainty: bool = False  # Whether to predict uncertainty in predictions
 
 
-# --- SwiGLU Activation ---
-class SwiGLU(nn.Module):
-    """ SwiGLU Activation Function - Modern Transformer architecture component """
-
-    def __init__(self, dim: int, hidden_dim: int | None = None, bias: bool = False):
-        super().__init__()
-        if hidden_dim is None:
-            # Default expansion factor for SwiGLU
-            hidden_dim = int(dim * 4 * 2 / 3)
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
-
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+# --- Using GPT2MLP instead of SwiGLU ---
+# Importing from gpt2_blocks.py
 
 
 # --- Simple Attention Pooling ---
@@ -88,17 +77,21 @@ class AttentionPooling(nn.Module):
 
 class MultimodalFuturePredictor(nn.Module):
     """
-    Transformer-based model for multimodal future prediction.
+    GPT2-style Transformer-based model for multimodal future prediction.
 
     Predicts future states and images based on current trajectory and image context.
+    Uses GPT2-style blocks with pre-normalization and residual connections instead of SwiGLU.
     Can predict single or multiple future steps with optional uncertainty estimation.
+
+    Specifically designed to take an image at index 0 (current state) and predict 
+    an image at index 8 (future state).
 
     Input: 
         - trajectory_sequence: (B, H, D_state) tensor of state sequences
-        - current_image: (B, C, H, W) tensor of current image
+        - current_image: (B, C, H, W) tensor of current image at index 0
     Output: Future predictions, depending on configuration:
-        - future_state: (B, D_state) or (B, num_future_steps, D_state)
-        - future_image: (B, C, H, W) 
+        - future_state: (B, D_state) or (B, num_future_steps, D_state) - state at index 8
+        - future_image: (B, C, H, W) - future image at index 8 
         - state_uncertainty: (B, D_state) or (B, num_future_steps, D_state)
         - image_uncertainty: (B, C, H, W)
     """
@@ -144,23 +137,36 @@ class MultimodalFuturePredictor(nn.Module):
         # CLS token for image (following ViT approach)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
 
-        # Calculate SwiGLU hidden dimension
-        swiglu_hidden_dim = config.hidden_dim * config.swiglu_intermediate_factor
+        # Calculate hidden dimension for MLP layers
+        self.mlp_hidden_dim = config.hidden_dim * config.mlp_intermediate_factor
 
-        # Transformer encoder with pre-normalization and modern design
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim,
-            nhead=config.num_heads,
-            dim_feedforward=swiglu_hidden_dim,
-            dropout=config.dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True  # Pre-LN architecture for better training stability
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=config.num_layers
-        )
+        # Use GPT2-style transformer blocks
+        if config.use_gpt2_style:
+            # Custom GPT2-style transformer
+            self.transformer_encoder = nn.ModuleList([
+                GPT2Block(
+                    dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    dropout=config.dropout
+                ) for _ in range(config.num_layers)
+            ])
+            self.use_gpt2_style = True
+        else:
+            # Standard transformer encoder (fallback option)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_dim,
+                nhead=config.num_heads,
+                dim_feedforward=self.mlp_hidden_dim,
+                dropout=config.dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True  # Pre-LN architecture for better training stability
+            )
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layer=encoder_layer,
+                num_layers=config.num_layers
+            )
+            self.use_gpt2_style = False
 
         # Attention pooling instead of simple averaging or first token extraction
         self.attention_pooler = AttentionPooling(
@@ -187,8 +193,8 @@ class MultimodalFuturePredictor(nn.Module):
             if self.multi_step_prediction:
                 # For multi-step prediction, output num_future_steps states
                 self.future_state_decoder = nn.Sequential(
-                    SwiGLU(config.hidden_dim,
-                           hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                    GPT2MLP(config.hidden_dim,
+                            hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
                     nn.LayerNorm(
                         config.hidden_dim) if config.use_layernorm else nn.Identity(),
                     nn.Linear(config.hidden_dim,
@@ -200,8 +206,8 @@ class MultimodalFuturePredictor(nn.Module):
             else:
                 # Standard single-step prediction
                 self.future_state_decoder = nn.Sequential(
-                    SwiGLU(config.hidden_dim,
-                           hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                    GPT2MLP(config.hidden_dim,
+                            hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
                     nn.LayerNorm(
                         config.hidden_dim) if config.use_layernorm else nn.Identity(),
                     nn.Linear(config.hidden_dim,
@@ -216,8 +222,8 @@ class MultimodalFuturePredictor(nn.Module):
                 if self.multi_step_prediction:
                     # Predict uncertainty for each state dimension at each future step
                     self.state_uncertainty_head = nn.Sequential(
-                        SwiGLU(config.hidden_dim,
-                               hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                        GPT2MLP(config.hidden_dim,
+                                hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
                         nn.LayerNorm(
                             config.hidden_dim) if config.use_layernorm else nn.Identity(),
                         nn.Linear(config.hidden_dim,
@@ -230,8 +236,8 @@ class MultimodalFuturePredictor(nn.Module):
                 else:
                     # Predict uncertainty for each state dimension
                     self.state_uncertainty_head = nn.Sequential(
-                        SwiGLU(config.hidden_dim,
-                               hidden_dim=swiglu_hidden_dim, bias=use_bias),
+                        GPT2MLP(config.hidden_dim,
+                                hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
                         nn.LayerNorm(
                             config.hidden_dim) if config.use_layernorm else nn.Identity(),
                         nn.Linear(config.hidden_dim,
@@ -350,7 +356,14 @@ class MultimodalFuturePredictor(nn.Module):
             [cls_tokens, patch_embeddings], dim=1)
 
         # Pass through transformer encoder
-        img_features = self.transformer_encoder(patch_embeddings_with_cls)
+        if self.use_gpt2_style:
+            # Forward through GPT2 style blocks
+            img_features = patch_embeddings_with_cls
+            for block in self.transformer_encoder:
+                img_features = block(img_features)
+        else:
+            # Standard transformer encoder
+            img_features = self.transformer_encoder(patch_embeddings_with_cls)
 
         # Create mask where all positions except CLS are ignored
         cls_only_mask = torch.ones(
@@ -366,21 +379,21 @@ class MultimodalFuturePredictor(nn.Module):
 
         Args:
             current_trajectory: (B, H_current, D_state) tensor of current state trajectory
-            current_image: (B, C, H, W) tensor of current image frame
+            current_image: (B, C, H, W) tensor of current image at index 0 (current state)
 
         Returns:
             tuple containing prediction outputs:
             - If multi_step_prediction=False (default):
                 (future_state, future_image, state_uncertainty, image_uncertainty)
-                - future_state: (B, D_state) tensor of predicted state at t+future_steps
-                - future_image: (B, C, H, W) tensor of predicted image at t+future_steps or None
+                - future_state: (B, D_state) tensor of predicted state at t+future_steps (state at index 8)
+                - future_image: (B, C, H, W) tensor of predicted image at index 8 (future state) or None
                 - state_uncertainty: (B, D_state) tensor of predicted state uncertainty or None
                 - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
 
             - If multi_step_prediction=True:
                 (future_states, future_image, state_uncertainties, image_uncertainty)
                 - future_states: (B, num_future_steps, D_state) tensor of predicted states
-                - future_image: (B, C, H, W) tensor of predicted image at t+future_steps or None
+                - future_image: (B, C, H, W) tensor of predicted image at index 8 or None
                 - state_uncertainties: (B, num_future_steps, D_state) tensor of predicted 
                   state uncertainties or None
                 - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
@@ -422,7 +435,15 @@ class MultimodalFuturePredictor(nn.Module):
             [img_embedding, state_embeddings], dim=1)  # (B, H+1, hidden_dim)
 
         # Pass through transformer
-        transformer_output = self.transformer_encoder(sequence_for_transformer)
+        if self.use_gpt2_style:
+            # Forward through GPT2 style blocks
+            transformer_output = sequence_for_transformer
+            for block in self.transformer_encoder:
+                transformer_output = block(transformer_output)
+        else:
+            # Standard transformer encoder
+            transformer_output = self.transformer_encoder(
+                sequence_for_transformer)
 
         # Get pooled representation for future prediction
         pooled_output = self.attention_pooler(transformer_output)

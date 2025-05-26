@@ -7,7 +7,6 @@ from lerobot.common.policies.normalize import Normalize
 from model.diffusion.modeling_mymodel import MyDiffusionModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
 import numpy
-import random
 
 
 def validate_dataset_indices(dataloader, all_state_indices, image_indices):
@@ -20,66 +19,24 @@ def validate_dataset_indices(dataloader, all_state_indices, image_indices):
     print(f"State sequence shape: {sample_batch['observation.state'].shape}")
     print(f"Image sequence shape: {sample_batch['observation.image'].shape}")
 
-    # Check if we have enough state frames
-    max_required_state_idx = max(all_state_indices)
-    if max_required_state_idx >= state_seq_length:
+    # Check if we have the required states (0-8)
+    required_states = 9  # We need states 0-8
+    if state_seq_length < required_states:
         print(
-            f"WARNING: Required max state index {max_required_state_idx} exceeds available states {state_seq_length-1}")
+            f"WARNING: Required {required_states} state frames but only have {state_seq_length}")
         return False
 
-    # Check if we have enough image frames
-    max_required_img_idx = max(image_indices)
-    if max_required_img_idx >= image_seq_length:
+    # Check if we have the required image frames (0 and 8)
+    if image_seq_length <= max(image_indices):
         print(
-            f"WARNING: Required max image index {max_required_img_idx} exceeds available images {image_seq_length-1}")
+            f"WARNING: Required image indices {image_indices} exceed available images (0-{image_seq_length-1})")
         return False
 
     print("Dataset validation successful")
     return True
 
 
-def get_random_keyframe_config():
-    """Generate a random keyframe configuration with variable horizon length and adaptive keyframes."""
-    # Choose a random horizon length between 4 and 32
-    horizon = random.randint(4, 32)
-
-    # Select appropriate interpolation mode based on horizon length
-    if horizon <= 8:
-        mode = "dense"
-    elif horizon <= 16:
-        mode = "skip_even"
-    else:
-        mode = "sparse"
-
-    # Generate adaptive keyframes based on horizon length
-    keyframes = []
-
-    # Always include the horizon as the furthest keyframe
-    keyframes.append(horizon)
-
-    # For medium to long horizons, add intermediate keyframes
-    if horizon > 12:
-        # Add a midpoint keyframe
-        mid_point = horizon // 2
-        keyframes.append(mid_point)
-
-        # For very long horizons, add another intermediate point
-        if horizon > 24:
-            quarter_point = horizon // 4
-            keyframes.append(quarter_point)
-
-    # Sort keyframes to ensure they're in ascending order
-    keyframes.sort()
-
-    # Choose interpolation method with dynamic probability
-    # For longer horizons, favor cubic interpolation for smoother transitions
-    cubic_prob = 0.3  # Base probability
-    if horizon > 16:
-        cubic_prob = 0.5  # Increase probability for long horizons
-
-    interp_method = "cubic" if random.random() < cubic_prob else "linear"
-
-    return horizon, mode, keyframes, interp_method
+# Removed keyframe config generation since we're using direct state prediction
 
 
 def main():
@@ -105,17 +62,20 @@ def main():
         "action": features["action"]
     }
 
-    # Initial configuration (will be updated dynamically during training)
-    horizon, interpolation_mode, keyframe_indices, interp_method = get_random_keyframe_config()
+    # Simplified configuration without interpolation
+    # Fixed horizon of 8 frames for direct state prediction
+    horizon = 8
+    n_obs_steps = 1  # We'll use the current state (t=0) for conditioning
 
     cfg = DiffusionConfig(
         input_features=input_features,
         output_features=output_features,
-        interpolate_state=True,
+        interpolate_state=False,  # Don't use interpolation
         horizon=horizon,
-        interpolation_mode=interpolation_mode,
-        keyframe_indices=keyframe_indices,
-        interpolation_method=interp_method,
+        n_obs_steps=n_obs_steps,
+        # These parameters aren't used but set them to avoid defaults
+        keyframe_indices=[],
+        output_horizon=horizon
     )
 
     # --- Model ---
@@ -128,42 +88,28 @@ def main():
         cfg.input_features, cfg.normalization_mapping, dataset_metadata.stats)
 
     # --- Dataset ---
-    # Define keyframe indices and target indices for all possible configurations
-    # Standard keyframe indices for conditioning
-    keyframe_indices = [-1, 0]  # History keyframes
+    # Define simple indices for the dataset
 
-    # Add future keyframes for the largest possible horizon
-    max_horizon = 32
-    keyframe_indices.extend(list(range(1, max_horizon + 1)))
+    # State indices from 0 to 8
+    state_range = list(range(9))  # 0-8 inclusive
 
-    # For target indices, we need all possible indices that could be used
-    # by any interpolation mode for any horizon in the range 4-32
-    target_indices = list(range(max_horizon + 1))
+    # Image indices for observations
+    image_indices = [0, 1]  # Use only available image frames (0 and 1)
 
-    # Combine all indices and remove duplicates
-    all_state_indices = list(set(keyframe_indices + target_indices))
-    all_state_indices.sort()
+    # All state indices for validation
+    all_state_indices = state_range.copy()
 
-    # Create a range of state indices to request from the dataset
-    min_state_index = min(all_state_indices)
-    max_state_index = max(all_state_indices)
-    state_range = list(range(min_state_index, max_state_index + 1))
-
-    # For images, just use observation history images
-    image_indices = [-1, 0]
-
-    print(f"Using state indices range: {min_state_index} to {max_state_index}")
+    print(f"Using state range: {state_range}")
     print(f"Using image indices: {image_indices}")
 
     delta_timestamps = {
         "observation.image": [i / dataset_metadata.fps for i in image_indices],
         "observation.state": [i / dataset_metadata.fps for i in state_range],
-        "action": [i / dataset_metadata.fps for i in cfg.action_delta_indices],
     }
     # --- Optimizer & Dataloader ---
     dataset = LeRobotDataset(
         dataset_repo_id, delta_timestamps=delta_timestamps)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         diffusion_model.parameters(), lr=cfg.optimizer_lr)
     dataloader = torch.utils.data.DataLoader(
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
@@ -180,19 +126,12 @@ def main():
 
     while not done:
         for batch in dataloader:
-            # Randomly select configuration for this batch
-            batch_horizon, batch_mode, batch_keyframes, batch_interp_method = get_random_keyframe_config()
-
-            # Update the model configuration for this batch
-            diffusion_model.config.horizon = batch_horizon
-            diffusion_model.config.interpolation_mode = batch_mode
-            diffusion_model.config.keyframe_indices = batch_keyframes
-            diffusion_model.config.interpolation_method = batch_interp_method
+            # Using fixed horizon with direct state prediction
 
             # Only print config at the start and when logging
             if step % log_freq == 0:
                 print(
-                    f"Batch config: horizon={batch_horizon}, mode={batch_mode}, keyframes={batch_keyframes}, interp={batch_interp_method}")
+                    f"Using fixed horizon={horizon} with direct state prediction")
 
             # --- Normalize the batch and move to device ---
             norm_batch = normalize_inputs(batch)
@@ -202,6 +141,9 @@ def main():
                           for k, v in norm_batch.items()}
 
             # --- Compute Loss ---
+            # This will use the _compute_original_diffusion_loss method
+            # since interpolate_state=False in our config.
+            # It directly trains the model to predict states 1-8 given state 0
             loss = diffusion_model.compute_diffusion_loss(norm_batch)
 
             loss.backward()

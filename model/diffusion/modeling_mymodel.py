@@ -15,11 +15,7 @@ from model.diffusion.diffusion_modules import (
     DiffusionRgbEncoder,
     DiffusionTransformer,
 )
-from model.diffusion.interpolation_utils import (
-    linear_interpolate_states,
-    cubic_interpolate_states,
-    smart_interpolate_states,
-)
+# No longer need interpolation utils for direct state prediction
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.utils import (
@@ -506,156 +502,11 @@ class MyDiffusionModel(nn.Module):
         return global_cond
 
     def compute_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
-        """Computes the diffusion loss for interpolation.
-        Expects norm_batch to be a fully normalized batch containing keyframe states
-        at indices specified by keyframe_delta_indices.
+        """Computes the diffusion loss for direct state prediction.
+        Expects norm_batch to be a fully normalized batch containing state sequence (0-8).
         """
-        if not self.config.interpolate_state:
-            # Fall back to original behavior
-            return self._compute_original_diffusion_loss(norm_batch)
-
-        # --- Prepare Keyframe Conditioning Data ---
-        if "observation.state" not in norm_batch:
-            raise KeyError(
-                "Missing 'observation.state' in norm_batch for compute_diffusion_loss")
-
-        full_state_sequence = norm_batch["observation.state"]
-        # [-1, 0, 8, 16, 32]
-        keyframe_indices = self.config.keyframe_delta_indices
-
-        # Extract keyframe states (B, num_keyframes, D)
-        keyframe_states = []
-        max_idx = full_state_sequence.shape[1] - 1
-
-        for idx in keyframe_indices:
-            # Convert relative index to absolute index in the sequence
-            abs_idx = idx + self.config.n_obs_steps - 1  # Convert to 0-based indexing
-
-            # Clamp to valid range if out of bounds
-            if abs_idx < 0:
-                abs_idx = 0
-                print(
-                    f"Warning: Keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
-            elif abs_idx > max_idx:
-                abs_idx = max_idx
-                print(
-                    f"Warning: Keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
-
-            keyframe_states.append(
-                full_state_sequence[:, abs_idx:abs_idx+1, :])
-
-        keyframe_states = torch.cat(
-            keyframe_states, dim=1)  # (B, num_keyframes, D)
-
-        cond_batch = {"observation.state": keyframe_states}
-
-        # Handle keyframe images if available
-        if self.config.image_features and OBS_IMAGE in norm_batch:
-            image_sequence = norm_batch[OBS_IMAGE]
-            max_idx = image_sequence.shape[1] - 1
-            keyframe_images = []
-
-            # For images, only try to use observation history images (-1, 0)
-            # This avoids the "Image keyframe index 8 out of bounds" warnings
-            observation_indices = keyframe_indices[:self.config.n_obs_steps]
-
-            for idx in observation_indices:
-                abs_idx = idx + self.config.n_obs_steps - 1
-
-                # Clamp to valid range if out of bounds
-                if abs_idx < 0:
-                    abs_idx = 0
-                    print(
-                        f"Warning: Image keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to 0")
-                elif abs_idx > max_idx:
-                    abs_idx = max_idx
-                    print(
-                        f"Warning: Image keyframe index {idx} (abs_idx {abs_idx}) out of bounds, clamped to {max_idx}")
-
-                keyframe_images.append(image_sequence[:, abs_idx:abs_idx+1])
-
-            # Make sure we have n_obs_steps images for conditioning
-            if len(keyframe_images) < self.config.n_obs_steps:
-                # If we don't have enough keyframe images, duplicate the last one
-                last_image = keyframe_images[-1]
-                while len(keyframe_images) < self.config.n_obs_steps:
-                    keyframe_images.append(last_image)
-
-            cond_batch[OBS_IMAGE] = torch.cat(keyframe_images, dim=1)
-
-        # Calculate global conditioning from keyframes
-        global_cond = self._prepare_global_conditioning(cond_batch)
-
-        # --- Prepare Interpolation Targets ---
-        # Get target indices based on interpolation mode and horizon
-        target_indices = self.config.interpolation_target_indices
-
-        # Use improved interpolation for smoother results
-        # First, create time values for each keyframe
-        keyframe_times = torch.tensor(
-            keyframe_indices, device=full_state_sequence.device)
-        target_times = torch.tensor(
-            target_indices, device=full_state_sequence.device)
-
-        # Use smart interpolation based on config setting
-        interpolated_targets = smart_interpolate_states(
-            keyframe_states, keyframe_times, target_times,
-            method=self.config.interpolation_method)
-
-        # Use the interpolated states as clean targets
-        clean_targets = interpolated_targets
-
-        # Flatten targets for diffusion model: (B, output_horizon * D)
-        B, output_horizon, D = clean_targets.shape
-        clean_targets_flat = clean_targets.reshape(B, output_horizon * D)
-
-        device = clean_targets_flat.device
-
-        # --- Diffusion Process ---
-        noise = torch.randn(clean_targets_flat.shape, device=device)
-        timesteps = torch.randint(
-            low=0, high=self.noise_scheduler.config.num_train_timesteps,
-            size=(B,), device=device,
-        ).long()
-        noisy_targets = self.noise_scheduler.add_noise(
-            clean_targets_flat, noise, timesteps)
-
-        # --- Reshape noisy_targets to 3D for transformer ---
-        # DiffusionTransformer expects (B, T, D) but we have (B, T*D)
-        # Reshape to add the time dimension explicitly
-        noisy_targets_3d = noisy_targets.view(B, output_horizon, D)
-
-        # --- Transformer Prediction ---
-        pred = self.transformer(noisy_targets_3d, timesteps,
-                                global_cond=global_cond)
-
-        # Reshape prediction back to match target shape
-        pred = pred.reshape(B, output_horizon * D)
-
-        # --- Loss Calculation ---
-        if self.config.prediction_type == "epsilon":
-            target = noise
-        elif self.config.prediction_type == "sample":
-            target = clean_targets_flat
-        else:
-            raise ValueError(
-                f"Unsupported prediction type {self.config.prediction_type}")
-
-        diffusion_loss = F.mse_loss(pred, target, reduction="none")
-
-        # Optional: Mask loss based on padding
-        if self.config.do_mask_loss_for_padding and "action_is_pad" in norm_batch:
-            # Apply mask if available (simplified for interpolation case)
-            diffusion_loss = diffusion_loss.mean()
-        else:
-            diffusion_loss = diffusion_loss.mean()
-
-        return diffusion_loss
-
-    def _compute_original_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
-        """Original diffusion loss computation for backward compatibility."""
         n_obs_steps = self.config.n_obs_steps
-        horizon = self.config.horizon
+        horizon = self.config.horizon  # Should be 8 for our 0-8 sequence
 
         # --- Prepare Conditioning Data (History) ---
         if "observation.state" not in norm_batch:
@@ -663,66 +514,35 @@ class MyDiffusionModel(nn.Module):
                 "Missing 'observation.state' in norm_batch for compute_diffusion_loss")
 
         full_state_sequence = norm_batch["observation.state"]
-        # Ensure sequence is long enough for history
-        if full_state_sequence.shape[1] < n_obs_steps:
-            raise ValueError(
-                f"Full state sequence too short for history. Need {n_obs_steps}, got {full_state_sequence.shape[1]}")
-        # Shape (B, n_obs, D)
-        history_state = full_state_sequence[:, :n_obs_steps]
 
+        # Ensure sequence is long enough for state prediction (we need states 0-8)
+        if full_state_sequence.shape[1] < n_obs_steps + horizon:
+            raise ValueError(
+                f"Full state sequence too short. Need at least {n_obs_steps + horizon} frames, got {full_state_sequence.shape[1]}")
+
+        # Use first state(s) for conditioning: shape (B, n_obs, D)
+        history_state = full_state_sequence[:, :n_obs_steps]
         cond_batch = {"observation.state": history_state}
 
-        # Check for image history
-        if self.config.image_features:
-            if OBS_IMAGE in norm_batch:
-                image_history = norm_batch["observation.image"]
-                # Check if image sequence length matches n_obs_steps
-                if image_history.shape[1] != n_obs_steps:
-                    # If dataset loaded more images than needed (e.g., full sequence), slice here
-                    if image_history.shape[1] > n_obs_steps:
-                        print(
-                            f"Warning: Image sequence longer than n_obs_steps ({image_history.shape[1]} > {n_obs_steps}). Slicing.")
-                        cond_batch["observation.image"] = image_history[:,
-                                                                        :n_obs_steps]
-                    else:  # If shorter, it's an error
-                        raise ValueError(
-                            f"Image history length mismatch. Expected {n_obs_steps}, got {image_history.shape[1]}")
-                else:  # Length matches
-                    cond_batch["observation.image"] = image_history
-            else:
-                # If images configured but not in batch, print warning. global_cond will be smaller.
-                print(
-                    "Warning: image_features configured but 'observation.image' not found in norm_batch.")
-
-        # Add env state history if configured and present
-        if self.config.env_state_feature:
-            if OBS_ROBOT in norm_batch:
-                full_env_state = norm_batch[OBS_ROBOT]
-                if full_env_state.shape[1] < n_obs_steps:
-                    raise ValueError(
-                        f"Env state sequence too short for history. Need {n_obs_steps}, got {full_env_state.shape[1]}")
-                cond_batch[OBS_ROBOT] = full_env_state[:, :n_obs_steps]
+        # Handle image conditioning if available
+        if self.config.image_features and OBS_IMAGE in norm_batch:
+            image_sequence = norm_batch[OBS_IMAGE]
+            if image_sequence.shape[1] >= n_obs_steps:
+                # Use first and last image for conditioning
+                cond_batch[OBS_IMAGE] = image_sequence[:, :n_obs_steps]
             else:
                 print(
-                    f"Warning: env_state_feature configured but '{OBS_ROBOT}' not found in norm_batch.")
+                    f"Warning: Not enough image frames for conditioning. Expected at least {n_obs_steps}, got {image_sequence.shape[1]}")
 
-        # Calculate global_cond based on available history features in cond_batch
-        # This tensor's dimension MUST match the expected input dim of cond_embed layer
+        # Calculate global conditioning from history data
         global_cond = self._prepare_global_conditioning(cond_batch)
 
         # --- Prepare Target Data (Future States) ---
-        # Ensure sequence is long enough for target horizon starting after history
-        expected_target_end_idx = n_obs_steps + horizon
+        # For direct state prediction, we want to predict states 1-8 given state 0
+        # We take slices directly from the sequence
+        clean_targets = full_state_sequence[:, n_obs_steps:n_obs_steps+horizon]
 
-        clean_targets = full_state_sequence[:,
-                                            n_obs_steps-1:expected_target_end_idx-1, :]
-
-        if clean_targets.shape[1] != horizon:
-            # This check should be redundant if the length check above passes, but good for safety
-            raise ValueError(
-                f"Target state slicing failed. Expected horizon {horizon}, got {clean_targets.shape[1]}")
-
-        B = clean_targets.shape[0]
+        B, T, D = clean_targets.shape
         device = clean_targets.device
 
         # --- Diffusion Process ---
@@ -735,7 +555,6 @@ class MyDiffusionModel(nn.Module):
             clean_targets, noise, timesteps)
 
         # --- Transformer Prediction ---
-        # This is the likely point of failure if global_cond dimension is wrong
         pred = self.transformer(noisy_targets, timesteps,
                                 global_cond=global_cond)
 
@@ -750,23 +569,29 @@ class MyDiffusionModel(nn.Module):
 
         diffusion_loss = F.mse_loss(pred, target, reduction="none")
 
-        # Optional: Mask loss based on padding
+        # Calculate mean loss - masking is optional
         if self.config.do_mask_loss_for_padding and "action_is_pad" in norm_batch:
             padding_mask = norm_batch["action_is_pad"]
-            # Ensure padding mask has at least horizon length
-            if padding_mask.shape[1] < horizon:
-                raise ValueError(
-                    f"Padding mask too short. Expected {horizon}, got {padding_mask.shape[1]}")
-            # Select the part of the mask corresponding to the target horizon
-            mask = ~padding_mask[:, :horizon]  # Shape (B, H)
-            mask_expanded = mask.unsqueeze(-1).expand_as(diffusion_loss)
-            diffusion_loss = diffusion_loss * mask_expanded
-            # Normalize loss by number of unmasked elements
-            diffusion_loss = diffusion_loss.sum() / (mask_expanded.sum() + 1e-8)
+            if padding_mask.shape[1] >= horizon:
+                mask = ~padding_mask[:, :horizon]  # Shape (B, H)
+                mask_expanded = mask.unsqueeze(-1).expand_as(diffusion_loss)
+                diffusion_loss = diffusion_loss * mask_expanded
+                # Normalize loss by number of unmasked elements
+                diffusion_loss = diffusion_loss.sum() / (mask_expanded.sum() + 1e-8)
+            else:
+                diffusion_loss = diffusion_loss.mean()
         else:
-            diffusion_loss = diffusion_loss.mean()  # Original mean loss
+            diffusion_loss = diffusion_loss.mean()
 
         return diffusion_loss
+
+    def _compute_original_diffusion_loss(self, norm_batch: dict[str, Tensor]) -> Tensor:
+        """Original diffusion loss computation for backward compatibility.
+        This function is kept for compatibility but will not be used since
+        interpolate_state=False in our updated config.
+        """
+        # Simply call our main implementation
+        return self.compute_diffusion_loss(norm_batch)
 
     def compute_invdyn_loss(self, invdyn_batch: dict[str, Tensor], inv_dyn_model: MlpInvDynamic) -> Tensor:
         """Computes only the inverse dynamics loss. Moved here for consistency."""
