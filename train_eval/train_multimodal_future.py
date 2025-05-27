@@ -45,14 +45,8 @@ def parse_args():
     # Future prediction specific arguments
     parser.add_argument("--future_steps", type=int, default=8,
                         help="Number of steps into future to predict")
-    parser.add_argument("--use_gpt2_style", action="store_true", default=True,
-                        help="Whether to use GPT2-style architecture")
     parser.add_argument("--context_horizon", type=int, default=8,
                         help="Length of trajectory context used for prediction")
-    parser.add_argument("--multi_step", action="store_true", default=False,
-                        help="Whether to predict multiple future steps")
-    parser.add_argument("--num_future_steps", type=int, default=3,
-                        help="Number of future steps to predict if multi_step is enabled")
     parser.add_argument("--predict_uncertainty", action="store_true", default=False,
                         help="Whether to predict uncertainty in predictions")
 
@@ -115,11 +109,7 @@ def main():
     future_steps = args.future_steps
 
     # Total steps needed = context_horizon + future_steps
-    if args.multi_step and args.num_future_steps > 1:
-        total_horizon = context_horizon + \
-            max(future_steps, args.num_future_steps)
-    else:
-        total_horizon = context_horizon + future_steps
+    total_horizon = context_horizon + future_steps
 
     # Get state dimension
     state_dim = features["observation.state"].shape[0]
@@ -127,10 +117,6 @@ def main():
     print(f"Using state dimension: {state_dim}")
     print(f"Context horizon: {context_horizon}, Future steps: {future_steps}")
     print(f"Total horizon for dataset: {total_horizon}")
-
-    if args.multi_step:
-        print(
-            f"Multi-step prediction enabled with {args.num_future_steps} future steps")
 
     if args.predict_uncertainty:
         print("Uncertainty prediction enabled")
@@ -178,10 +164,7 @@ def main():
         dropout=0.1,
         use_layernorm=True,
         mlp_intermediate_factor=4,
-        use_gpt2_style=args.use_gpt2_style,
         future_steps=args.future_steps,
-        multi_step_prediction=args.multi_step,
-        num_future_steps=args.num_future_steps,
         predict_uncertainty=args.predict_uncertainty
     )
 
@@ -276,29 +259,12 @@ def main():
             generate_noise_this_step = generate_noise
             generate_noise = not generate_noise
 
-            # Make predictions
-            if args.multi_step:
-                # For multi-step prediction
-                predicted_states, predicted_future, state_uncertainties, output_uncertainty = model.predict_future_trajectory(
-                    context_states, current_image, generate_noise=generate_noise_this_step)
+            # Make predictions for single-step
+            predicted_states, predicted_future, state_uncertainties, output_uncertainty = model.predict_future_trajectory(
+                context_states, current_image, generate_noise=generate_noise_this_step)
 
-                # Target states depend on how many future steps we're predicting
-                if args.num_future_steps > future_states.shape[1]:
-                    # If we're predicting more steps than available, pad with the last state
-                    padding = args.num_future_steps - future_states.shape[1]
-                    last_state = future_states[:, -1:].expand(-1, padding, -1)
-                    padded_future_states = torch.cat(
-                        [future_states, last_state], dim=1)
-                    target_future_states = padded_future_states
-                else:
-                    target_future_states = future_states[:,
-                                                         :args.num_future_steps]
-            else:
-                # For single-step prediction
-                predicted_states, predicted_future, state_uncertainties, output_uncertainty = model.predict_future_trajectory(
-                    context_states, current_image, generate_noise=generate_noise_this_step)
-
-                target_future_states = future_states[:, -1]
+            # Target state is the last future state
+            target_future_states = future_states[:, -1]
 
             # Calculate losses
             total_loss = 0.0
@@ -308,37 +274,18 @@ def main():
             uncertainty_loss = None
 
             # State prediction is always enabled
-            if args.multi_step:
-                if args.predict_uncertainty and state_uncertainties is not None:
-                    uncertainty_loss = negative_log_likelihood_loss(
-                        predicted_states.reshape(
-                            B * args.num_future_steps, -1),
-                        target_future_states.reshape(
-                            B * args.num_future_steps, -1),
-                        state_uncertainties.reshape(
-                            B * args.num_future_steps, -1)
-                    )
-                    total_loss += uncertainty_loss
-                    metrics['uncertainty_losses'].append(
-                        uncertainty_loss.item())
-                else:
-                    state_loss = state_loss_fn(
-                        predicted_states, target_future_states)
-                    total_loss += state_loss
-                    metrics['state_losses'].append(state_loss.item())
+            if args.predict_uncertainty and state_uncertainties is not None:
+                uncertainty_loss = negative_log_likelihood_loss(
+                    predicted_states, target_future_states, state_uncertainties
+                )
+                total_loss += uncertainty_loss
+                metrics['uncertainty_losses'].append(
+                    uncertainty_loss.item())
             else:
-                if args.predict_uncertainty and state_uncertainties is not None:
-                    uncertainty_loss = negative_log_likelihood_loss(
-                        predicted_states, target_future_states, state_uncertainties
-                    )
-                    total_loss += uncertainty_loss
-                    metrics['uncertainty_losses'].append(
-                        uncertainty_loss.item())
-                else:
-                    state_loss = state_loss_fn(
-                        predicted_states, target_future_states)
-                    total_loss += state_loss
-                    metrics['state_losses'].append(state_loss.item())
+                state_loss = state_loss_fn(
+                    predicted_states, target_future_states)
+                total_loss += state_loss
+                metrics['state_losses'].append(state_loss.item())
 
             if predicted_future is not None:
                 if generate_noise_this_step:
