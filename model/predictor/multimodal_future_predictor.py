@@ -10,7 +10,8 @@ from model.predictor.gpt2_blocks import GPT2Block, GPT2MLP
 
 @dataclass
 class MultimodalFuturePredictorConfig:
-    """Configuration for MultimodalFuturePredictor - a transformer-based multimodal future prediction model"""
+    """Configuration for MultimodalFuturePredictor - a transformer-based multimodal future prediction model
+    that predicts future states and alternates between generating images and noise."""
     state_dim: int  # Dimension of state
     horizon: int    # Sequence length (time steps) for state trajectory
     hidden_dim: int = 768  # Hidden dimension for transformer layers
@@ -22,11 +23,7 @@ class MultimodalFuturePredictorConfig:
     use_gpt2_style: bool = True  # Whether to use GPT2-style architecture
 
     # Future prediction parameters
-    # Enable future prediction mode (default is now True)
-    predict_future: bool = True
     future_steps: int = 8  # Number of steps to predict into the future
-    predict_future_image: bool = True  # Whether to predict future images
-    predict_future_state: bool = True  # Whether to predict future states
     multi_step_prediction: bool = False  # Whether to predict multiple future steps
     # Number of future steps to predict if multi_step_prediction is True
     num_future_steps: int = 1
@@ -79,21 +76,26 @@ class MultimodalFuturePredictor(nn.Module):
     """
     GPT2-style Transformer-based model for multimodal future prediction.
 
-    Predicts future states and images based on current trajectory and image context.
+    Predicts future states, images and noise based on current trajectory and image context.
     Uses GPT2-style blocks with pre-normalization and residual connections instead of SwiGLU.
     Can predict single or multiple future steps with optional uncertainty estimation.
 
+    The model can alternate between generating images and noise during training,
+    which improves diversity and quality of generated outputs.
+
     Specifically designed to take an image at index 0 (current state) and predict 
-    an image at index 8 (future state).
+    either an image or noise at index 8 (future state).
 
     Input: 
         - trajectory_sequence: (B, H, D_state) tensor of state sequences
         - current_image: (B, C, H, W) tensor of current image at index 0
+        - generate_noise: Boolean flag to toggle between generating image or noise
+
     Output: Future predictions, depending on configuration:
         - future_state: (B, D_state) or (B, num_future_steps, D_state) - state at index 8
-        - future_image: (B, C, H, W) - future image at index 8 
-        - state_uncertainty: (B, D_state) or (B, num_future_steps, D_state)
-        - image_uncertainty: (B, C, H, W)
+        - future_output: (B, C, H, W) - future image or noise at index 8
+        - state_uncertainty: (B, D_state) or (B, num_future_steps, D_state) 
+        - output_uncertainty: (B, C, H, W)
     """
 
     def __init__(self, config: MultimodalFuturePredictorConfig):
@@ -103,6 +105,10 @@ class MultimodalFuturePredictor(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.use_image_context = True
         use_bias = False  # No bias in linear layers
+
+        # Always enable future prediction features
+        self.predict_future_state = True
+        self.predict_future_image = True
 
         # Image parameters for ViT-like processing
         self.patch_size = 16
@@ -176,46 +182,40 @@ class MultimodalFuturePredictor(nn.Module):
         )
 
         # Future prediction settings
-        self.predict_future = config.predict_future
         self.future_steps = config.future_steps
-        self.predict_future_image = config.predict_future_image
-        self.predict_future_state = config.predict_future_state
-        self.multi_step_prediction = getattr(
-            config, "multi_step_prediction", False)
-        self.num_future_steps = getattr(config, "num_future_steps", 1)
-        self.predict_uncertainty = getattr(
-            config, "predict_uncertainty", False)
+        self.multi_step_prediction = config.multi_step_prediction
+        self.num_future_steps = config.num_future_steps
+        self.predict_uncertainty = config.predict_uncertainty
 
-        # For future state prediction
-        if self.predict_future_state:
-            state_pred_hidden = config.hidden_dim // 2
+        # For future state prediction (always enabled)
+        state_pred_hidden = config.hidden_dim // 2
 
-            if self.multi_step_prediction:
-                # For multi-step prediction, output num_future_steps states
-                self.future_state_decoder = nn.Sequential(
-                    GPT2MLP(config.hidden_dim,
-                            hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
-                    nn.LayerNorm(
-                        config.hidden_dim) if config.use_layernorm else nn.Identity(),
-                    nn.Linear(config.hidden_dim,
-                              state_pred_hidden, bias=use_bias),
-                    nn.ReLU(),
-                    nn.Linear(state_pred_hidden,
-                              config.state_dim * self.num_future_steps, bias=use_bias)
-                )
-            else:
-                # Standard single-step prediction
-                self.future_state_decoder = nn.Sequential(
-                    GPT2MLP(config.hidden_dim,
-                            hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
-                    nn.LayerNorm(
-                        config.hidden_dim) if config.use_layernorm else nn.Identity(),
-                    nn.Linear(config.hidden_dim,
-                              state_pred_hidden, bias=use_bias),
-                    nn.ReLU(),
-                    nn.Linear(state_pred_hidden,
-                              config.state_dim, bias=use_bias)
-                )
+        if self.multi_step_prediction:
+            # For multi-step prediction, output num_future_steps states
+            self.future_state_decoder = nn.Sequential(
+                GPT2MLP(config.hidden_dim,
+                        hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
+                nn.LayerNorm(
+                    config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                nn.Linear(config.hidden_dim,
+                          state_pred_hidden, bias=use_bias),
+                nn.ReLU(),
+                nn.Linear(state_pred_hidden,
+                          config.state_dim * self.num_future_steps, bias=use_bias)
+            )
+        else:
+            # Standard single-step prediction
+            self.future_state_decoder = nn.Sequential(
+                GPT2MLP(config.hidden_dim,
+                        hidden_dim=self.mlp_hidden_dim, dropout=config.dropout),
+                nn.LayerNorm(
+                    config.hidden_dim) if config.use_layernorm else nn.Identity(),
+                nn.Linear(config.hidden_dim,
+                          state_pred_hidden, bias=use_bias),
+                nn.ReLU(),
+                nn.Linear(state_pred_hidden,
+                          config.state_dim, bias=use_bias)
+            )
 
             # Add uncertainty estimation head if enabled
             if self.predict_uncertainty:
@@ -281,6 +281,14 @@ class MultimodalFuturePredictor(nn.Module):
                           2 * self.in_channels)
             )
 
+            # Noise prediction head (always included)
+            self.noise_prediction_head = nn.Sequential(
+                nn.Linear(img_decoder_dim, img_decoder_dim),
+                nn.GELU(),
+                nn.Linear(img_decoder_dim, self.patch_size **
+                          2 * self.in_channels)
+            )
+
             # Add image uncertainty prediction if enabled
             if self.predict_uncertainty:
                 self.img_uncertainty_head = nn.Sequential(
@@ -291,6 +299,14 @@ class MultimodalFuturePredictor(nn.Module):
                     nn.Softplus()  # Ensure positive values for variance
                 )
 
+                # Noise uncertainty prediction (always included if using uncertainty)
+                self.noise_uncertainty_head = nn.Sequential(
+                    nn.Linear(img_decoder_dim, img_decoder_dim),
+                    nn.GELU(),
+                    nn.Linear(img_decoder_dim, self.patch_size **
+                              2 * self.in_channels),
+                    nn.Softplus()  # Ensure positive values for variance
+                )
         self._init_weights()
 
     def _init_weights(self):
@@ -304,6 +320,13 @@ class MultimodalFuturePredictor(nn.Module):
             nn.init.normal_(self.img_decoder_token, mean=0.0, std=0.02)
             nn.init.normal_(self.img_decoder_pos_embed, mean=0.0, std=0.02)
 
+            # Initialize noise prediction head
+            for m in self.noise_prediction_head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
         # Initialize uncertainty heads if present
         if self.predict_uncertainty:
             if hasattr(self, "state_uncertainty_head"):
@@ -315,6 +338,14 @@ class MultimodalFuturePredictor(nn.Module):
 
             if hasattr(self, "img_uncertainty_head"):
                 for m in self.img_uncertainty_head.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+
+            # Initialize noise uncertainty head
+            if hasattr(self, "noise_uncertainty_head"):
+                for m in self.noise_uncertainty_head.modules():
                     if isinstance(m, nn.Linear):
                         nn.init.xavier_uniform_(m.weight)
                         if m.bias is not None:
@@ -373,30 +404,31 @@ class MultimodalFuturePredictor(nn.Module):
         # Return attention-pooled representation
         return self.attention_pooler(img_features, mask=cls_only_mask)
 
-    def predict_future_trajectory(self, current_trajectory: torch.Tensor, current_image: torch.Tensor = None) -> tuple:
+    def predict_future_trajectory(self, current_trajectory: torch.Tensor, current_image: torch.Tensor = None, generate_noise: bool = False) -> tuple:
         """
         Predicts future state and image based on current trajectory and image.
+        Always supports alternating between predicting images and noise.
 
         Args:
             current_trajectory: (B, H_current, D_state) tensor of current state trajectory
             current_image: (B, C, H, W) tensor of current image at index 0 (current state)
+            generate_noise: Whether to generate noise instead of image
 
         Returns:
             tuple containing prediction outputs:
             - If multi_step_prediction=False (default):
-                (future_state, future_image, state_uncertainty, image_uncertainty)
-                - future_state: (B, D_state) tensor of predicted state at t+future_steps (state at index 8)
-                - future_image: (B, C, H, W) tensor of predicted image at index 8 (future state) or None
+                (future_state, future_output, state_uncertainty, output_uncertainty)
+                - future_state: (B, D_state) tensor of predicted state at t+future_steps 
+                - future_output: (B, C, H, W) tensor of predicted image or noise
                 - state_uncertainty: (B, D_state) tensor of predicted state uncertainty or None
-                - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
+                - output_uncertainty: (B, C, H, W) tensor of predicted uncertainty or None
 
             - If multi_step_prediction=True:
-                (future_states, future_image, state_uncertainties, image_uncertainty)
+                (future_states, future_output, state_uncertainties, output_uncertainty)
                 - future_states: (B, num_future_steps, D_state) tensor of predicted states
-                - future_image: (B, C, H, W) tensor of predicted image at index 8 or None
-                - state_uncertainties: (B, num_future_steps, D_state) tensor of predicted 
-                  state uncertainties or None
-                - image_uncertainty: (B, C, H, W) tensor of predicted image uncertainty or None
+                - future_output: (B, C, H, W) tensor of predicted image or noise
+                - state_uncertainties: (B, num_future_steps, D_state) tensor of predicted state uncertainties or None
+                - output_uncertainty: (B, C, H, W) tensor of predicted image/noise uncertainty or None
         """
         B, H, D = current_trajectory.shape
 
@@ -454,33 +486,35 @@ class MultimodalFuturePredictor(nn.Module):
         state_uncertainty = None
         image_uncertainty = None
 
-        # Predict future state if enabled
-        if self.predict_future_state:
-            if self.multi_step_prediction:
-                # For multi-step prediction
-                future_state_flat = self.future_state_decoder(pooled_output)
+        # Predict future state (always enabled)
+        if self.multi_step_prediction:
+            # For multi-step prediction
+            future_state_flat = self.future_state_decoder(pooled_output)
 
-                # Reshape to [B, num_future_steps, state_dim]
-                future_state = future_state_flat.view(
+            # Reshape to [B, num_future_steps, state_dim]
+            future_state = future_state_flat.view(
+                B, self.num_future_steps, self.state_dim)
+
+            # Predict uncertainty if enabled
+            if self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
+                state_uncertainty_flat = self.state_uncertainty_head(
+                    pooled_output)
+                state_uncertainty = state_uncertainty_flat.view(
                     B, self.num_future_steps, self.state_dim)
+        else:
+            # Standard single-step prediction
+            future_state = self.future_state_decoder(pooled_output)
 
-                # Predict uncertainty if enabled
-                if self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
-                    state_uncertainty_flat = self.state_uncertainty_head(
-                        pooled_output)
-                    state_uncertainty = state_uncertainty_flat.view(
-                        B, self.num_future_steps, self.state_dim)
-            else:
-                # Standard single-step prediction
-                future_state = self.future_state_decoder(pooled_output)
+            # Predict uncertainty if enabled
+            if self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
+                state_uncertainty = self.state_uncertainty_head(
+                    pooled_output)
 
-                # Predict uncertainty if enabled
-                if self.predict_uncertainty and hasattr(self, "state_uncertainty_head"):
-                    state_uncertainty = self.state_uncertainty_head(
-                        pooled_output)
+        # Predict future image or noise if current image is provided
+        if current_image is not None:
+            # Use generate_noise parameter directly
+            generate_noise_this_time = generate_noise
 
-        # Predict future image if enabled
-        if self.predict_future_image and current_image is not None:
             # Get image encoder memory
             B = current_image.shape[0]
 
@@ -517,40 +551,59 @@ class MultimodalFuturePredictor(nn.Module):
                 memory_mask=memory_mask
             )
 
-            # Skip the first token (condition token) and reconstruct patches
+            # Skip the first token (condition token)
             decoded_patches = decoded_patches[:, 1:, :]
 
             # Apply reconstruction head to get pixel values for each patch
-            patch_pixels = self.img_reconstruction_head(decoded_patches)
+            if generate_noise_this_time:
+                # Use noise prediction head
+                patch_pixels = self.noise_prediction_head(decoded_patches)
+            else:
+                # Use image reconstruction head
+                patch_pixels = self.img_reconstruction_head(decoded_patches)
+
             patch_pixels = patch_pixels.reshape(
                 B, self.num_patches, self.patch_size, self.patch_size, self.in_channels
             )
 
             # Rearrange to image
             patches_per_side = int(np.sqrt(self.num_patches))
-            future_image = patch_pixels.permute(0, 1, 4, 2, 3).reshape(
+            output_tensor = patch_pixels.permute(0, 1, 4, 2, 3).reshape(
                 B, self.in_channels,
                 patches_per_side * self.patch_size,
                 patches_per_side * self.patch_size
             )
 
-            # Apply tanh to normalize pixel values to [-1, 1]
-            future_image = torch.tanh(future_image)
+            # Apply tanh to normalize pixel values to [-1, 1] for images but not for noise
+            if not generate_noise_this_time:
+                output_tensor = torch.tanh(output_tensor)
+                future_image = output_tensor
+            else:
+                # For noise, we want values from a standard normal distribution
+                future_image = output_tensor  # This is actually noise now
 
-            # Predict image uncertainty if enabled
-            if self.predict_uncertainty and hasattr(self, "img_uncertainty_head"):
-                patch_uncertainties = self.img_uncertainty_head(
-                    decoded_patches)
-                patch_uncertainties = patch_uncertainties.reshape(
-                    B, self.num_patches, self.patch_size, self.patch_size, self.in_channels
-                )
+            # Predict uncertainty if enabled
+            if self.predict_uncertainty:
+                if generate_noise_this_time:
+                    # Use noise uncertainty head
+                    patch_uncertainties = self.noise_uncertainty_head(
+                        decoded_patches)
+                else:
+                    # Use image uncertainty head
+                    patch_uncertainties = self.img_uncertainty_head(
+                        decoded_patches)
 
-                # Rearrange to image
-                image_uncertainty = patch_uncertainties.permute(0, 1, 4, 2, 3).reshape(
-                    B, self.in_channels,
-                    patches_per_side * self.patch_size,
-                    patches_per_side * self.patch_size
-                )
+                if patch_uncertainties is not None:
+                    patch_uncertainties = patch_uncertainties.reshape(
+                        B, self.num_patches, self.patch_size, self.patch_size, self.in_channels
+                    )
+
+                    # Rearrange to image
+                    image_uncertainty = patch_uncertainties.permute(0, 1, 4, 2, 3).reshape(
+                        B, self.in_channels,
+                        patches_per_side * self.patch_size,
+                        patches_per_side * self.patch_size
+                    )
 
         # Return predictions and uncertainties
         return future_state, future_image, state_uncertainty, image_uncertainty

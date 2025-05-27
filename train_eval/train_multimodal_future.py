@@ -49,10 +49,6 @@ def parse_args():
                         help="Whether to use GPT2-style architecture")
     parser.add_argument("--context_horizon", type=int, default=8,
                         help="Length of trajectory context used for prediction")
-    parser.add_argument("--predict_image", action="store_true", default=True,
-                        help="Whether to predict future images")
-    parser.add_argument("--predict_state", action="store_true", default=True,
-                        help="Whether to predict future states")
     parser.add_argument("--multi_step", action="store_true", default=False,
                         help="Whether to predict multiple future steps")
     parser.add_argument("--num_future_steps", type=int, default=3,
@@ -97,6 +93,11 @@ def negative_log_likelihood_loss(pred, target, uncertainty):
 
 
 def main():
+    """
+    Train a MultimodalFuturePredictor that can generate future states, images, and noise.
+    The model alternates between generating images and noise during training,
+    which improves diversity and quality of generated outputs.
+    """
     args = parse_args()
     device = torch.device(args.device)
 
@@ -178,10 +179,7 @@ def main():
         use_layernorm=True,
         mlp_intermediate_factor=4,
         use_gpt2_style=args.use_gpt2_style,
-        predict_future=True,
         future_steps=args.future_steps,
-        predict_future_image=args.predict_image,
-        predict_future_state=args.predict_state,
         multi_step_prediction=args.multi_step,
         num_future_steps=args.num_future_steps,
         predict_uncertainty=args.predict_uncertainty
@@ -233,12 +231,16 @@ def main():
         'total_losses': [],
         'state_losses': [],
         'image_losses': [],
+        'noise_losses': [],
         'uncertainty_losses': [],
         'lr': []
     }
 
     pbar = tqdm(range(args.steps), desc="Training Future Predictor")
     step = 0
+
+    # Flag for alternating between noise and image generation
+    generate_noise = False
 
     # Main training loop
     while step < args.steps:
@@ -264,13 +266,21 @@ def main():
             target_future_image = images[:, 2]
 
             # Reset gradients
-            optimizer.zero_grad()
+            optimizer.zero_grad()            # Always do alternating noise-image generation
+            # Create noise target if generating noise this time
+            if generate_noise:
+                # Generate noise with the same shape as the target image
+                noise_target = torch.randn_like(target_future_image)
+
+            # Toggle for next iteration
+            generate_noise_this_step = generate_noise
+            generate_noise = not generate_noise
 
             # Make predictions
             if args.multi_step:
                 # For multi-step prediction
-                predicted_states, predicted_future_image, state_uncertainties, image_uncertainty = model.predict_future_trajectory(
-                    context_states, current_image)
+                predicted_states, predicted_future, state_uncertainties, output_uncertainty = model.predict_future_trajectory(
+                    context_states, current_image, generate_noise=generate_noise_this_step)
 
                 # Target states depend on how many future steps we're predicting
                 if args.num_future_steps > future_states.shape[1]:
@@ -285,8 +295,8 @@ def main():
                                                          :args.num_future_steps]
             else:
                 # For single-step prediction
-                predicted_states, predicted_future_image, state_uncertainties, image_uncertainty = model.predict_future_trajectory(
-                    context_states, current_image)
+                predicted_states, predicted_future, state_uncertainties, output_uncertainty = model.predict_future_trajectory(
+                    context_states, current_image, generate_noise=generate_noise_this_step)
 
                 target_future_states = future_states[:, -1]
 
@@ -294,73 +304,83 @@ def main():
             total_loss = 0.0
             state_loss = None
             image_loss = None
+            noise_loss = None
             uncertainty_loss = None
 
-            if args.predict_state:
-                if args.multi_step:
-                    if args.predict_uncertainty and state_uncertainties is not None:
-                        uncertainty_loss = negative_log_likelihood_loss(
-                            predicted_states.reshape(
-                                B * args.num_future_steps, -1),
-                            target_future_states.reshape(
-                                B * args.num_future_steps, -1),
-                            state_uncertainties.reshape(
-                                B * args.num_future_steps, -1)
-                        )
-                        total_loss += uncertainty_loss
-                        metrics['uncertainty_losses'].append(
-                            uncertainty_loss.item())
-                    else:
-                        state_loss = state_loss_fn(
-                            predicted_states, target_future_states)
-                        total_loss += state_loss
-                        metrics['state_losses'].append(state_loss.item())
-                else:
-                    if args.predict_uncertainty and state_uncertainties is not None:
-                        uncertainty_loss = negative_log_likelihood_loss(
-                            predicted_states, target_future_states, state_uncertainties
-                        )
-                        total_loss += uncertainty_loss
-                        metrics['uncertainty_losses'].append(
-                            uncertainty_loss.item())
-                    else:
-                        state_loss = state_loss_fn(
-                            predicted_states, target_future_states)
-                        total_loss += state_loss
-                        metrics['state_losses'].append(state_loss.item())
-
-            if args.predict_image and predicted_future_image is not None:
-                # Ensure target image is the same size as predicted
-                if target_future_image.shape != predicted_future_image.shape:
-                    target_future_image = torch.nn.functional.interpolate(
-                        target_future_image,
-                        size=predicted_future_image.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
+            # State prediction is always enabled
+            if args.multi_step:
+                if args.predict_uncertainty and state_uncertainties is not None:
+                    uncertainty_loss = negative_log_likelihood_loss(
+                        predicted_states.reshape(
+                            B * args.num_future_steps, -1),
+                        target_future_states.reshape(
+                            B * args.num_future_steps, -1),
+                        state_uncertainties.reshape(
+                            B * args.num_future_steps, -1)
                     )
-
-                # Normalize target image to match prediction range if using tanh
-                if target_future_image.min() >= 0 and target_future_image.max() <= 1:
-                    target_future_image = target_future_image * 2 - 1
-
-                if args.predict_uncertainty and image_uncertainty is not None:
-                    pred_img_flat = predicted_future_image.view(B, -1)
-                    target_img_flat = target_future_image.view(B, -1)
-                    img_uncertainty_flat = image_uncertainty.view(B, -1)
-
-                    img_uncertainty_loss = negative_log_likelihood_loss(
-                        pred_img_flat, target_img_flat, img_uncertainty_flat
-                    )
-                    img_loss_weight = 0.05
-                    total_loss += img_uncertainty_loss * img_loss_weight
+                    total_loss += uncertainty_loss
                     metrics['uncertainty_losses'].append(
-                        img_uncertainty_loss.item())
+                        uncertainty_loss.item())
                 else:
-                    image_loss = image_loss_fn(
-                        predicted_future_image, target_future_image)
-                    image_loss_weight = 0.1
-                    total_loss += image_loss * image_loss_weight
-                    metrics['image_losses'].append(image_loss.item())
+                    state_loss = state_loss_fn(
+                        predicted_states, target_future_states)
+                    total_loss += state_loss
+                    metrics['state_losses'].append(state_loss.item())
+            else:
+                if args.predict_uncertainty and state_uncertainties is not None:
+                    uncertainty_loss = negative_log_likelihood_loss(
+                        predicted_states, target_future_states, state_uncertainties
+                    )
+                    total_loss += uncertainty_loss
+                    metrics['uncertainty_losses'].append(
+                        uncertainty_loss.item())
+                else:
+                    state_loss = state_loss_fn(
+                        predicted_states, target_future_states)
+                    total_loss += state_loss
+                    metrics['state_losses'].append(state_loss.item())
+
+            if predicted_future is not None:
+                if generate_noise_this_step:
+                    # For noise prediction
+                    # We compare the predicted noise with randomly generated noise
+                    noise_loss = state_loss_fn(predicted_future, noise_target)
+                    noise_loss_weight = 0.1
+                    total_loss += noise_loss * noise_loss_weight
+                    metrics['noise_losses'].append(noise_loss.item())
+                else:
+                    # For image prediction
+                    # Ensure target image is the same size as predicted
+                    if target_future_image.shape != predicted_future.shape:
+                        target_future_image = torch.nn.functional.interpolate(
+                            target_future_image,
+                            size=predicted_future.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+
+                    # Normalize target image to match prediction range if using tanh
+                    if target_future_image.min() >= 0 and target_future_image.max() <= 1:
+                        target_future_image = target_future_image * 2 - 1
+
+                    if args.predict_uncertainty and output_uncertainty is not None:
+                        pred_img_flat = predicted_future.view(B, -1)
+                        target_img_flat = target_future_image.view(B, -1)
+                        img_uncertainty_flat = output_uncertainty.view(B, -1)
+
+                        img_uncertainty_loss = negative_log_likelihood_loss(
+                            pred_img_flat, target_img_flat, img_uncertainty_flat
+                        )
+                        img_loss_weight = 0.05
+                        total_loss += img_uncertainty_loss * img_loss_weight
+                        metrics['uncertainty_losses'].append(
+                            img_uncertainty_loss.item())
+                    else:
+                        image_loss = image_loss_fn(
+                            predicted_future, target_future_image)
+                        image_loss_weight = 0.1
+                        total_loss += image_loss * image_loss_weight
+                        metrics['image_losses'].append(image_loss.item())
 
             # Backprop and update
             total_loss.backward()
@@ -384,7 +404,7 @@ def main():
 
                 log_msg = f"Step {step}/{args.steps}: Total Loss={avg_total_loss:.4f}, LR={current_lr:.6f}"
 
-                if args.predict_state and len(metrics['state_losses']) > 0:
+                if len(metrics['state_losses']) > 0:
                     recent_state_losses = metrics['state_losses'][-min(
                         args.log_freq, len(metrics['state_losses'])):]
                     if recent_state_losses:
@@ -392,13 +412,21 @@ def main():
                             recent_state_losses) / len(recent_state_losses)
                         log_msg += f", State Loss={avg_state_loss:.4f}"
 
-                if args.predict_image and len(metrics['image_losses']) > 0:
+                if len(metrics['image_losses']) > 0:
                     recent_image_losses = metrics['image_losses'][-min(
                         args.log_freq, len(metrics['image_losses'])):]
                     if recent_image_losses:
                         avg_image_loss = sum(
                             recent_image_losses) / len(recent_image_losses)
                         log_msg += f", Image Loss={avg_image_loss:.4f}"
+
+                if len(metrics['noise_losses']) > 0:
+                    recent_noise_losses = metrics['noise_losses'][-min(
+                        args.log_freq, len(metrics['noise_losses'])):]
+                    if recent_noise_losses:
+                        avg_noise_loss = sum(
+                            recent_noise_losses) / len(recent_noise_losses)
+                        log_msg += f", Noise Loss={avg_noise_loss:.4f}"
 
                 if args.predict_uncertainty and len(metrics['uncertainty_losses']) > 0:
                     recent_uncertainty_losses = metrics['uncertainty_losses'][-min(
