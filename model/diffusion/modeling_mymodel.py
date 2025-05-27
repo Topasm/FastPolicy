@@ -408,7 +408,7 @@ class MyDiffusionModel(nn.Module):
                 f"{OBS_ROBOT} sequence length ({batch[OBS_ROBOT].shape[1]}) "
                 f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
             )
-        cond_state = batch[OBS_ROBOT][:, :n_obs_steps, :]
+        cond_state = batch[OBS_ROBOT][:, :n_obs_steps + 1, :]
         global_cond_feats = [cond_state]
 
         # Check if images are configured AND present in the batch before processing

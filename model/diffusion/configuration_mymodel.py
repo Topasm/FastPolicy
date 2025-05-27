@@ -90,7 +90,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2  # Always use states at -1, 0
-    horizon: int = 16  # Variable horizon (8, 16, or 32)
+    horizon: int = 8  # Variable horizon (8, 16, or 32)
     output_horizon: int = 8  # Always output 8 states
     n_action_steps: int = 8
 

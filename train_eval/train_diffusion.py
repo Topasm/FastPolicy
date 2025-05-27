@@ -9,36 +9,6 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 import numpy
 
 
-def validate_dataset_indices(dataloader, all_state_indices, image_indices):
-    """Validate that dataset has enough frames for the required indices."""
-    sample_batch = next(iter(dataloader))
-    state_seq_length = sample_batch["observation.state"].shape[1]
-    image_seq_length = sample_batch["observation.image"].shape[1]
-
-    print("\nDataset validation:")
-    print(f"State sequence shape: {sample_batch['observation.state'].shape}")
-    print(f"Image sequence shape: {sample_batch['observation.image'].shape}")
-
-    # Check if we have the required states (0-8)
-    required_states = 9  # We need states 0-8
-    if state_seq_length < required_states:
-        print(
-            f"WARNING: Required {required_states} state frames but only have {state_seq_length}")
-        return False
-
-    # Check if we have the required image frames (0 and 8)
-    if image_seq_length <= max(image_indices):
-        print(
-            f"WARNING: Required image indices {image_indices} exceed available images (0-{image_seq_length-1})")
-        return False
-
-    print("Dataset validation successful")
-    return True
-
-
-# Removed keyframe config generation since we're using direct state prediction
-
-
 def main():
     output_directory = Path("outputs/train/diffusion_only")
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -65,7 +35,8 @@ def main():
     # Simplified configuration without interpolation
     # Fixed horizon of 8 frames for direct state prediction
     horizon = 8
-    n_obs_steps = 1  # We'll use the current state (t=0) for conditioning
+    # We'll use the previous and current states (t-1, t=0) for conditioning
+    n_obs_steps = 2
 
     cfg = DiffusionConfig(
         input_features=input_features,
@@ -90,11 +61,10 @@ def main():
     # --- Dataset ---
     # Define simple indices for the dataset
 
-    # State indices from 0 to 8
-    state_range = list(range(9))  # 0-8 inclusive
+    # State indices from -1 to 8
+    state_range = list(range(-1, 9))  # -1 for t=0, 0-8 for t=1-8
 
-    # Image indices for observations
-    image_indices = [0, 1]  # Use only available image frames (0 and 1)
+    image_indices = [-1, 0, 8]  # Using only available image frames
 
     # All state indices for validation
     all_state_indices = state_range.copy()
@@ -115,11 +85,6 @@ def main():
         dataset, num_workers=4, batch_size=64, shuffle=True, pin_memory=device.type != "cpu", drop_last=True
     )
 
-    # Validate dataset has enough frames for the required indices
-    if not validate_dataset_indices(dataloader, all_state_indices, image_indices):
-        return  # Exit if validation fails
-
-    # --- Training Loop ---
     step = 0
     done = False
     print("Starting Diffusion Model Training...")
