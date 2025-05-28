@@ -62,14 +62,11 @@ def main():
         transformer_dim=512,
         transformer_num_layers=6,
         transformer_num_heads=8,
-        # Keep original parameters for compatibility
-        down_dims=(512, 512, 512),
-        kernel_size=5,
-        n_groups=8,
-        diffusion_step_embed_dim=128,
-        use_film_scale_modulation=True,
+        # Vision parameters
         vision_backbone="resnet18",
         spatial_softmax_num_keypoints=32,
+        # Disable state interpolation for direct action prediction
+        interpolate_state=False,
     )
 
     # Create and initialize the model
@@ -79,15 +76,16 @@ def main():
 
     # Setup delta timestamps for dataset
     # Use only the necessary states for conditioning (2 steps)
-    # and the horizon steps for action prediction
+    # and the full 16-frame horizon for asynchronous action prediction
     # Just the previous (-1) and current (0) states
     state_range = [-1, 0]
     image_indices = [-1, 0]  # Previous and current image frames
+    action_range = list(range(16))  # Full 16-frame action sequence
 
     delta_timestamps = {
         "observation.image": [i / dataset_metadata.fps for i in image_indices],
         "observation.state": [i / dataset_metadata.fps for i in state_range],
-        "action": [i / dataset_metadata.fps for i in range(horizon)],
+        "action": [i / dataset_metadata.fps for i in action_range],
     }
 
     # Create dataset and dataloader
@@ -107,7 +105,7 @@ def main():
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
 
     # Training loop
-    print("Starting RT-Diffusion Training...")
+    print("Starting Asynchronous RT-Diffusion Training...")
     step = 0
     done = False
 
@@ -117,18 +115,22 @@ def main():
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
                      for k, v in batch.items()}
 
-            # Compute loss
-            loss = policy(batch)
+            # Use asynchronous diffusion training
+            loss = policy.forward_async(batch)
 
             # Backprop and update
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             # Logging
             if step % log_freq == 0:
                 print(
-                    f"Step: {step}/{training_steps} | Loss: {loss.item():.4f}")
+                    f"Step: {step}/{training_steps} | Async Loss: {loss.item():.4f}")
 
             # Checkpointing
             if step % save_freq == 0 and step > 0:

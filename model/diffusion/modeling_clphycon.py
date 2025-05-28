@@ -163,6 +163,52 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         # Just return the loss directly for training
         return loss
 
+    def forward_async(self, batch: dict[str, Tensor]) -> Tensor:
+        """Run the batch through the model with asynchronous diffusion training."""
+        from model.diffusion.async_training import AsyncDiffusionTrainer
+
+        # Normalize inputs and targets
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)
+            batch["observation.images"] = torch.stack(
+                [batch[key] for key in self.config.image_features], dim=-4
+            )
+        batch = self.normalize_targets(batch)
+
+        # Prepare global conditioning
+        global_cond = self.diffusion._prepare_global_conditioning(batch)
+
+        # Extract 16-frame action sequence
+        actions = batch["action"]  # (B, horizon, action_dim)
+        if actions.shape[1] < 16:
+            raise ValueError(
+                f"Need at least 16 action frames for async training, got {actions.shape[1]}")
+
+        # Take first 16 frames as ground truth sequence
+        clean_sequence = actions[:, :16, :]  # (B, 16, action_dim)
+
+        # Initialize async trainer if not exists
+        if not hasattr(self, '_async_trainer'):
+            # Calculate safe parameters to stay within num_train_timesteps=100
+            # For horizon=16, gap=3: max_timestep = 19 + (16-1)*3 = 19 + 45 = 64 < 100 ✓
+            self._async_trainer = AsyncDiffusionTrainer(
+                # Low range for base timestep sampling (0-19)
+                gap_timesteps=20,
+                gap=3,             # Gap between consecutive timesteps
+                horizon=16         # 16-frame horizon
+            )
+
+        # Compute asynchronous diffusion loss
+        loss = self._async_trainer.compute_async_loss(
+            clean_sequence=clean_sequence,
+            denoising_model=self.diffusion.async_transformer,
+            noise_scheduler=self.diffusion.noise_scheduler,
+            global_cond=global_cond
+        )
+
+        return loss
+
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
     """
@@ -202,6 +248,14 @@ class DiffusionModel(nn.Module):
 
         # Replace UNet with DiffusionTransformer
         self.transformer = DiffusionTransformer(
+            config,
+            global_cond_dim=global_cond_dim_total,
+            output_dim=config.action_feature.shape[0]
+        )
+
+        # Also create an async-capable transformer
+        from model.diffusion.async_modules import DenoisingTransformer
+        self.async_transformer = DenoisingTransformer(
             config,
             global_cond_dim=global_cond_dim_total,
             output_dim=config.action_feature.shape[0]
