@@ -45,7 +45,7 @@ def main():
     }
 
     # Configuration for the diffusion model
-    horizon = 8
+    horizon = 16
     n_obs_steps = 2
 
     cfg = DiffusionConfig(
@@ -81,7 +81,7 @@ def main():
     # Use only the necessary states for conditioning (2 steps)
     # and the horizon steps for action prediction
     # Just the previous (-1) and current (0) states
-    state_range = list(range(-1, 1))
+    state_range = [-1, 0]
     image_indices = [-1, 0]  # Previous and current image frames
 
     delta_timestamps = {
