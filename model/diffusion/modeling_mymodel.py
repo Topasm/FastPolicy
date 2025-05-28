@@ -24,9 +24,6 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 
-from model.critic.multimodal_scorer import MultimodalTrajectoryScorer
-from model.invdynamics.invdyn import MlpInvDynamic
-
 
 class MYDiffusionPolicy(PreTrainedPolicy):
     """
@@ -79,20 +76,6 @@ class MYDiffusionPolicy(PreTrainedPolicy):
         # Instantiate the diffusion model (now using DiT)
         self.diffusion = MyDiffusionModel(config)
         # Instantiate MlpInvDynamic
-        self.inv_dyn_model = MlpInvDynamic(
-            o_dim=self.state_dim * 2,
-            a_dim=self.action_dim,
-            hidden_dim=self.config.inv_dyn_hidden_dim,
-            dropout=0.1,
-            use_layernorm=True,
-            out_activation=nn.Tanh(),
-        )
-        # Instantiate MultimodalTrajectoryScorer
-        self.critic_scorer = MultimodalTrajectoryScorer(
-            state_dim=self.state_dim,
-            horizon=config.horizon,
-            hidden_dim=config.critic_hidden_dim
-        )
 
         # Determine and store the device AFTER loading weights
         self.diffusion.to(config.device)
