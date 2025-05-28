@@ -26,10 +26,10 @@ def main():
     output_directory = Path("outputs/train/multimodal_autoregressive")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    training_steps = 30000
-    log_freq = 100
-    save_freq = 500
-    batch_size = 32
+    training_steps = 20000
+    log_freq = 200
+    save_freq = 5000
+    batch_size = 128
 
     # --- Dataset and Config Setup ---
     dataset_repo_id = "lerobot/pusht"

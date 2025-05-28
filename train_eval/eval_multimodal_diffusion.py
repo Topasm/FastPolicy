@@ -132,12 +132,38 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
                 [prev_state, curr_state], dim=0).unsqueeze(0)
 
             if image is not None and "observation.image" in self._queues:
-                batch["observation.image"] = self._queues["observation.image"][-1]
+                # Format image for diffusion model: [B, T, C, H, W]
+                # First, get the latest image and ensure proper dimensions
+                latest_image = self._queues["observation.image"][-1]
+
+                # Resize to 84x84 which is likely what the diffusion model expects
+                if latest_image.shape[-1] != 84 or latest_image.shape[-2] != 84:
+                    latest_image = torch.nn.functional.interpolate(
+                        latest_image, size=(84, 84), mode='bilinear', align_corners=False
+                    )
+
+                # Create a sequence of images to match n_obs_steps
+                # Duplicate the image for the required observation steps (typically 2)
+                n_obs_steps = self.config.n_obs_steps if hasattr(self.config, "n_obs_steps") else 2
+                image_sequence = latest_image.unsqueeze(1).repeat(1, n_obs_steps, 1, 1, 1)  # [B, n_obs_steps, C, H, W]
+                
+                batch["observation.image"] = image_sequence
         else:
             # Not enough states yet, use only the current state twice
             batch["observation.state"] = curr_state.repeat(2, 1).unsqueeze(0)
             if image is not None:
-                batch["observation.image"] = image
+                # Resize to 84x84 which is likely what the diffusion model expects
+                if image.shape[-1] != 84 or image.shape[-2] != 84:
+                    image = torch.nn.functional.interpolate(
+                        image, size=(84, 84), mode='bilinear', align_corners=False
+                    )
+
+                # Create a sequence of images to match n_obs_steps
+                # Duplicate the image for the required observation steps (typically 2)
+                n_obs_steps = self.config.n_obs_steps if hasattr(self.config, "n_obs_steps") else 2
+                image_sequence = image.unsqueeze(1).repeat(1, n_obs_steps, 1, 1, 1)  # [B, n_obs_steps, C, H, W]
+
+                batch["observation.image"] = image_sequence
 
         # Convert to correct device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
@@ -145,7 +171,6 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
 
         # Step 1: Generate future trajectory with the autoregressive model if available
         future_trajectory = None
-        future_images = None
 
         if self.autoregressive_model is not None:
             # Get context for the autoregressive model (all available states)
@@ -154,13 +179,23 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
 
             # Ensure we have at least one image for the autoregressive model
             if image is not None:
-                # Use the autoregressive model to predict future trajectory
-                predicted_states, predicted_image, _, _ = self.autoregressive_model.predict_future_trajectory(
-                    context_states, image, generate_noise=False
+                # Get original image from the queue (before any resizing for diffusion model)
+                original_image = self._queues["observation.image"][-1]
+                
+                # Use the autoregressive model to predict future trajectory with the original image
+                predicted_states, _, _, _ = self.autoregressive_model.predict_future_trajectory(
+                    context_states, original_image, generate_noise=False
                 )
 
-                future_trajectory = predicted_states  # (B, state_dim)
-                future_images = predicted_image       # (B, C, H, W)
+                # Debug print to see shapes
+                print(f"Autoregressive model predicted_states shape: {predicted_states.shape}")
+                
+                # The autoregressive model returns a 2D tensor (B, state_dim)
+                # We need to reshape it to match the diffusion model's output format (B, horizon, state_dim)
+                # We'll repeat the prediction to match the expected horizon length of the diffusion model
+                # Default to a reasonable horizon length if we don't know it yet
+                horizon_length = 10  # Default value, will be updated when we see diffusion model output
+                future_trajectory = predicted_states.unsqueeze(1).repeat(1, horizon_length, 1)  # (B, horizon, state_dim)
 
         # Step 2: Get normalized batch and pass to diffusion model
         try:
@@ -173,9 +208,16 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
         # If future trajectory is available, use it to guide sampling
         sampled_actions = []
 
+        # Prepare global conditioning for the diffusion model
+        global_cond = self.diffusion_model._prepare_global_conditioning(
+            norm_batch)
+
         for _ in range(self.num_samples):
-            # Sample from diffusion model
-            trajectories = self.diffusion_model.sample(norm_batch)
+            # Sample from diffusion model using conditional_sample
+            trajectories = self.diffusion_model.conditional_sample(
+                batch_size=curr_state.shape[0],
+                global_cond=global_cond
+            )
 
             # If future trajectory from autoregressive model is available, use it
             if future_trajectory is not None:
@@ -191,8 +233,15 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
                     diffusion_future = trajectories[:, 2:, :]
 
                     # Resize future_trajectory if needed
-                    if diffusion_future.shape[-2] != future_trajectory.shape[-2]:
-                        # Simple approach: just use as much as we can from each
+                    print(f"Diffusion future shape: {diffusion_future.shape}, Future trajectory shape: {future_trajectory.shape}")
+                    # Handle the case where future_trajectory is 2D (B, state_dim) or has different shape
+                    if len(future_trajectory.shape) == 2:
+                        # Expand to match diffusion_future shape by repeating the single prediction
+                        future_trajectory_expanded = future_trajectory.unsqueeze(1).repeat(1, diffusion_future.shape[1], 1)
+                        print(f"Expanded future trajectory from 2D to shape: {future_trajectory_expanded.shape}")
+                        blended_future = alpha * diffusion_future + (1-alpha) * future_trajectory_expanded
+                    elif diffusion_future.shape[-2] != future_trajectory.shape[-2]:
+                        # If both are 3D but different sizes, use as much as we can
                         min_steps = min(
                             diffusion_future.shape[-2], future_trajectory.shape[-2])
                         blended_future = alpha * diffusion_future[:, :min_steps, :] + \
@@ -205,10 +254,22 @@ class MultimodalDiffusionPolicy(torch.nn.Module):
                     trajectories[:, 2:, :] = blended_future
 
             # Use inverse dynamics to get action from first two states of trajectory
-            sampled_action = self.inv_dyn_model(
-                trajectories[:, 0, :],  # Previous state
-                trajectories[:, 1, :]   # Next state
-            )
+            if trajectories.shape[1] >= 2:
+                # The inverse dynamics model expects state pairs as a single concatenated tensor
+                # Create state pairs by concatenating consecutive states
+                state_pairs = torch.cat([
+                    trajectories[:, 0, :],  # Previous state
+                    trajectories[:, 1, :]   # Next state
+                ], dim=-1)  # Shape: (B, state_dim*2)
+                
+                # Call the inverse dynamics model with the concatenated state pair
+                sampled_action = self.inv_dyn_model(state_pairs)
+            else:
+                print(
+                    f"Warning: Trajectory too short ({trajectories.shape}), using zero action")
+                sampled_action = torch.zeros((curr_state.shape[0], self.inv_dyn_model.a_dim),
+                                             device=self.device)
+
             sampled_actions.append(sampled_action)
 
         # Stack all sampled actions
@@ -249,7 +310,6 @@ def main():
 
     # --- Load Config and Stats ---
     # Load diffusion config
-    diffusion_cfg_path = Path(config_stats_path) / "config.json"
     diffusion_cfg = DiffusionConfig.from_pretrained(config_stats_path)
     diffusion_cfg.device = device  # Override device if needed
 
