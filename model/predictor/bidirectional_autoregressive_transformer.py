@@ -7,7 +7,6 @@ This model implements the following pipeline:
 2. Generate forward states: st_0 → st_1 → ... → st_15
 3. Generate goal image: i_n from st_15
 4. Generate backward states: st_n → st_n-1 → ... → st_n-15
-5. Generate reconstructed initial latent that should match i_0's latent
 
 The model is trained autoregressively with proper causal masking.
 """
@@ -15,9 +14,10 @@ The model is trained autoregressively with proper causal masking.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
-import math
+import json  # Added for config saving
+from dataclasses import dataclass, asdict, field  # Ensure dataclass is imported
+from typing import Optional, Dict, Any
+from pathlib import Path
 
 
 @dataclass
@@ -33,9 +33,42 @@ class BidirectionalARTransformerConfig:
     image_channels: int = 3           # Number of image channels (RGB)
     image_size: int = 96              # Size of the input/output images
     image_latent_dim: int = 256       # Dimension of image latent representation
-    # Number of forward trajectory steps (st_0 to st_15)
     forward_steps: int = 16
-    backward_steps: int = 16          # Number of backward trajectory steps
+    backward_steps: int = 16
+    input_features: Dict[str, Any] = field(default_factory=dict)
+    output_features: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        def feature_to_dict(feat):
+            if hasattr(feat, 'to_dict'):
+                return feat.to_dict()
+            if hasattr(feat, '__dataclass_fields__'):  # Check if it's a dataclass
+                return asdict(feat)
+            return str(feat)
+
+        d = asdict(self)
+        # Ensure features are serializable
+        d["input_features"] = {k: feature_to_dict(
+            v) for k, v in self.input_features.items()}
+        d["output_features"] = {k: feature_to_dict(
+            v) for k, v in self.output_features.items()}
+        return d
+
+    def save_pretrained(self, output_dir: Path):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure path is a string for older python versions if json.dump requires it
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
+
+    @classmethod
+    def from_pretrained(cls, output_dir: Path):
+        config_path = Path(output_dir) / "config.json"
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+        # Deserialization of FeatureSpec might be needed here if they are complex
+        # For now, assume they are simple dicts or basic types after to_dict
+        return cls(**config_dict)
 
 
 class ImageEncoder(nn.Module):
@@ -164,7 +197,6 @@ class BidirectionalARTransformer(nn.Module):
     3. Generate forward trajectory: st_0 → st_1 → ... → st_15 (autoregressive)
     4. Generate goal image i_n from final state st_15
     5. Generate backward trajectory: st_n → st_n-1 → ... → st_n-15 (autoregressive)
-    6. Generate final latent that should reconstruct initial image i_0
     """
 
     def __init__(self, config: BidirectionalARTransformerConfig):
@@ -184,8 +216,8 @@ class BidirectionalARTransformer(nn.Module):
         self.token_type_embedding = nn.Embedding(3, config.hidden_dim)
 
         # Position embeddings for the full sequence
-        # We need positions for: 1 initial_image + 16 forward_states + 1 goal_image + 16 backward_states + 1 final_latent
-        max_seq_len = 1 + config.forward_steps + 1 + config.backward_steps + 1
+        # We need positions for: 1 initial_image + 16 forward_states + 1 goal_image + 16 backward_states
+        max_seq_len = 1 + config.forward_steps + 1 + config.backward_steps
         self.position_embedding = nn.Embedding(max_seq_len, config.hidden_dim)
 
         # Transformer layers
@@ -260,7 +292,6 @@ class BidirectionalARTransformer(nn.Module):
         Returns:
             Dictionary containing predicted states, images, and latents
         """
-        batch_size = initial_images.shape[0]
         device = initial_images.device
 
         # Encode initial image
@@ -319,11 +350,6 @@ class BidirectionalARTransformer(nn.Module):
             tokens.append(self.state_projection(backward_states[:, i]))
             token_types.append(1)  # state token
 
-        # 6. Final latent (target should be initial_image_latents)
-        # Use initial as target for reconstruction
-        tokens.append(self.image_latent_projection(initial_image_latents))
-        token_types.append(0)  # image token
-
         # Stack tokens
         sequence = torch.stack(tokens, dim=1)  # [B, seq_len, hidden_dim]
         seq_len = sequence.shape[1]
@@ -374,13 +400,6 @@ class BidirectionalARTransformer(nn.Module):
                                         backward_start:backward_start+self.config.backward_steps]
         results['predicted_backward_states'] = self.state_output_head(
             backward_hidden)
-
-        # Final latent prediction (last position)
-        final_hidden = hidden_states[:, -1:]  # [B, 1, hidden_dim]
-        results['predicted_final_latents'] = self.image_latent_output_head(
-            final_hidden.squeeze(1))
-        results['predicted_final_images'] = self.image_decoder(
-            results['predicted_final_latents'])
 
         return results
 
@@ -493,28 +512,6 @@ class BidirectionalARTransformer(nn.Module):
             tokens.append(self.state_projection(next_state))
             token_types.append(1)  # state token
 
-        # Generate final latent (should reconstruct initial image)
-        current_seq = torch.stack(tokens, dim=1)
-        current_len = current_seq.shape[1]
-
-        token_types_tensor = torch.tensor(
-            token_types, device=device).unsqueeze(0).expand(batch_size, -1)
-        type_embeddings = self.token_type_embedding(token_types_tensor)
-        current_seq = current_seq + type_embeddings
-
-        positions = torch.arange(current_len, device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        pos_embeddings = self.position_embedding(positions)
-        current_seq = current_seq + pos_embeddings
-
-        causal_mask = self._create_causal_mask(current_len, device)
-        hidden_states = self.transformer(src=current_seq, mask=causal_mask)
-
-        results['predicted_final_latents'] = self.image_latent_output_head(
-            hidden_states[:, -1])
-        results['predicted_final_images'] = self.image_decoder(
-            results['predicted_final_latents'])
-
         # Stack the lists into tensors
         if results['predicted_forward_states']:
             results['predicted_forward_states'] = torch.stack(
@@ -527,20 +524,20 @@ class BidirectionalARTransformer(nn.Module):
 
 
 def compute_loss(
+    model: 'BidirectionalARTransformer',
     predictions: Dict[str, torch.Tensor],
-    targets: Dict[str, torch.Tensor],
-    config: BidirectionalARTransformerConfig
+    targets: Dict[str, torch.Tensor]
 ) -> Dict[str, torch.Tensor]:
     """
     Compute comprehensive loss for the bidirectional autoregressive model.
 
     Args:
-        predictions: Model predictions
-        targets: Ground truth targets
-        config: Model configuration
+        model: The BidirectionalARTransformer model instance.
+        predictions: Model predictions.
+        targets: Ground truth targets.
 
     Returns:
-        Dictionary of losses
+        Dictionary of losses.
     """
     losses = {}
 
@@ -548,8 +545,8 @@ def compute_loss(
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         losses['forward_state_loss'] = F.mse_loss(
             predictions['predicted_forward_states'],
-            # Exclude last state as it becomes goal
-            targets['forward_states'][:, :-1]
+            # Ground truth for st_1 to st_{T-1}
+            targets['forward_states'][:, 1:]
         )
 
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
@@ -565,26 +562,29 @@ def compute_loss(
             targets['goal_images']
         )
 
-    if 'predicted_final_images' in predictions and 'initial_images' in targets:
-        losses['image_reconstruction_loss'] = F.mse_loss(
-            predictions['predicted_final_images'],
-            targets['initial_images']
-        )
-
     # Latent consistency losses
     if 'predicted_goal_latents' in predictions and 'goal_images' in targets:
-        # Encode goal images and compare latents
-        with torch.no_grad():
-            # This would need access to the image encoder - we'll compute this in the training loop
-            pass
+        with torch.no_grad():  # Ensure encoder is not trained on this reconstruction
+            goal_image_latents = model.image_encoder(targets['goal_images'])
+        losses['goal_latent_consistency_loss'] = F.mse_loss(
+            predictions['predicted_goal_latents'],
+            goal_image_latents
+        )
 
-    if 'predicted_final_latents' in predictions and 'initial_images' in targets:
-        # Latent should reconstruct initial image
-        # This is enforced by the image reconstruction loss above
-        pass
+    # Compute weighted total loss
+    weights = {
+        'forward_state_loss': 1.0,
+        'backward_state_loss': 1.0,
+        'goal_image_loss': 2.0,
+        'goal_latent_consistency_loss': 1.0,
+    }
 
-    # Total loss
-    total_loss = sum(losses.values())
+    total_loss = torch.tensor(
+        0.0, device=predictions[next(iter(predictions))].device)
+    for loss_name, loss_value in losses.items():
+        if loss_name in weights:  # only include weighted losses in the sum for total_loss
+            weight = weights.get(loss_name, 1.0)
+            total_loss += weight * loss_value
+
     losses['total_loss'] = total_loss
-
     return losses
