@@ -42,3 +42,4 @@ share/python-wheels/
 
 #nohup conda run --name rss python /home/ahrilab/Desktop/DraftLLM/traindiffusion.py > train.log 2>&1 &
 #nohup conda run --name rss python /home/ahrilab/Desktop/DraftLLM/train.py > train.log 2>&1 &
+nohup.out

@@ -332,13 +332,21 @@ class BidirectionalARTransformer(nn.Module):
         tokens.append(self.image_latent_projection(initial_image_latents))
         token_types.append(0)  # image token
 
-        # 2. Initial state
+        # 2. Initial state (st_0)
         tokens.append(self.state_projection(initial_states))
         token_types.append(1)  # state token
 
-        # 3. Forward trajectory states (st_1 to st_15)
-        for i in range(self.config.forward_steps - 1):
-            tokens.append(self.state_projection(forward_states[:, i]))
+        # 3. Forward trajectory states (st_1 to st_{F-1})
+        # forward_states contains [st_0, st_1, ..., st_{F-1}]
+        # We need to add tokens for st_1, ..., st_{F-1}
+        # This corresponds to (self.config.forward_steps - 1) states.
+        # Selects st_1, ..., st_{F-1}
+        future_forward_states_for_input = forward_states[:,
+                                                         1:self.config.forward_steps]
+        for i in range(self.config.forward_steps - 1):  # Loop F-1 times
+            # Add emb(st_1), ..., emb(st_{F-1})
+            tokens.append(self.state_projection(
+                future_forward_states_for_input[:, i]))
             token_types.append(1)  # state token
 
         # 4. Goal image latent
@@ -377,27 +385,28 @@ class BidirectionalARTransformer(nn.Module):
 
         # Extract predictions for different parts of the sequence
         results = {}
+        F = self.config.forward_steps  # e.g., 16 (st_0 ... st_{F-1})
+        B = self.config.backward_steps  # e.g., 16
 
-        # Forward states predictions (positions 2 to forward_steps)
-        # [B, forward_steps-1, hidden_dim]
-        forward_hidden = hidden_states[:, 2:2+self.config.forward_steps-1]
+        # Forward states predictions (st_1 to st_{F-1}, total F-1 states)
+        # Use hidden_states from emb(st_0) (idx 1) to emb(st_{F-2}) (idx F-1)
+        forward_hidden = hidden_states[:, 1:F]
         results['predicted_forward_states'] = self.state_output_head(
             forward_hidden)
 
-        # Goal image prediction (position forward_steps+1)
-        # [B, 1, hidden_dim]
-        goal_hidden = hidden_states[:, 1 +
-                                    self.config.forward_steps:1+self.config.forward_steps+1]
+        # Goal image prediction (i_{F-1})
+        # Use hidden_states from emb(st_{F-1}) (idx F)
+        goal_image_predictor_hidden = hidden_states[:, F]
         predicted_goal_latents = self.image_latent_output_head(
-            goal_hidden.squeeze(1))
+            goal_image_predictor_hidden)  # No squeeze needed as input is [B, H]
         results['predicted_goal_images'] = self.image_decoder(
             predicted_goal_latents)
         results['predicted_goal_latents'] = predicted_goal_latents
 
-        # Backward states predictions
-        backward_start = 2 + self.config.forward_steps
-        backward_hidden = hidden_states[:,
-                                        backward_start:backward_start+self.config.backward_steps]
+        # Backward states predictions (st'_{F-1} to st'_{F-B}, total B states)
+        # Use hidden_states from emb(i_{F-1}) (idx F+1) to emb(st'_{F-B+1}) (idx F+B)
+        # Note: st'_{F-B+1} is the (B-1)th backward state input token, which is bst_{B-2}
+        backward_hidden = hidden_states[:, F + 1: F + 1 + B]
         results['predicted_backward_states'] = self.state_output_head(
             backward_hidden)
 
