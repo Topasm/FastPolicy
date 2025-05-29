@@ -63,22 +63,28 @@ def q_sample(x_0: Tensor, timesteps: Tensor, noise_scheduler: DDPMScheduler, noi
     B, T, D = x_0.shape
     device = x_0.device
 
-    # Handle asynchronous timesteps - each frame has different noise level
-    noisy_samples = torch.zeros_like(x_0)
+    # Extract the alphas from the noise scheduler
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
-    for t_idx in range(T):
-        # Get timesteps for all samples at frame t_idx
-        t_frame = timesteps[:, t_idx]  # (B,)
+    # Flatten the timesteps tensor to index into the alphas
+    # timesteps is (B, T)
+    flat_timesteps = timesteps.reshape(-1).long()  # (B*T)
 
-        # Add noise for this frame across all samples
-        # Use the scheduler's add_noise method for each frame
-        x_0_frame = x_0[:, t_idx, :]  # (B, D)
-        noise_frame = noise[:, t_idx, :]  # (B, D)
+    # Get the appropriate alpha values for each timestep
+    flat_sqrt_alphas = sqrt_alphas_cumprod[flat_timesteps]  # (B*T)
+    # (B*T)
+    flat_sqrt_one_minus_alphas = sqrt_one_minus_alphas_cumprod[flat_timesteps]
 
-        # Add noise using scheduler
-        noisy_frame = noise_scheduler.add_noise(
-            x_0_frame, noise_frame, t_frame)
-        noisy_samples[:, t_idx, :] = noisy_frame
+    # Reshape to match the batch and time dimensions
+    sqrt_alphas = flat_sqrt_alphas.reshape(B, T, 1)  # (B, T, 1)
+    sqrt_one_minus_alphas = flat_sqrt_one_minus_alphas.reshape(
+        B, T, 1)  # (B, T, 1)
+
+    # Apply noise using vectorized operations
+    # x_t = sqrt(α_t) * x_0 + sqrt(1 - α_t) * ε
+    noisy_samples = sqrt_alphas * x_0 + sqrt_one_minus_alphas * noise
 
     return noisy_samples
 

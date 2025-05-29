@@ -102,7 +102,7 @@ def main():
     )
 
     # Create optimizer
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
 
     # Training loop
     print("Starting Asynchronous RT-Diffusion Training...")

@@ -1,169 +1,140 @@
-#!/usr/bin/env python
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import torch
+"""
+This script demonstrates how to evaluate a pretrained policy from the HuggingFace Hub or from your local
+training outputs directory. In the latter case, you might want to run examples/3_train_policy.py first.
+
+It requires the installation of the 'gym_pusht' simulation environment. Install it by running:
+```bash
+pip install -e ".[pusht]"
+```
+"""
+
 from pathlib import Path
-import numpy as np
-import safetensors.torch
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.policies.normalize import Normalize, Unnormalize
+import gym_pusht  # noqa: F401
+import gymnasium as gym
+import imageio
+import numpy
+import torch
 
-from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
-from model.invdynamics.invdyn import MlpInvDynamic
 
+# Create a directory to store the video of the evaluation
+output_directory = Path("outputs/eval/example_pusht_diffusion")
+output_directory.mkdir(parents=True, exist_ok=True)
 
-def evaluate_trajectory_continuity(model_path, num_samples=10):
-    """
-    Evaluate the continuity of generated trajectories.
-    Continuity is a key aspect of CL-DiffPhyCon's performance.
-    """
-    model_path = Path(model_path)
+# Select your device
+device = "cuda"
 
-    # Load config and stats
-    config = DiffusionConfig.from_pretrained(model_path)
-    with safetensors.safe_open(model_path / "stats.safetensors", framework="pt", device="cpu") as f:
-        stats = {k: f.get_tensor(k) for k in f.keys()}
+# Provide the [hugging face repo id](https://huggingface.co/lerobot/diffusion_pusht):
+pretrained_policy_path = "lerobot/diffusion_pusht"
+# OR a path to a local outputs/train folder.
+# pretrained_policy_path = Path("outputs/train/example_pusht_diffusion")
 
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+policy = CLDiffPhyConModel.from_pretrained(pretrained_policy_path)
 
-    # Load models
-    diffusion_model = CLDiffPhyConModel(config)
-    diff_state_dict = torch.load(
-        model_path / "diffusion_final.pth", map_location="cpu")
-    diffusion_model.load_state_dict(diff_state_dict)
-    diffusion_model.to(device)
-    diffusion_model.eval()
+# Initialize evaluation environment to render two observation types:
+# an image of the scene and state/position of the agent. The environment
+# also automatically stops running after 300 interactions/steps.
+env = gym.make(
+    "gym_pusht/PushT-v0",
+    obs_type="pixels_agent_pos",
+    max_episode_steps=300,
+)
 
-    inv_dyn_model = MlpInvDynamic(
-        o_dim=config.robot_state_feature.shape[0] * 2,
-        a_dim=config.action_feature.shape[0],
-        hidden_dim=config.inv_dyn_hidden_dim,
-        dropout=0.1,
-        use_layernorm=True,
-        out_activation=torch.nn.Tanh(),
-    )
-    inv_state_dict = torch.load(
-        model_path / "invdyn_final.pth", map_location="cpu")
-    inv_dyn_model.load_state_dict(inv_state_dict)
-    inv_dyn_model.to(device)
-    inv_dyn_model.eval()
+# We can verify that the shapes of the features expected by the policy match the ones from the observations
+# produced by the environment
+print(policy.config.input_features)
+print(env.observation_space)
 
-    # Create dataset
-    dataset_repo_id = "lerobot/pusht"  # Same dataset as training
-    dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
+# Similarly, we can check that the actions produced by the policy will match the actions expected by the
+# environment
+print(policy.config.output_features)
+print(env.action_space)
 
-    # State indices from -1 to 8
-    state_range = list(range(-1, 9))  # For n_obs_steps=2 and horizon=8
-    image_indices = [-1, 0, 8]
+# Reset the policy and environments to prepare for rollout
+policy.reset()
+numpy_observation, info = env.reset(seed=42)
 
-    delta_timestamps = {
-        "observation.image": [i / dataset_metadata.fps for i in image_indices],
-        "observation.state": [i / dataset_metadata.fps for i in state_range],
-        "action": [i / dataset_metadata.fps for i in range(config.horizon)],
+# Prepare to collect every rewards and all the frames of the episode,
+# from initial state to final state.
+rewards = []
+frames = []
+
+# Render frame of the initial state
+frames.append(env.render())
+
+step = 0
+done = False
+while not done:
+    # Prepare observation for the policy running in Pytorch
+    state = torch.from_numpy(numpy_observation["agent_pos"])
+    image = torch.from_numpy(numpy_observation["pixels"])
+
+    # Convert to float32 with image from channel first in [0,255]
+    # to channel last in [0,1]
+    state = state.to(torch.float32)
+    image = image.to(torch.float32) / 255
+    image = image.permute(2, 0, 1)
+
+    # Send data tensors from CPU to GPU
+    state = state.to(device, non_blocking=True)
+    image = image.to(device, non_blocking=True)
+
+    # Add extra (empty) batch dimension, required to forward the policy
+    state = state.unsqueeze(0)
+    image = image.unsqueeze(0)
+
+    # Create the policy input dictionary
+    observation = {
+        "observation.state": state,
+        "observation.image": image,
     }
 
-    eval_dataset = LeRobotDataset(
-        dataset_repo_id, delta_timestamps=delta_timestamps, split="val")
+    # Predict the next action with respect to the current observation
+    with torch.inference_mode():
+        action = policy.select_action(observation)
 
-    # Create normalizers
-    normalize_inputs = Normalize(
-        config.input_features, config.normalization_mapping, stats)
-    unnormalize_states = Unnormalize(
-        {"observation.state": config.robot_state_feature},
-        config.normalization_mapping,
-        stats
-    )
+    # Prepare the action for the environment
+    numpy_action = action.squeeze(0).to("cpu").numpy()
 
-    # Randomly sample episodes
-    episode_indices = np.random.choice(
-        len(eval_dataset), min(num_samples, len(eval_dataset)), replace=False)
+    # Step through the environment and receive a new observation
+    numpy_observation, reward, terminated, truncated, info = env.step(
+        numpy_action)
+    print(f"{step=} {reward=} {terminated=}")
 
-    # Setup plots
-    # Plot up to 4 dimensions
-    n_dims_to_plot = min(4, config.robot_state_feature.shape[0])
-    fig, axes = plt.subplots(num_samples, n_dims_to_plot,
-                             figsize=(16, 3*num_samples))
+    # Keep track of all the rewards and frames
+    rewards.append(reward)
+    frames.append(env.render())
 
-    # Evaluate continuity
-    continuity_errors = []
+    # The rollout is considered done when the success state is reached (i.e. terminated is True),
+    # or the maximum number of iterations is reached (i.e. truncated is True)
+    done = terminated | truncated | done
+    step += 1
 
-    for sample_idx, episode_idx in enumerate(episode_indices):
-        print(f"Evaluating episode {episode_idx}")
+if terminated:
+    print("Success!")
+else:
+    print("Failure!")
 
-        # Get episode data
-        episode = eval_dataset[episode_idx]
+# Get the speed of environment (i.e. its number of frames per second).
+fps = env.metadata["render_fps"]
 
-        # Normalize and move to device
-        norm_episode = normalize_inputs(
-            {k: v.unsqueeze(0) for k, v in episode.items()})
-        norm_episode = {k: v.to(device) for k, v in norm_episode.items()}
+# Encode all frames into a mp4 video.
+video_path = output_directory / "rollout.mp4"
+imageio.mimsave(str(video_path), numpy.stack(frames), fps=fps)
 
-        # Extract history for conditioning
-        n_obs = config.n_obs_steps
-        input_batch = {
-            "observation.state": norm_episode["observation.state"][:, :n_obs],
-            "observation.image": norm_episode["observation.image"][:, :n_obs] if "observation.image" in norm_episode else None
-        }
-        input_batch = {k: v for k, v in input_batch.items() if v is not None}
-
-        # State at t=0
-        current_state = norm_episode["observation.state"][:, n_obs-1]
-
-        # Generate trajectory with CL-DiffPhyCon
-        with torch.no_grad():
-            generated_states = diffusion_model.cl_phycon_inference(
-                input_batch,
-                current_state,
-                inv_dyn_model=inv_dyn_model,
-                num_samples=1,
-                return_trajectory=True
-            )
-
-        # Extract ground truth trajectory for comparison
-        gt_states = norm_episode["observation.state"][:,
-                                                      n_obs:n_obs+config.horizon]
-
-        # Unnormalize for visualization
-        gen_states_unnorm = unnormalize_states(
-            {"observation.state": generated_states.cpu()}
-        )["observation.state"].squeeze(0).numpy()
-
-        gt_states_unnorm = unnormalize_states(
-            {"observation.state": gt_states.cpu()}
-        )["observation.state"].squeeze(0).numpy()
-
-        # Calculate continuity error (first derivative discontinuity)
-        gen_diff = np.diff(gen_states_unnorm, axis=0)
-        continuity_error = np.max(np.abs(np.diff(gen_diff, axis=0)))
-        continuity_errors.append(continuity_error)
-
-        # Plot state trajectories
-        for dim in range(n_dims_to_plot):
-            ax = axes[sample_idx, dim] if num_samples > 1 else axes[dim]
-            ax.plot(gen_states_unnorm[:, dim], 'b-', label='Generated')
-            ax.plot(gt_states_unnorm[:, dim], 'g--', label='Ground Truth')
-            ax.set_title(f'State Dimension {dim}')
-            ax.legend()
-
-    plt.tight_layout()
-    plt.savefig(model_path / "trajectory_evaluation.png")
-
-    # Print continuity statistics
-    avg_continuity_error = np.mean(continuity_errors)
-    print(f"Average continuity error: {avg_continuity_error:.5f}")
-
-    # Save statistics
-    with open(model_path / "eval_metrics.txt", "w") as f:
-        f.write(f"Average continuity error: {avg_continuity_error:.5f}\n")
-
-    return avg_continuity_error
-
-
-if __name__ == "__main__":
-    model_path = "outputs/train/clphycon"
-    evaluate_trajectory_continuity(model_path, num_samples=5)
+print(f"Video of the evaluation is available in '{video_path}'.")

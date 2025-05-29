@@ -103,6 +103,139 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             self._queues["observation.environment_state"] = deque(
                 maxlen=self.config.n_obs_steps)
 
+#     def reset(self):
+#         """Clear observation and action queues. Should be called on `env.reset()`"""
+#         self._queues = {
+#             "observation.state": deque(maxlen=self.config.n_obs_steps),
+#             "action": deque(maxlen=self.config.n_action_steps), # 이 큐는 이제 CL-DiffPhyCon 방식에서는 다른 용도
+#         }
+#         if self.config.image_features:
+#             self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
+#         if self.config.env_state_feature:
+#             self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
+
+#         self._u_pred_async = None # 에피소드 시작 시 이전 예측 초기화
+#         # self._action_queue_for_execution = deque(maxlen=self.config.n_action_steps) # 필요하다면 별도 큐
+
+    # def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    #     """Select action using CL-DiffPhyCon asynchronous inference."""
+    #     device = get_device_from_parameters(self)  # policy.device 대신 사용
+
+    #     # 1. 입력 정규화 및 현재 관찰 준비
+    #     normalized_batch_obs_only = {}
+    #     # 현재 관찰만 사용 (batch는 현재 스텝의 관찰만 포함한다고 가정)
+    #     for k_in, k_out in self.config.input_features.items():
+    #         if k_in in batch:  # Check if the key from config exists in the batch
+    #             normalized_batch_obs_only[k_out] = batch[k_in]  # Use mapping
+    #         # else: # Handle missing keys if necessary, e.g. if state/image is optional
+    #         #    print(f"Warning: Key {k_in} not found in current observation batch for select_action")
+
+    #     normalized_batch_obs_only = self.normalize_inputs(
+    #         normalized_batch_obs_only)
+
+    #     if self.config.image_features:
+    #         # input_features에 정의된 이미지 키들을 사용해야 함
+    #         # 예: "observation.image_rgb", "observation.image_depth"
+    #         # self.config.image_features는 단순 리스트가 아니라 Dict[str, FeatureSpec] 일 수 있음
+
+    #         # 가정: self.config.image_features가 ["observation.image"] 형태의 키 리스트라고 가정
+    #         # 실제로는 config.input_features 에서 image 관련 키들을 찾아야 함
+    #         img_keys_in_batch = [
+    #             k for k in normalized_batch_obs_only if "image" in k]  # 더 정확한 로직 필요
+    #         if img_keys_in_batch:
+    #             normalized_batch_obs_only["observation.images"] = torch.stack(
+    #                 [normalized_batch_obs_only[key] for key in img_keys_in_batch], dim=-4
+    #             )
+
+    #     # populate_queues는 n_obs_steps 만큼의 히스토리를 만드는데 사용됨.
+    #     # CL-DiffPhyCon은 현재 관찰 s_k를 사용하므로, 이 부분은 config.n_obs_steps=1 일때 간단해짐.
+    #     # n_obs_steps > 1 이면, populate_queues로 히스토리 관찰을 만들고,
+    #     # _prepare_global_conditioning에 전달.
+    #     self._queues = populate_queues(
+    #         self._queues, normalized_batch_obs_only)  # 현재 관찰을 큐에 추가/업데이트
+
+    #     current_stacked_obs_batch = {
+    #         # OBS_ROBOT, "observation.images" 등을 큐에서 가져와 스택
+    #         k: torch.stack(list(self._queues[k]), dim=1)
+    #         for k in self.config.input_features  # self._queues에 있는 키만 사용
+    #         if k in self._queues and len(self._queues[k]) > 0
+    #     }
+
+    #     if not current_stacked_obs_batch:  # 초기 스텝, 큐가 비어있을 수 있음
+    #         print(
+    #             "Warning: current_stacked_obs_batch is empty in select_action. Using raw batch.")
+    #         # 이 경우, batch에서 직접 global_cond를 만들어야 함 (n_obs_steps=1 이라고 가정)
+    #         # 또는 populate_queues가 최소 1개의 데이터를 보장하도록 해야 함
+    #         temp_global_cond_input = {}
+    #         if OBS_ROBOT in normalized_batch_obs_only:
+    #              temp_global_cond_input[OBS_ROBOT] = normalized_batch_obs_only[OBS_ROBOT].unsqueeze(
+    #                  1)  # Add sequence dim
+    #          if "observation.images" in normalized_batch_obs_only:  # 이미 stack 되어있다고 가정
+    #              temp_global_cond_input["observation.images"] = normalized_batch_obs_only["observation.images"].unsqueeze(
+    #                  1)  # Add sequence dim
+    #          # ... 기타 환경 상태 등 ...
+    #          if not temp_global_cond_input:
+    #              raise ValueError(
+    #                  "Cannot prepare global_cond, not enough observation data.")
+    #          global_cond = self.diffusion._prepare_global_conditioning(
+    #              temp_global_cond_input)
+    #     else:
+    #         global_cond = self.diffusion._prepare_global_conditioning(
+    #             current_stacked_obs_batch)
+
+    #     # 2. 비동기 추론 로직
+    #     if self._u_pred_async is None:
+    #         # 초기화 단계: 표준 동기 샘플링 (ddpm_init 역할)
+    #         # self.diffusion.transformer (동기 모델) 사용
+    #         print(f"[{self.__class__.__name__}] Generating initial plan (sync)...")
+    #         # conditional_sample은 정규화된 액션을 반환한다고 가정
+    #         current_plan_normalized = self.diffusion.conditional_sample(
+    #             batch_size=global_cond.shape[0],
+    #             global_cond=global_cond
+    #         )  # (B, 16, action_dim)
+    #     else:
+    #         # 피드백 단계: 비동기 샘플링 (ddpm_feedback 역할)
+    #         # self.diffusion.async_transformer 사용
+    #         print(f"[{self.__class__.__name__}] Updating plan (async)...")
+
+    #         # current_input_normalized 준비:
+    #         # 현재 실제 상태 (u_init)와 이전 예측의 뒷부분 (u_pred_shifted)을 결합해야 함.
+    #         # u_init은 current_stacked_obs_batch에서 파생될 수 있으나, 액션 차원으로 변환 필요.
+    #         # 또는, CL-DiffPhyCon 논문처럼 u_pred를 그대로 사용하고,
+    #         # DenoisingTransformer가 global_cond (현재 상태 s_k)를 통해 현재 상태를 반영하도록 함.
+    #         # 여기서는 후자를 가정. u_pred를 바로 current_input_normalized로 사용.
+
+    #         current_plan_normalized = self.diffusion.async_conditional_sample(
+    #             current_input_normalized=self._u_pred_async,  # 이전 스텝의 정규화된 예측
+    #             global_cond=global_cond,  # 현재 관찰 기반의 global_cond
+    #             # async_t_seq_func, gap_timesteps 등은 async_conditional_sample 내부에서 처리되거나 config에서 가져옴
+    #         )
+
+    #     # 3. 다음 스텝을 위한 _u_pred_async 업데이트 (롤링/쉬프팅)
+    #     #   다음 u_pred는 현재 plan에서 한 스텝 밀린 것.
+    #     #   [p1, p2, ..., p16] -> 다음 u_pred는 [p2, ..., p16, new_noisy_frame] 형태
+    #     next_u_pred = torch.zeros_like(current_plan_normalized, device=device)
+    #     next_u_pred[:, :-1, :] = current_plan_normalized[:, 1:, :]
+    #     # 마지막 프레임은 새롭게 노이즈를 추가하거나, 0으로 채우거나, 복제할 수 있음.
+    #     # 가장 간단하게는 이전 프레임 복제 또는 0으로 채우기.
+    #     # 또는 약간의 노이즈 추가:
+    #     next_u_pred[:, -1,
+    #                 :] = torch.randn_like(next_u_pred[:, -1, :]) * 0.1  # 예시
+    #     # 아니면 그냥 마지막것 복사: next_u_pred[:, -1, :] = current_plan_normalized[:, -1, :]
+    #     self._u_pred_async = next_u_pred
+
+    #     # 4. 실제 환경에 적용할 액션 추출 및 비정규화
+    #     # 현재 plan (current_plan_normalized)에서 첫 번째 액션을 사용
+    #     # (B, action_dim)
+    #     action_normalized_to_execute = current_plan_normalized[:, 0, :]
+
+    #     action_unnormalized = self.unnormalize_outputs(
+    #         # config.output_features에 "action" 키가 있다고 가정
+    #         {"action": action_normalized_to_execute}
+    #     )["action"]
+
+    #     return action_unnormalized
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -654,218 +787,3 @@ class DiffusionSinusoidalPosEmb(nn.Module):
         emb = x.unsqueeze(-1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
-
-
-class DiffusionConv1dBlock(nn.Module):
-    """Conv1d --> GroupNorm --> Mish"""
-
-    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
-        super().__init__()
-
-        self.block = nn.Sequential(
-            nn.Conv1d(inp_channels, out_channels,
-                      kernel_size, padding=kernel_size // 2),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.Mish(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class DiffusionConditionalUnet1d(nn.Module):
-    """A 1D convolutional UNet with FiLM modulation for conditioning.
-
-    Note: this removes local conditioning as compared to the original diffusion policy code.
-    """
-
-    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
-        super().__init__()
-
-        self.config = config
-
-        # Encoder for the diffusion timestep.
-        self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
-            nn.Linear(config.diffusion_step_embed_dim,
-                      config.diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(config.diffusion_step_embed_dim *
-                      4, config.diffusion_step_embed_dim),
-        )
-
-        # The FiLM conditioning dimension.
-        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
-
-        # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
-        # just reverse these.
-        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
-            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
-        )
-
-        # Unet encoder.
-        common_res_block_kwargs = {
-            "cond_dim": cond_dim,
-            "kernel_size": config.kernel_size,
-            "n_groups": config.n_groups,
-            "use_film_scale_modulation": config.use_film_scale_modulation,
-        }
-        self.down_modules = nn.ModuleList([])
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (len(in_out) - 1)
-            self.down_modules.append(
-                nn.ModuleList(
-                    [
-                        DiffusionConditionalResidualBlock1d(
-                            dim_in, dim_out, **common_res_block_kwargs),
-                        DiffusionConditionalResidualBlock1d(
-                            dim_out, dim_out, **common_res_block_kwargs),
-                        # Downsample as long as it is not the last block.
-                        nn.Conv1d(dim_out, dim_out, 3, 2,
-                                  1) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        # Processing in the middle of the auto-encoder.
-        self.mid_modules = nn.ModuleList(
-            [
-                DiffusionConditionalResidualBlock1d(
-                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
-                ),
-                DiffusionConditionalResidualBlock1d(
-                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
-                ),
-            ]
-        )
-
-        # Unet decoder.
-        self.up_modules = nn.ModuleList([])
-        for ind, (dim_out, dim_in) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= (len(in_out) - 1)
-            self.up_modules.append(
-                nn.ModuleList(
-                    [
-                        # dim_in * 2, because it takes the encoder's skip connection as well
-                        DiffusionConditionalResidualBlock1d(
-                            dim_in * 2, dim_out, **common_res_block_kwargs),
-                        DiffusionConditionalResidualBlock1d(
-                            dim_out, dim_out, **common_res_block_kwargs),
-                        # Upsample as long as it is not the last block.
-                        nn.ConvTranspose1d(
-                            dim_out, dim_out, 4, 2, 1) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        self.final_conv = nn.Sequential(
-            DiffusionConv1dBlock(
-                config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
-            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
-        )
-
-    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
-        """
-        Args:
-            x: (B, T, input_dim) tensor for input to the Unet.
-            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
-            global_cond: (B, global_cond_dim)
-            output: (B, T, input_dim)
-        Returns:
-            (B, T, input_dim) diffusion model prediction.
-        """
-        # For 1D convolutions we'll need feature dimension first.
-        x = einops.rearrange(x, "b t d -> b d t")
-
-        timesteps_embed = self.diffusion_step_encoder(timestep)
-
-        # If there is a global conditioning feature, concatenate it to the timestep embedding.
-        if global_cond is not None:
-            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
-        else:
-            global_feature = timesteps_embed
-
-        # Run encoder, keeping track of skip features to pass to the decoder.
-        encoder_skip_features: list[Tensor] = []
-        for resnet, resnet2, downsample in self.down_modules:
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            encoder_skip_features.append(x)
-            x = downsample(x)
-
-        for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
-
-        # Run decoder, using the skip features from the encoder.
-        for resnet, resnet2, upsample in self.up_modules:
-            x = torch.cat((x, encoder_skip_features.pop()), dim=1)
-            x = resnet(x, global_feature)
-            x = resnet2(x, global_feature)
-            x = upsample(x)
-
-        x = self.final_conv(x)
-
-        x = einops.rearrange(x, "b d t -> b t d")
-        return x
-
-
-class DiffusionConditionalResidualBlock1d(nn.Module):
-    """ResNet style 1D convolutional block with FiLM modulation for conditioning."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        cond_dim: int,
-        kernel_size: int = 3,
-        n_groups: int = 8,
-        # Set to True to do scale modulation with FiLM as well as bias modulation (defaults to False meaning
-        # FiLM just modulates bias).
-        use_film_scale_modulation: bool = False,
-    ):
-        super().__init__()
-
-        self.use_film_scale_modulation = use_film_scale_modulation
-        self.out_channels = out_channels
-
-        self.conv1 = DiffusionConv1dBlock(
-            in_channels, out_channels, kernel_size, n_groups=n_groups)
-
-        # FiLM modulation (https://arxiv.org/abs/1709.07871) outputs per-channel bias and (maybe) scale.
-        cond_channels = out_channels * 2 if use_film_scale_modulation else out_channels
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(), nn.Linear(cond_dim, cond_channels))
-
-        self.conv2 = DiffusionConv1dBlock(
-            out_channels, out_channels, kernel_size, n_groups=n_groups)
-
-        # A final convolution for dimension matching the residual (if needed).
-        self.residual_conv = (
-            nn.Conv1d(in_channels, out_channels,
-                      1) if in_channels != out_channels else nn.Identity()
-        )
-
-    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, in_channels, T)
-            cond: (B, cond_dim)
-        Returns:
-            (B, out_channels, T)
-        """
-        out = self.conv1(x)
-
-        # Get condition embedding. Unsqueeze for broadcasting to `out`, resulting in (B, out_channels, 1).
-        cond_embed = self.cond_encoder(cond).unsqueeze(-1)
-        if self.use_film_scale_modulation:
-            # Treat the embedding as a list of scales and biases.
-            scale = cond_embed[:, : self.out_channels]
-            bias = cond_embed[:, self.out_channels:]
-            out = scale * out + bias
-        else:
-            # Treat the embedding as biases.
-            out = out + cond_embed
-
-        out = self.conv2(out)
-        out = out + self.residual_conv(x)
-        return out
