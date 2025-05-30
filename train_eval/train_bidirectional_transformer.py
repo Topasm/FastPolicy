@@ -21,7 +21,7 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformerConfig,
     compute_loss  # Import the consolidated loss function
 )
-from model.bidirectional_dataset import BidirectionalTrajectoryDataset
+from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
 
 
 def main():
