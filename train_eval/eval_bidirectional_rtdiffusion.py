@@ -109,14 +109,15 @@ def main():
 
     # --- Load RT-Diffusion Model ---
     # Load configuration by directly reading the JSON and instantiating DiffusionConfig
-    rtdiff_config_json_path = rtdiff_output_dir / "config.json"
+    rtdiff_config_json_path = rtdiff_output_dir / \
+        "config.json"  # config.json 경로 확인은 유지
     if not rtdiff_config_json_path.is_file():
         raise OSError(
             f"RT-Diffusion config JSON not found at {rtdiff_config_json_path}")
     print(
-        f"Loading RT-Diffusion configuration from: {rtdiff_config_json_path}")
-    rtdiff_config_data = json.loads(rtdiff_config_json_path.read_text())
-    rtdiff_config = DiffusionConfig(**rtdiff_config_data)
+        f"Loading RT-Diffusion configuration from directory: {rtdiff_output_dir}")
+    # from_pretrained 메서드를 사용하여 설정 로드
+    rtdiff_config = DiffusionConfig.from_pretrained(rtdiff_output_dir)
     # rtdiff_config.device = device # DiffusionConfig might not have a device attribute, model is moved to device later
 
     # Create model instance

@@ -190,6 +190,66 @@ class CLDiffPhyConModel(PreTrainedPolicy):
 
         return action_sequence
 
+    @torch.no_grad()
+    def select_action(
+        self,
+        observation: dict[str, Tensor],
+        episode_return: Optional[float] = None,
+        episode_step: Optional[int] = None,
+        training_progress: Optional[float] = None,
+        deterministic: bool = False,
+    ) -> Tensor:  # 반환 타입은 실제 반환하는 것에 맞게 조정할 수 있으나, Tensor로 우선 둡니다.
+        """Select action for evaluation (when used as a standalone policy)."""
+        from lerobot.common.policies.utils import populate_queues
+
+        current_obs_for_norm = {}
+        # input_features는 Dict[str, FeatureSpec] 형태이므로, key로 직접 순회합니다.
+        for cfg_key in self.config.input_features:
+            obs_part_key = cfg_key.split("observation.")[-1]
+            if obs_part_key in observation:
+                current_obs_for_norm[cfg_key] = observation[obs_part_key]
+
+        current_obs_normalized = self.normalize_inputs(current_obs_for_norm)
+
+        if self.config.image_features:
+            current_obs_normalized_for_queue = dict(current_obs_normalized)
+            current_obs_normalized_for_queue["observation.images"] = torch.stack(
+                [current_obs_normalized[key] for key in self.config.image_features], dim=-4
+            )
+        else:
+            current_obs_normalized_for_queue = current_obs_normalized
+
+        self._queues = populate_queues(
+            self._queues, current_obs_normalized_for_queue)
+
+        if len(self._queues["action"]) == 0:
+            if len(self._queues["observation.state"]) < self.config.n_obs_steps:
+                action_dim = self.config.action_feature.shape[0]
+                device = get_device_from_parameters(self)
+                return torch.zeros((observation[list(observation.keys())[0]].shape[0], action_dim), device=device)
+
+            obs_history_batch = {}
+            for queue_key in self._queues:
+                if queue_key.startswith("observation") and len(self._queues[queue_key]) > 0:
+                    if queue_key == "observation.state":
+                        obs_history_batch[OBS_ROBOT] = torch.stack(
+                            list(self._queues[queue_key]), dim=1)
+                    elif queue_key == "observation.images" and self.config.image_features:
+                        obs_history_batch["observation.images"] = torch.stack(
+                            list(self._queues[queue_key]), dim=1)
+                    elif queue_key == "observation.environment_state" and self.config.env_state_feature:
+                        obs_history_batch[OBS_ENV] = torch.stack(
+                            list(self._queues[queue_key]), dim=1)
+
+            actions_normalized = self.diffusion.generate_actions(
+                obs_history_batch)
+            actions_unnormalized = self.unnormalize_outputs(
+                {"action": actions_normalized})["action"]
+            self._queues["action"].extend(actions_unnormalized.transpose(0, 1))
+
+        selected_action = self._queues["action"].popleft()
+        return selected_action
+
     # This is the training method
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
         """Run the batch through the model and compute the loss for training or validation."""
