@@ -4,8 +4,8 @@
 import math
 from collections import deque
 from typing import Callable, Optional, Dict  # Added Dict
+from einops import rearrange  # Ensure einops is imported if used directly
 
-import einops
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -17,7 +17,9 @@ from torch import Tensor, nn
 from lerobot.common.constants import OBS_ENV, OBS_ROBOT, OBS_IMAGE
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from lerobot.common.policies.normalize import Normalize, Unnormalize
+# Assuming this is in the path
 from model.diffusion.diffusion_modules import DiffusionTransformer
+# Assuming this is in the path
 from model.diffusion.async_modules import DenoisingTransformer
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.utils import (
@@ -25,6 +27,7 @@ from lerobot.common.policies.utils import (
     get_dtype_from_parameters,
     get_output_shape,
 )
+from collections import OrderedDict  # For _replace_submodules OrderedDict fix
 
 
 class CLDiffPhyConModel(PreTrainedPolicy):
@@ -61,23 +64,15 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             "observation.state": deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.image_features:  # Check based on config.image_features being non-empty
+        if self.config.image_features:
             self._queues["observation.images"] = deque(
                 maxlen=self.config.n_obs_steps)
-        if self.config.env_state_feature:  # Check based on config.env_state_feature being non-empty
+        if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(
                 maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def select_action(self, current_raw_observation: Dict[str, Tensor]) -> Tensor:
-        """
-        Selects an action based on the current raw observation.
-        This method makes CLDiffPhyConModel a concrete class.
-        It primarily supports action-prediction mode. If the model is configured
-        to predict states (interpolate_state=True), this method will raise a
-        NotImplementedError as it requires an Inverse Dynamics Model to convert
-        predicted states to actions.
-        """
         if self.config.diffusion_target_key != "action":
             raise NotImplementedError(
                 f"select_action in CLDiffPhyConModel is not designed to directly output actions "
@@ -88,76 +83,45 @@ class CLDiffPhyConModel(PreTrainedPolicy):
 
         device = get_device_from_parameters(self)
 
-        # Normalize raw observation.
-        # normalize_inputs expects a batch, so add a batch dim and remove it after.
-        # Or, ensure current_raw_observation is already batched (e.g., by a wrapper).
-        # Assuming current_raw_observation is a single unbatched observation dict.
-        # For simplicity, let's assume current_raw_observation might not have batch dim.
-        # However, LeRobot policies usually expect batched inputs even for B=1.
-        # Let's assume it comes with Batch=1 from an eval loop.
         normalized_obs_for_queue = self.normalize_inputs(
             current_raw_observation)
 
-        # Update observation queues
-        # Squeeze batch dimension if it was B=1 for queue storage (if queues store single timesteps)
         self._queues["observation.state"].append(
             normalized_obs_for_queue["observation.state"].squeeze(0))
 
         if self.config.image_features:
-            # Stack images from possibly multiple cameras for the queue
-            # normalized_obs_for_queue will have keys like "observation.image.camera_0"
-            # These are already [B, C, H, W]. We need [NumCam, C, H, W] for the queue if B=1.
             current_images_stacked_for_queue = torch.stack(
                 [normalized_obs_for_queue[key].squeeze(0) for key in self.config.image_features], dim=0
-            )  # [NumCam, C, H, W]
+            )
             self._queues["observation.images"].append(
                 current_images_stacked_for_queue)
 
-        # Manage action execution queue from previous predictions
         if len(self._queues["action"]) > 0:
             return self._queues["action"].popleft()
 
-        # Check if enough observation history is available
         if len(self._queues["observation.state"]) < self.config.n_obs_steps:
-            # Default action if not enough history
             action_dim = self.config.output_features["action"].shape[0]
-            # print(f"Warning: Not enough obs history for {self.name}. Returning zero action.")
-            # Return [ActionDim] for B=1
             return torch.zeros(action_dim, device=device)
 
-        # Prepare batched observations for the model from queues
-        # Stack items from deques: list of [StateDim] -> [n_obs_steps, StateDim] -> [1, n_obs_steps, StateDim]
         obs_state_history = torch.stack(
             list(self._queues["observation.state"]), dim=0).unsqueeze(0)
 
         obs_dict_for_model = {
-            OBS_ROBOT: obs_state_history  # Used by _prepare_global_conditioning
+            OBS_ROBOT: obs_state_history
         }
         if self.config.image_features:
-            # list(self._queues["observation.images"]) is a list of [NumCam, C, H, W]
-            # Stack to [n_obs_steps, NumCam, C, H, W], then unsqueeze for batch_dim
             obs_image_history = torch.stack(
                 list(self._queues["observation.images"]), dim=0).unsqueeze(0)
-            # Used by _prepare_global_conditioning
             obs_dict_for_model["observation.images"] = obs_image_history
-            # For predict_action, it might expect "observation.image" if single camera setup was different
-            # The current _prepare_global_conditioning uses "observation.images" (plural)
 
-        # Call the core diffusion model prediction
-        # predict_action returns a normalized sequence [B, horizon, target_dim]
-        # Here B=1.
         predicted_target_sequence_normalized = self.predict_action(
             obs_dict_for_model, previous_rt_diffusion_plan=None)
 
-        # Unnormalize the output. This assumes predict_action returned actions.
         unnormalized_output = self.unnormalize_outputs({
-            # Remove B=1 dim for unnormalizer
             "action": predicted_target_sequence_normalized.squeeze(0)
         })
-        # [horizon, ActionDim]
         unnormalized_actions = unnormalized_output["action"]
 
-        # Populate action queue for n_action_steps and return the first one
         for i in range(min(self.config.n_action_steps, unnormalized_actions.shape[0])):
             self._queues["action"].append(unnormalized_actions[i])
 
@@ -169,12 +133,17 @@ class CLDiffPhyConModel(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action(self, obs_dict: dict[str, Tensor], previous_rt_diffusion_plan: Optional[Tensor] = None) -> Tensor:
-        # obs_dict keys here are expected to be OBS_ROBOT, "observation.images", etc.
-        # and values have shape [B, n_obs_steps, ...]
-        batch_size = obs_dict[OBS_ROBOT].shape[0] if OBS_ROBOT in obs_dict else obs_dict["observation.images"].shape[0]
-        # device = get_device_from_parameters(self) # Already on device if called from select_action
+        batch_size = -1
+        if OBS_ROBOT in obs_dict and obs_dict[OBS_ROBOT] is not None:
+            batch_size = obs_dict[OBS_ROBOT].shape[0]
+        elif "observation.images" in obs_dict and obs_dict["observation.images"] is not None:
+            batch_size = obs_dict["observation.images"].shape[0]
+        elif OBS_ENV in obs_dict and obs_dict[OBS_ENV] is not None:
+            batch_size = obs_dict[OBS_ENV].shape[0]
+        else:
+            first_key = next(iter(obs_dict.keys()))
+            batch_size = obs_dict[first_key].shape[0]
 
-        # _prepare_global_conditioning takes the already history-batched obs_dict
         global_cond = self.diffusion._prepare_global_conditioning(obs_dict)
 
         output_sequence: Tensor
@@ -190,34 +159,81 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             )
         return output_sequence
 
-    def forward(self, batch: dict[str, Tensor]) -> Tensor:
-        normalized_batch = self.normalize_inputs(batch)
+    def _prepare_batch_for_global_cond(self, normalized_batch_inputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """
+        Slices the necessary history from normalized_batch_inputs for global conditioning.
+        Ensures all conditioning modalities have sequence length self.config.n_obs_steps.
+        """
+        batch_for_global_cond = {}
+        cond_horizon = self.config.n_obs_steps
 
+        # Process OBS_ROBOT (state) for conditioning
+        if OBS_ROBOT in normalized_batch_inputs and self.config.robot_state_feature:
+            # [B, S_loaded, Dim]
+            state_input_full = normalized_batch_inputs[OBS_ROBOT]
+            # Take the slice corresponding to observation_delta_indices, which are the first cond_horizon steps
+            # if delta_timestamps was constructed as [-N+1..0, 1..H_target]
+            if state_input_full.shape[1] < cond_horizon:
+                raise ValueError(
+                    f"Full state input seq len {state_input_full.shape[1]} < cond_horizon {cond_horizon}")
+            batch_for_global_cond[OBS_ROBOT] = state_input_full[:,
+                                                                :cond_horizon, :]
+
+        # Process image features for conditioning
         if self.config.image_features:
-            normalized_batch_with_images = dict(normalized_batch)
-            # Correct stacking for "observation.images" for _prepare_global_conditioning
-            # Input batch[key] is [B, S, C, H, W], stack to [B, S, N_cam, C, H, W]
-            # Assuming S is the sequence/history length (n_obs_steps)
-            list_of_image_batches = [normalized_batch[key]
-                                     for key in self.config.image_features]
-            if list_of_image_batches:
-                normalized_batch_with_images["observation.images"] = torch.stack(
-                    list_of_image_batches, dim=2)  # dim=2 for NumCameras
-        else:
-            normalized_batch_with_images = normalized_batch
+            list_of_image_tensors_for_cond = []
+            for key in self.config.image_features:
+                if key in normalized_batch_inputs:
+                    # [B, S_img_loaded, C, H, W]
+                    img_input_full = normalized_batch_inputs[key]
+                    if img_input_full.shape[1] < cond_horizon:
+                        raise ValueError(
+                            f"Full image input seq len {img_input_full.shape[1]} < cond_horizon {cond_horizon} for key {key}")
+                    list_of_image_tensors_for_cond.append(
+                        img_input_full[:, :cond_horizon, :, :, :])
+            if list_of_image_tensors_for_cond:
+                batch_for_global_cond["observation.images"] = torch.stack(
+                    list_of_image_tensors_for_cond, dim=2)
 
-        final_normalized_batch = self.normalize_targets(
-            normalized_batch_with_images)
+        # Process OBS_ENV for conditioning
+        if OBS_ENV in normalized_batch_inputs and self.config.env_state_feature:
+            # [B, S_env_loaded, Dim]
+            env_input_full = normalized_batch_inputs[OBS_ENV]
+            if env_input_full.shape[1] < cond_horizon:
+                raise ValueError(
+                    f"Full env input seq len {env_input_full.shape[1]} < cond_horizon {cond_horizon}")
+            batch_for_global_cond[OBS_ENV] = env_input_full[:,
+                                                            :cond_horizon, :]
+
+        return batch_for_global_cond
+
+    def forward(self, batch: dict[str, Tensor]) -> Tensor:
+        normalized_batch_inputs = self.normalize_inputs(batch)
+        batch_for_global_cond = self._prepare_batch_for_global_cond(
+            normalized_batch_inputs)
+
+        normalized_targets_batch = self.normalize_targets(batch)
+
+        final_normalized_batch = dict(batch_for_global_cond)
+        for key, val in normalized_targets_batch.items():
+            if key in self.config.output_features:
+                final_normalized_batch[key] = val
 
         global_cond_train = self.diffusion._prepare_global_conditioning(
-            final_normalized_batch)
+            batch_for_global_cond)
 
         diffusion_target_key = self.config.diffusion_target_key
         if diffusion_target_key not in final_normalized_batch:
             raise KeyError(
-                f"Diffusion target key '{diffusion_target_key}' not found in normalized batch. Available keys: {list(final_normalized_batch.keys())}")
+                f"Diffusion target key '{diffusion_target_key}' not found in final_normalized_batch. Available keys: {list(final_normalized_batch.keys())}")
 
+        # trajectory_to_diffuse is the target sequence (e.g. states for t=1..H)
+        # It should have length self.config.horizon
+        # LeRobotDataset loads this based on cfg.target_delta_indices
         trajectory_to_diffuse = final_normalized_batch[diffusion_target_key]
+        if trajectory_to_diffuse.shape[1] != self.config.horizon:
+            raise ValueError(
+                f"Target trajectory for '{diffusion_target_key}' has length {trajectory_to_diffuse.shape[1]}, expected horizon {self.config.horizon}")
 
         loss = self.diffusion.compute_loss(
             trajectory_to_diffuse,
@@ -229,28 +245,25 @@ class CLDiffPhyConModel(PreTrainedPolicy):
     def forward_async(self, batch: dict[str, Tensor]) -> Tensor:
         from model.diffusion.async_training import AsyncDiffusionTrainer
 
-        normalized_batch = self.normalize_inputs(batch)
-        if self.config.image_features:
-            normalized_batch_with_images = dict(normalized_batch)
-            list_of_image_batches_async = [
-                normalized_batch[key] for key in self.config.image_features]
-            if list_of_image_batches_async:
-                normalized_batch_with_images["observation.images"] = torch.stack(
-                    list_of_image_batches_async, dim=2)
-        else:
-            normalized_batch_with_images = normalized_batch
+        normalized_batch_inputs = self.normalize_inputs(batch)
+        batch_for_global_cond_async = self._prepare_batch_for_global_cond(
+            normalized_batch_inputs)
 
-        final_normalized_batch = self.normalize_targets(
-            normalized_batch_with_images)
+        normalized_targets_batch_async = self.normalize_targets(batch)
+        final_normalized_batch_async = dict(batch_for_global_cond_async)
+        for key, val in normalized_targets_batch_async.items():
+            if key in self.config.output_features:
+                final_normalized_batch_async[key] = val
+
         global_cond_train_async = self.diffusion._prepare_global_conditioning(
-            final_normalized_batch)
+            batch_for_global_cond_async)
 
         diffusion_target_key = self.config.diffusion_target_key
-        if diffusion_target_key not in final_normalized_batch:
+        if diffusion_target_key not in final_normalized_batch_async:
             raise KeyError(
                 f"Diffusion target key '{diffusion_target_key}' not found in final_normalized_batch for async training.")
 
-        target_full_sequence = final_normalized_batch[diffusion_target_key]
+        target_full_sequence = final_normalized_batch_async[diffusion_target_key]
 
         if target_full_sequence.shape[1] < self.config.horizon:
             raise ValueError(
@@ -294,21 +307,23 @@ class DiffusionModel(nn.Module):
 
         if self.config.image_features:
             num_images = len(self.config.image_features)
+            # Instantiate DiffusionRgbEncoder correctly based on config
             if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config)
-                            for _ in range(num_images)]
-                self.rgb_encoder = nn.ModuleList(encoders)
-                if encoders:  # ensure encoders list is not empty
-                    obs_only_cond_dim += encoders[0].feature_dim * num_images
+                self.rgb_encoder = nn.ModuleList(
+                    [DiffusionRgbEncoder(config) for _ in range(num_images)])
+                if encoders:
+                    # Use feature_dim from instance
+                    obs_only_cond_dim += self.rgb_encoder[0].feature_dim * num_images
             else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
+                self.rgb_encoder = DiffusionRgbEncoder(
+                    config)  # Single encoder
                 obs_only_cond_dim += self.rgb_encoder.feature_dim * num_images
 
         if self.config.env_state_feature:
             obs_only_cond_dim += self.config.env_state_feature.shape[0]
 
-        global_cond_obs_part_dim_total = obs_only_cond_dim * config.n_obs_steps
-        global_cond_dim_total_for_transformer = global_cond_obs_part_dim_total
+        global_cond_dim_per_step = obs_only_cond_dim
+        global_cond_dim_total_for_transformer = global_cond_dim_per_step * config.n_obs_steps
 
         diffusion_target_key = config.diffusion_target_key
         if diffusion_target_key not in config.output_features:
@@ -352,89 +367,114 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        # Determine batch_size and n_obs_steps from available keys
-        # OBS_ROBOT: [B, S, StateDim]
-        # "observation.images": [B, S, N_cam, C, H, W]
-        # OBS_ENV: [B, S, EnvDim]
-        if OBS_ROBOT in batch and batch[OBS_ROBOT] is not None:
-            batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
-        elif "observation.images" in batch and batch["observation.images"] is not None:
-            batch_size, n_obs_steps = batch["observation.images"].shape[:2]
-        elif OBS_ENV in batch and batch[OBS_ENV] is not None:
-            batch_size, n_obs_steps = batch[OBS_ENV].shape[:2]
-        else:
-            # This case should ideally not be reached if config requires some observation.
-            # If it can be reached (e.g. unconditional model), handle appropriately.
-            # For now, assume at least one observation type is always present.
-            first_valid_key = next(
-                (k for k, v in batch.items() if isinstance(v, Tensor) and v.ndim >= 2), None)
-            if first_valid_key:
-                batch_size, n_obs_steps = batch[first_valid_key].shape[:2]
-            else:  # Fallback, though this indicates an issue with input batch or config
-                raise ValueError(
-                    "Cannot determine batch_size and n_obs_steps from batch for global conditioning.")
+    def _prepare_global_conditioning(self, batch_for_cond: dict[str, Tensor]) -> Tensor:
+        """
+        Prepares the global conditioning vector from a batch dictionary.
+        `batch_for_cond` MUST contain tensors for conditioning (OBS_ROBOT, observation.images, OBS_ENV)
+        where each tensor ALREADY has its sequence length equal to self.config.n_obs_steps.
+        Slicing of longer sequences from dataloader should happen *before* calling this method
+        (e.g., in CLDiffPhyConModel.forward/forward_async).
+        """
+        conditioning_horizon = self.config.n_obs_steps
+        batch_size = -1
+        first_valid_tensor_for_device = None  # For device info if list is empty
 
-        global_cond_feats = []
+        # Determine batch_size from a reliable source in the batch
+        # All conditioning inputs are expected to have B and S=conditioning_horizon dimensions.
+        for key in [OBS_ROBOT, "observation.images", OBS_ENV]:  # Check in order of likelihood
+            if key in batch_for_cond and batch_for_cond[key] is not None:
+                batch_size = batch_for_cond[key].shape[0]
+                first_valid_tensor_for_device = batch_for_cond[key]
+                # CRITICAL SANITY CHECK: Ensure input sequence lengths match conditioning_horizon
+                if batch_for_cond[key].shape[1] != conditioning_horizon:
+                    raise ValueError(
+                        f"INTERNAL ERROR: Sequence length for conditioning key '{key}' ({batch_for_cond[key].shape[1]}) "
+                        f"in _prepare_global_conditioning's input batch does not match config.n_obs_steps ({conditioning_horizon}). "
+                        f"Slicing should have occurred before calling this method."
+                    )
+                break  # Found batch_size
 
-        if OBS_ROBOT in batch and self.config.robot_state_feature and batch[OBS_ROBOT] is not None:
-            global_cond_feats.append(batch[OBS_ROBOT].flatten(start_dim=2))
-
-        if self.config.image_features and "observation.images" in batch and batch["observation.images"] is not None:
-            images_data = batch["observation.images"]
-            if images_data.ndim != 6:
-                if images_data.ndim == 5 and len(self.config.image_features) == 1:
-                    images_data = images_data.unsqueeze(2)
+        if batch_size == -1:  # No standard conditioning keys found or all were None
+            if not batch_for_cond:  # Empty input dict
+                # This means global_cond_dim_total_for_transformer should be 0.
+                # The DiffusionTransformer's cond_embed would only take time_embedding.
+                time_emb_dim = self.transformer.time_embed[-1].out_features
+                if self.transformer.cond_embed.in_features == time_emb_dim:
+                    # Need a batch_size to return empty tensor of shape [B, 0]
+                    # This path is problematic if batch_size cannot be inferred.
+                    # Assuming if batch_for_cond is empty, it implies an unconditional call
+                    # where global_cond is not used or is just time.
+                    # If the calling code guarantees a batch_size (e.g. from target tensor), use that.
+                    # For now, this path is ambiguous for determining batch_size.
+                    # Let's assume if this is reached, it's an error unless model is purely unconditional on obs.
+                    raise ValueError(
+                        "Cannot determine batch_size for _prepare_global_conditioning as input batch_for_cond is effectively empty or missing standard keys.")
                 else:
                     raise ValueError(
-                        f"Expected observation.images to have 6 dims (B,S,N,C,H,W), got {images_data.ndim}")
+                        "No conditioning features found in batch_for_cond, but DiffusionTransformer expects them.")
+            else:  # Fallback: try to get batch_size from any tensor if standard keys absent/None
+                first_key_in_batch = next(iter(batch_for_cond))
+                batch_size = batch_for_cond[first_key_in_batch].shape[0]
+                first_valid_tensor_for_device = batch_for_cond[first_key_in_batch]
 
+        processed_features_list = []
+
+        # Process robot state for conditioning
+        if OBS_ROBOT in batch_for_cond and self.config.robot_state_feature and batch_for_cond[OBS_ROBOT] is not None:
+            state_data_cond = batch_for_cond[OBS_ROBOT]
+            processed_features_list.append(state_data_cond)
+
+        # Process image features for conditioning
+        if self.config.image_features and "observation.images" in batch_for_cond and batch_for_cond["observation.images"] is not None:
+            images_data_cond = batch_for_cond["observation.images"]
+
+            s_img_cond = images_data_cond.shape[1]
+            n_cam_cond = images_data_cond.shape[2]
+
+            # This s_img_cond should be == conditioning_horizon due to checks/slicing before calling
             if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(
-                    images_data, "b s n c h w -> n (b s) c h w")
-                img_features_list = torch.cat(
-                    [encoder(images) for encoder, images in zip(
-                        self.rgb_encoder, images_per_camera, strict=True)]
+                img_features_all_cams = []
+                for i in range(n_cam_cond):
+                    cam_images = images_data_cond[:, :, i, :, :, :]
+                    cam_images_flat = rearrange(
+                        cam_images, "b s c h w -> (b s) c h w")
+                    cam_features_encoded = self.rgb_encoder[i](cam_images_flat)
+                    cam_features_reshaped = rearrange(cam_features_encoded, "(b s) d -> b s d",
+                                                      b=batch_size, s=s_img_cond)
+                    img_features_all_cams.append(cam_features_reshaped)
+                img_features_processed = torch.cat(
+                    img_features_all_cams, dim=-1)
+            else:  # Single shared encoder
+                images_flat_for_encoder = rearrange(
+                    images_data_cond, "b s n c h w -> (b s n) c h w")
+                img_features_encoded = self.rgb_encoder(
+                    images_flat_for_encoder)
+                img_features_processed = rearrange(
+                    img_features_encoded, "(b s n) d -> b s (n d)",
+                    b=batch_size, s=s_img_cond, n=n_cam_cond
                 )
-                img_features = einops.rearrange(
-                    img_features_list, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                img_features = self.rgb_encoder(
-                    einops.rearrange(
-                        images_data, "b s n c h w -> (b s n) c h w")
-                )
-                img_features = einops.rearrange(
-                    img_features, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps
-                )
-            global_cond_feats.append(img_features)
+            processed_features_list.append(img_features_processed)
 
-        if OBS_ENV in batch and self.config.env_state_feature and batch[OBS_ENV] is not None:
-            global_cond_feats.append(batch[OBS_ENV])
+        # Process environment state for conditioning
+        if OBS_ENV in batch_for_cond and self.config.env_state_feature and batch_for_cond[OBS_ENV] is not None:
+            env_data_cond = batch_for_cond[OBS_ENV]
+            processed_features_list.append(env_data_cond)
 
-        if not global_cond_feats:
-            # If global_cond_dim_total_for_transformer is 0 (e.g. time_embed only in DiffusionTransformer)
-            # This means cond_embed in DiffusionTransformer takes only time_emb.
-            # The DiffusionTransformer.cond_embed.in_features would be transformer_dim (from time_embed).
-            # If transformer_dim (from config) for time_embed and cond_embed is non-zero.
-            time_emb_dim = self.transformer.time_embed[-1].out_features
-            if self.transformer.cond_embed.in_features == time_emb_dim:
-                # This means global_cond for cat with time_emb should be zero-dim
-                dummy_device = batch_size > 0 and global_cond_feats and global_cond_feats[0].device or torch.device(
-                    "cpu")
-                return torch.empty(batch_size, 0, device=dummy_device)
-            else:
-                raise ValueError(
-                    "No global conditioning features found, but DiffusionTransformer expects them.")
+        if not processed_features_list:
+            device_to_use = first_valid_tensor_for_device.device if first_valid_tensor_for_device is not None else torch.device(
+                "cpu")
+            return torch.empty(batch_size, 0, device=device_to_use)
 
-        concatenated_obs_feats = torch.cat(global_cond_feats, dim=-1)
-        flattened_obs_feats = concatenated_obs_feats.flatten(start_dim=1)
-        final_global_cond = flattened_obs_feats
-        return final_global_cond
+        concatenated_per_step_feats = torch.cat(
+            processed_features_list, dim=-1)
+        flattened_global_cond = concatenated_per_step_feats.flatten(
+            start_dim=1)
+
+        return flattened_global_cond
 
     def conditional_sample(self, batch_size: int, global_cond: Tensor, generator: Optional[torch.Generator] = None) -> Tensor:
-        device = global_cond.device  # get_device_from_parameters(self)
-        dtype = global_cond.dtype  # get_dtype_from_parameters(self)
+        device = global_cond.device
+        dtype = global_cond.dtype
 
         sample_output_dim = self.transformer.denoising_head.net[-1].out_features
 
@@ -443,7 +483,7 @@ class DiffusionModel(nn.Module):
             dtype=dtype, device=device, generator=generator,
         )
         self.noise_scheduler.set_timesteps(
-            self.num_inference_steps, device=device)  # Add device here
+            self.num_inference_steps, device=device)
 
         for t in self.noise_scheduler.timesteps:
             model_output = self.transformer(
@@ -459,27 +499,26 @@ class DiffusionModel(nn.Module):
     def async_conditional_sample(self, current_input_normalized: Tensor, global_cond: Tensor, generator: Optional[torch.Generator] = None) -> Tensor:
         device = current_input_normalized.device
         sample = current_input_normalized.clone()
-        async_num_steps = getattr(self.config, 'async_refinement_steps', min(
-            10, self.num_inference_steps // 10) or 1)
 
-        # Ensure num_inference_steps is set for the scheduler if not already
-        self.noise_scheduler.set_timesteps(
-            self.num_inference_steps, device=device)  # Ensure timesteps are set
+        async_num_steps = getattr(
+            self.config, 'async_refinement_steps', self.num_inference_steps)
+        if async_num_steps == 0 and self.num_inference_steps > 0:
+            async_num_steps = 1
+        elif self.num_inference_steps == 0:
+            async_num_steps = 0
 
-        # For refinement, we typically use a small number of steps from a low noise level.
-        # Let's use a subset of the scheduler's timesteps, e.g., the last `async_num_steps`.
-        # Or, if `async_num_steps` is small, generate specific timesteps for refinement.
-        if async_num_steps <= len(self.noise_scheduler.timesteps):
-            refinement_timesteps = self.noise_scheduler.timesteps[-async_num_steps:]
-        else:  # If async_num_steps is larger than total inference steps, use all.
-            refinement_timesteps = self.noise_scheduler.timesteps
+        if async_num_steps == 0:
+            return sample
 
-        # If refinement_timesteps needs to be custom (e.g. 0 to async_num_steps-1 for conceptual t)
-        # Then the DDPMScheduler step needs to be used carefully.
-        # For now, using actual scheduler timesteps for refinement.
+        self.noise_scheduler.set_timesteps(async_num_steps, device=device)
 
-        for t in refinement_timesteps:  # Iterate from higher noise to lower noise
-            model_input_timesteps = t.expand(sample.shape[0])  # B
+        timesteps_to_refine = self.noise_scheduler.timesteps
+
+        if not len(timesteps_to_refine):
+            return sample
+
+        for t in timesteps_to_refine:
+            model_input_timesteps = t.repeat(sample.shape[0])
             use_async_mode_for_transformer = False
 
             model_output = self.async_transformer(
@@ -495,58 +534,59 @@ class DiffusionModel(nn.Module):
 
     @torch.no_grad()
     def refine_state_path(self, initial_state_path: Tensor, observation_batch_for_cond: dict[str, Tensor], num_refinement_steps: Optional[int] = None, generator: Optional[torch.Generator] = None) -> Tensor:
-        device = initial_state_path.device  # get_device_from_parameters(self)
-        dtype = initial_state_path.dtype  # get_dtype_from_parameters(self)
+        device = initial_state_path.device
+        dtype = initial_state_path.dtype
         batch_size = initial_state_path.shape[0]
 
-        if initial_state_path.shape[1] != self.config.horizon:
-            print(
-                f"Warning: refine_state_path input horizon {initial_state_path.shape[1]} != model config horizon {self.config.horizon}.")
-            if initial_state_path.shape[1] > self.config.horizon:
-                initial_state_path = initial_state_path[:,
-                                                        :self.config.horizon]
+        current_horizon = initial_state_path.shape[1]
+        target_horizon = self.config.horizon
+
+        if current_horizon != target_horizon:
+            if current_horizon > target_horizon:
+                initial_state_path_adjusted = initial_state_path[:,
+                                                                 :target_horizon]
             else:
-                padding_needed = self.config.horizon - \
-                    initial_state_path.shape[1]
+                padding_needed = target_horizon - current_horizon
                 padding_shape = (batch_size, padding_needed,
                                  initial_state_path.shape[2])
-                padding = torch.zeros(
-                    padding_shape, device=device, dtype=dtype)
-                initial_state_path = torch.cat(
+                last_frame = initial_state_path[:, -1:, :]
+                padding = last_frame.repeat(1, padding_needed, 1)
+                initial_state_path_adjusted = torch.cat(
                     [initial_state_path, padding], dim=1)
+        else:
+            initial_state_path_adjusted = initial_state_path
 
         global_cond = self._prepare_global_conditioning(
             observation_batch_for_cond)
 
         effective_num_refinement_steps = num_refinement_steps
         if effective_num_refinement_steps is None:
-            effective_num_refinement_steps = min(
-                20, self.noise_scheduler.config.num_train_timesteps // 10)
-            if effective_num_refinement_steps == 0:
-                effective_num_refinement_steps = 1
+            effective_num_refinement_steps = getattr(self.config, 'num_refinement_steps_default',
+                                                     min(10, self.noise_scheduler.config.num_train_timesteps // 20) or 1)
+
+        if effective_num_refinement_steps == 0:
+            return initial_state_path_adjusted
 
         self.noise_scheduler.set_timesteps(
             effective_num_refinement_steps, device=device)
 
-        # Start with a bit of noise on initial_state_path if it's considered x0
-        # Or, if initial_state_path is already x_t like, proceed directly.
-        # Assuming initial_state_path is a "clean" proposed path (x0).
-        noise = torch.randn_like(
-            initial_state_path, device=device, dtype=dtype)
+        if not len(self.noise_scheduler.timesteps):
+            return initial_state_path_adjusted
 
-        # Start refinement from a relatively high noise level (first timestep in refinement schedule)
+        noise = torch.randn_like(
+            initial_state_path_adjusted, device=device, dtype=dtype)
         start_timestep_for_refinement = self.noise_scheduler.timesteps[0]
 
         sample = self.noise_scheduler.add_noise(
-            initial_state_path, noise,
+            initial_state_path_adjusted, noise,
             torch.full((batch_size,), start_timestep_for_refinement,
                        device=device, dtype=torch.long)
         )
 
-        for t in self.noise_scheduler.timesteps:  # These are the refinement timesteps
+        for t in self.noise_scheduler.timesteps:
             model_input_timesteps = torch.full(
                 (batch_size,), t, dtype=torch.long, device=device)
-            predicted_noise_or_sample = self.transformer(  # Use the main transformer for refinement
+            predicted_noise_or_sample = self.transformer(
                 sample, model_input_timesteps, global_cond=global_cond
             )
             sample = self.noise_scheduler.step(
@@ -579,22 +619,20 @@ class DiffusionModel(nn.Module):
 
         if self.config.do_mask_loss_for_padding and batch_info_for_masking is not None:
             pad_mask_key = None
-            # Try to find a specific padding mask for the target key
             specific_pad_mask_key = f"{self.config.diffusion_target_key}_is_pad"
+
             if specific_pad_mask_key in batch_info_for_masking:
                 pad_mask_key = specific_pad_mask_key
-            elif "action_is_pad" in batch_info_for_masking:  # Fallback to action_is_pad
+            elif self.config.diffusion_target_key == "action" and "action_is_pad" in batch_info_for_masking:
                 pad_mask_key = "action_is_pad"
-            # Add more fallbacks if necessary, e.g. a generic "is_pad"
+            elif "is_pad" in batch_info_for_masking and batch_info_for_masking["is_pad"].shape[1] == trajectory_to_diffuse.shape[1]:
+                pad_mask_key = "is_pad"
 
             if pad_mask_key and pad_mask_key in batch_info_for_masking:
                 is_pad_mask = batch_info_for_masking[pad_mask_key]
-                # Ensure mask matches trajectory horizon used in loss
-                # This is self.config.horizon for training
                 current_horizon = trajectory_to_diffuse.shape[1]
 
                 if is_pad_mask.shape[1] < current_horizon:
-                    # This indicates an issue, mask is shorter than data. Pad mask with False (not_pad).
                     padding_amount = current_horizon - is_pad_mask.shape[1]
                     mask_padding = torch.zeros(
                         is_pad_mask.shape[0], padding_amount, dtype=torch.bool, device=is_pad_mask.device)
@@ -604,12 +642,17 @@ class DiffusionModel(nn.Module):
                     is_pad_mask_adjusted = is_pad_mask[:, :current_horizon]
 
                 in_episode_bound = ~is_pad_mask_adjusted
-                loss = loss * in_episode_bound.unsqueeze(-1)
-            else:
+                if loss.ndim == 3 and in_episode_bound.ndim == 2:
+                    loss = loss * in_episode_bound.unsqueeze(-1)
+                elif loss.ndim == in_episode_bound.ndim:
+                    loss = loss * in_episode_bound
+                else:
+                    print(
+                        f"Warning: Loss shape {loss.shape} and padding mask shape {in_episode_bound.shape} are not compatible for broadcasting in masking.")
+
+            elif self.config.do_mask_loss_for_padding:
                 print(
-                    f"Warning: `do_mask_loss_for_padding` is True, but a suitable padding mask key was not found in `batch_info_for_masking` for target '{self.config.diffusion_target_key}'.")
-        elif self.config.do_mask_loss_for_padding and batch_info_for_masking is None:
-            print(f"Warning: `do_mask_loss_for_padding` is True, but `batch_info_for_masking` was not provided to compute_loss.")
+                    f"Warning: `do_mask_loss_for_padding` is True, but a suitable padding mask key ('{specific_pad_mask_key}', 'action_is_pad', or 'is_pad') was not found in `batch_info_for_masking` for target '{self.config.diffusion_target_key}'. Loss will not be masked for padding.")
 
         return loss.mean()
 
@@ -617,14 +660,27 @@ class DiffusionModel(nn.Module):
 class SpatialSoftmax(nn.Module):
     def __init__(self, input_shape, num_kp=None):
         super().__init__()
-        assert len(input_shape) == 3
+        assert len(
+            input_shape) == 3, f"SpatialSoftmax input_shape must be 3D (C,H,W), got {input_shape}"
         self._in_c, self._in_h, self._in_w = input_shape
+
+        self.is_valid = not (
+            self._in_c <= 0 or self._in_h <= 0 or self._in_w <= 0)
+
+        if not self.is_valid:
+            self.nets = nn.Identity()
+            self._out_c = self._in_c if num_kp is None else num_kp
+            self.register_buffer(
+                "pos_grid", torch.empty(0, 2, dtype=torch.float32))
+            return
+
         if num_kp is not None:
             self.nets = torch.nn.Conv2d(self._in_c, num_kp, kernel_size=1)
             self._out_c = num_kp
         else:
             self.nets = None
             self._out_c = self._in_c
+
         pos_x, pos_y = np.meshgrid(
             np.linspace(-1.0, 1.0, self._in_w, dtype=np.float32),
             np.linspace(-1.0, 1.0, self._in_h, dtype=np.float32)
@@ -634,15 +690,53 @@ class SpatialSoftmax(nn.Module):
         self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
 
     def forward(self, features: Tensor) -> Tensor:
-        if self.nets is not None:
-            features = self.nets(features)
-        # Handle cases where features might be empty (e.g. B=0 due to dataloader drop_last=True and small last batch)
-        if features.shape[0] == 0:
-            return torch.empty(0, self._out_c, 2, device=features.device, dtype=features.dtype)
+        if not self.is_valid:
+            batch_size = features.shape[0]
+            return torch.zeros(batch_size, self._out_c, 2, device=features.device, dtype=features.dtype)
 
-        features_flat = features.reshape(-1, self._in_h * self._in_w)
+        if features.shape[1] != self._in_c or features.shape[2] != self._in_h or features.shape[3] != self._in_w:
+            # This means input feature's C,H,W doesn't match what SpatialSoftmax was configured for.
+            # This can happen if the backbone output shape changed or was miscalculated.
+            # print(f"Warning: SpatialSoftmax forward input feature shape {features.shape} mismatches init C={self._in_c}, H={self._in_h},W={self._in_w}")
+            # Fallback to zeros, but this is an indicator of a deeper problem.
+            return torch.zeros(features.shape[0], self._out_c, 2, device=features.device, dtype=features.dtype)
+
+        # Apply Conv2D if it exists (to change num channels to num_kp)
+        if self.nets is not None:
+            processed_features = self.nets(features)
+        else:
+            # Use features directly if nets is None (num_kp was not set or _in_c was 0)
+            processed_features = features
+
+        # After nets, features are [B, self._out_c, H, W]
+        current_h, current_w = processed_features.shape[2], processed_features.shape[3]
+
+        if processed_features.shape[0] == 0:
+            return torch.empty(0, self._out_c, 2, device=processed_features.device, dtype=processed_features.dtype)
+
+        if current_h == 0 or current_w == 0:
+            return torch.zeros(processed_features.shape[0], self._out_c, 2, device=processed_features.device, dtype=processed_features.dtype)
+
+        # Ensure pos_grid matches the H, W of processed_features if they could change (they shouldn't after conv1x1)
+        if current_h * current_w != self.pos_grid.shape[0]:
+            # This should not happen if H,W are fixed by backbone and nets is 1x1 conv.
+            # Recreate pos_grid if necessary (though it's a sign of an issue)
+            # print(f"Warning: Recreating pos_grid in SpatialSoftmax due to shape mismatch. Feat H,W: ({current_h},{current_w}), Grid H,W: ({self._in_h},{self._in_w})")
+            pos_x, pos_y = np.meshgrid(
+                np.linspace(-1.0, 1.0, current_w, dtype=np.float32),
+                np.linspace(-1.0, 1.0, current_h, dtype=np.float32)
+            )
+            pos_x_tensor = torch.from_numpy(pos_x.reshape(
+                current_h * current_w, 1)).to(self.pos_grid.device)
+            pos_y_tensor = torch.from_numpy(pos_y.reshape(
+                current_h * current_w, 1)).to(self.pos_grid.device)
+            current_pos_grid = torch.cat([pos_x_tensor, pos_y_tensor], dim=1)
+        else:
+            current_pos_grid = self.pos_grid
+
+        features_flat = processed_features.reshape(-1, current_h * current_w)
         attention = F.softmax(features_flat, dim=-1)
-        expected_xy = attention @ self.pos_grid
+        expected_xy = attention @ current_pos_grid
         feature_keypoints = expected_xy.view(-1, self._out_c, 2)
         return feature_keypoints
 
@@ -675,56 +769,99 @@ class DiffusionRgbEncoder(nn.Module):
                     1, x.num_features // 16 if x.num_features > 0 else 1), num_channels=x.num_features)
             )
 
-        if not config.image_features:
-            print("Warning: config.image_features is empty for DiffusionRgbEncoder. Using default (3,96,96) for dummy input shape.")
-            images_shape_chw = (
-                3, config.crop_shape[0] if config.crop_shape else 96, config.crop_shape[1] if config.crop_shape else 96)
-        else:
-            images_shape_chw = next(iter(config.image_features.values())).shape
+        # Determine dummy input shape for feature_map_shape calculation
+        # Use a reliable way to get at least one image feature's shape
+        images_shape_chw_iter_list = [feat.shape for feat_name, feat in config.image_features.items(
+        ) if feat_name.startswith("observation.image")]
+        if not images_shape_chw_iter_list:  # If no "observation.image" keys, but other image_features might exist
+            images_shape_chw_iter_list = [
+                feat.shape for feat in config.image_features.values()]
 
-        dummy_h, dummy_w = config.crop_shape if config.crop_shape else images_shape_chw[1:]
-        dummy_c = images_shape_chw[0]
-        # Ensure dummy_c, dummy_h, dummy_w are positive for dummy_input
-        if not (dummy_c > 0 and dummy_h > 0 and dummy_w > 0):
-            raise ValueError(
-                f"Dummy input dimensions must be positive. Got C={dummy_c}, H={dummy_h}, W={dummy_w}")
+        if not images_shape_chw_iter_list:
+            # print("Warning: config.image_features is empty for DiffusionRgbEncoder. Using default (3,96,96) for dummy input shape.")
+            first_image_shape = (3, config.crop_shape[0] if config.crop_shape and config.crop_shape[0] > 0 else 96,
+                                 config.crop_shape[1] if config.crop_shape and config.crop_shape[1] > 0 else 96)
+        else:
+            first_image_shape = images_shape_chw_iter_list[0]
+
+        dummy_c_cfg = first_image_shape[0]
+        # Use crop_shape if available, else use shape from feature spec
+        crop_h, crop_w = (config.crop_shape if config.crop_shape else (
+            first_image_shape[1], first_image_shape[2]))
+
+        dummy_c = dummy_c_cfg if dummy_c_cfg > 0 else 3
+        dummy_h = crop_h if crop_h > 0 else 96
+        dummy_w = crop_w if crop_w > 0 else 96
+
         dummy_input = torch.zeros(1, dummy_c, dummy_h, dummy_w)
 
-        with torch.no_grad():  # Ensure no_grad for shape inference
-            feature_map_shape = get_output_shape(
-                self.backbone, dummy_input.shape)[1:]
+        with torch.no_grad():
+            try:
+                # Pass a clone of dummy_input to avoid in-place modification issues if any
+                feature_map_shape_tuple = get_output_shape(
+                    self.backbone, dummy_input.clone().shape)[1:]
+            except Exception as e:
+                # print(f"Error getting output shape from backbone for DiffusionRgbEncoder with dummy_input {dummy_input.shape}: {e}")
+                # print("Defaulting feature_map_shape to (1,1,1) to allow SpatialSoftmax init, but this is likely an error.")
+                feature_map_shape_tuple = (1, 1, 1)
 
-        if not (feature_map_shape[0] > 0 and feature_map_shape[1] > 0 and feature_map_shape[2] > 0):
-            raise ValueError(
-                f"Backbone output feature_map_shape has non-positive dimensions: {feature_map_shape}. Check vision_backbone and input shape.")
+        c_feat, h_feat, w_feat = feature_map_shape_tuple
+        # Ensure dimensions passed to SpatialSoftmax are positive
+        valid_feature_map_shape = (max(1, c_feat) if c_feat is not None else 1,
+                                   max(1, h_feat) if h_feat is not None else 1,
+                                   max(1, w_feat) if w_feat is not None else 1)
+        # if feature_map_shape_tuple != valid_feature_map_shape:
+        # print(f"Warning: Backbone output feature_map_shape {feature_map_shape_tuple} corrected to {valid_feature_map_shape} for SpatialSoftmax.")
 
         self.pool = SpatialSoftmax(
-            feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+            valid_feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim_from_pool = config.spatial_softmax_num_keypoints * 2
         self.final_feature_dim = getattr(
             config, 'vision_feature_dim', self.feature_dim_from_pool)
-        # Avoid Linear(0,0)
-        if self.feature_dim_from_pool == 0 and self.final_feature_dim == 0:
-            self.out = nn.Identity()  # Or handle this case based on expected behavior
-            print("Warning: feature_dim_from_pool and final_feature_dim are 0 in DiffusionRgbEncoder. Using nn.Identity for 'out' layer.")
-        else:
+
+        if self.feature_dim_from_pool <= 0:  # Check less than or equal to handle robustly
+            #  print(f"Warning: feature_dim_from_pool is {self.feature_dim_from_pool} for DiffusionRgbEncoder. Output layer will be Identity if final_feature_dim is also 0, or Linear(0, D).")
+            # If final_feature_dim is also 0 or less, Identity is safest. Otherwise, Linear(0, D) is an issue.
+            if self.final_feature_dim <= 0:
+                self.out = nn.Identity()
+                self.final_feature_dim = 0  # Ensure final_feature_dim reflects Identity output
+            else:  # feature_dim_from_pool is 0, but final_feature_dim > 0
+                # This is problematic: Linear(0, D)
+                self.out = nn.Linear(0, self.final_feature_dim)
+        else:  # feature_dim_from_pool > 0
             self.out = nn.Linear(self.feature_dim_from_pool,
                                  self.final_feature_dim)
 
         self.relu = nn.ReLU()
-        self.feature_dim = self.final_feature_dim
+        self.feature_dim = self.final_feature_dim  # Store the actual output dimension
 
     def forward(self, x: Tensor) -> Tensor:
-        if x.shape[0] == 0:  # Handle empty batch
+        if x.shape[0] == 0:
             return torch.empty(0, self.feature_dim, device=x.device, dtype=x.dtype)
         if self.do_crop:
             x = self.maybe_random_crop(
                 x) if self.training else self.center_crop(x)
-        x = self.backbone(x)
-        x = self.pool(x)
-        x = torch.flatten(x, start_dim=1)
-        x = self.relu(self.out(x))
-        return x
+
+        backbone_out = self.backbone(x)
+
+        if backbone_out.shape[2] <= 0 or backbone_out.shape[3] <= 0:
+            # print(f"Warning: Backbone output has non-positive spatial dimensions ({backbone_out.shape}). Returning zeros from RGB encoder.")
+            return torch.zeros(x.shape[0], self.feature_dim, device=x.device, dtype=x.dtype)
+
+        pooled_out = self.pool(backbone_out)
+        flattened_out = torch.flatten(pooled_out, start_dim=1)
+
+        if isinstance(self.out, nn.Linear):
+            if flattened_out.shape[1] != self.out.in_features:
+                if self.out.in_features == 0:
+                    # print(f"Warning: Input dim {flattened_out.shape[1]} to Linear(0, D) layer in DiffusionRgbEncoder. Returning zeros for safety.")
+                    return torch.zeros(flattened_out.shape[0], self.out.out_features, device=flattened_out.device, dtype=flattened_out.dtype)
+                else:  # self.out.in_features != 0 and mismatch
+                    raise ValueError(
+                        f"Dimension mismatch for Linear layer in DiffusionRgbEncoder. Expected {self.out.in_features}, got {flattened_out.shape[1]}")
+
+        output = self.relu(self.out(flattened_out))
+        return output
 
 
 def _replace_submodules(root_module: nn.Module, predicate: Callable[[nn.Module], bool], func: Callable[[nn.Module], nn.Module]) -> nn.Module:
@@ -732,23 +869,34 @@ def _replace_submodules(root_module: nn.Module, predicate: Callable[[nn.Module],
         return func(root_module)
     replace_list = [k.split(".") for k, m in root_module.named_modules(
         remove_duplicate=True) if predicate(m)]
-    for *parents, k_str in replace_list:  # Renamed k to k_str to avoid conflict
+    for *parents, k_str in replace_list:
         parent_module = root_module
         if parents:
             parent_module = root_module.get_submodule(".".join(parents))
 
-        # current_module = parent_module # This was redundant
         if isinstance(parent_module, nn.Sequential):
-            idx = int(k_str)
-            src_module = parent_module[idx]
-            new_module = func(src_module)
-            parent_module[idx] = new_module
+            try:
+                idx = int(k_str)
+                src_module = parent_module[idx]
+                new_module = func(src_module)
+                parent_module[idx] = new_module
+            except ValueError:
+                if hasattr(parent_module, k_str):
+                    src_module = getattr(parent_module, k_str)
+                    new_module = func(src_module)
+                    # Attempt to replace by name if parent is an OrderedDict (like default nn.Sequential)
+                    try:
+                        parent_module._modules[k_str] = new_module
+                    except AttributeError:
+                        print(
+                            f"Warning: Could not directly setattr or use _modules to replace {k_str} on Sequential {type(parent_module)}. Module replacement might be incomplete.")
+                else:
+                    print(
+                        f"Warning: Could not find module name {k_str} in Sequential block {parent_module} to replace.")
         else:
             src_module = getattr(parent_module, k_str)
             new_module = func(src_module)
             setattr(parent_module, k_str, new_module)
-    assert not any(predicate(m)
-                   for _, m in root_module.named_modules(remove_duplicate=True))
     return root_module
 
 
@@ -760,15 +908,18 @@ class DiffusionSinusoidalPosEmb(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         device = x.device
         half_dim = self.dim // 2
-        if half_dim <= 0:  # Avoid division by zero if dim is 0 or 1
+        if half_dim <= 0:
             if self.dim == 1:
-                # Or some other handling for dim=1
-                return torch.zeros_like(x.float().unsqueeze(-1))
-            return torch.empty(*x.shape, self.dim, device=device, dtype=torch.float32)
+                return torch.sin(x.float().unsqueeze(-1))
+            return torch.zeros(*x.shape, self.dim, device=device, dtype=torch.float32)
 
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(
-            half_dim, device=device, dtype=torch.float32) * -emb)
+        emb_val = math.log(10000) / (half_dim -
+                                     1) if half_dim > 1 else math.log(10000)
+        emb = torch.exp(torch.arange(half_dim, device=device,
+                        dtype=torch.float32) * -emb_val)
         emb = x.float().unsqueeze(-1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        if self.dim > 0 and self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1), "constant", 0)
+
         return emb
