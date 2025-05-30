@@ -1,174 +1,214 @@
-"""
-This script demonstrates how to evaluate a policy that uses a bidirectional transformer 
-for state prediction and an RT-Diffusion model for action generation.
-
-The bidirectional transformer generates forward states (0-16) from images,
-which are then passed to the RT-Diffusion model to generate actions.
-
-
-"""
 from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+# CLDiffPhyConModel will be used as the State Diffusion Model
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )
+# Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
-from pathlib import Path
+from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
 
+from pathlib import Path
 import gym_pusht  # noqa: F401
 import gymnasium as gym
 import imageio
-import numpy
+import numpy  # numpy was imported as numpy, not np
 import torch
-import json  # Added for loading rtdiff_config directly
-from torch import nn
-from torch.utils.data import DataLoader
-import os
-import numpy as np
+import json
+# from torch import nn # nn was not used directly
+# from torch.utils.data import DataLoader # DataLoader not used in eval
+# import os # os was not used directly
 
 
 def main():
-
     # --- Configuration ---
-    # Define paths to the individual component outputs
     bidirectional_output_dir = Path("outputs/train/bidirectional_transformer")
-    # RT-Diffusion model output dir
-    rtdiff_output_dir = Path("outputs/train/rtdiffusion")
+    # This path should point to the *state prediction* diffusion model's output
+    # IMPORTANT: Ensure this model was trained for STATE PREDICTION.
+    # Its config.json should have "interpolate_state": true and target a state feature.
+    # MODIFIED: Example path for state predictor
+    state_diffusion_output_dir = Path(
+        "outputs/train/rtdiffusion_state_predictor")
+    invdyn_output_dir = Path("outputs/train/invdyn_only")
 
-    output_directory = Path("outputs/eval/bidirectional_rtdiffusion")
+    output_directory = Path("outputs/eval/bidirectional_rtdiffusion_3stage")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- Set up bidirectional transformer config ---
-    bidir_cfg = BidirectionalARTransformerConfig(
-        # Match the state_dim from the trained model (based on error message)
-        state_dim=2,
-        image_size=96,  # Match the image size used in training
-        forward_steps=16,  # Number of forward steps to predict
-        backward_steps=16,  # Not used in inference but required for model
-    )
 
     # --- Load Dataset Metadata for normalization statistics ---
     print("Loading dataset metadata for normalization...")
     metadata = LeRobotDatasetMetadata("lerobot/pusht")
-
-    # Print available keys to help debugging
-    print(f"Available metadata stats keys: {metadata.stats.keys()}")
-    for key_meta in metadata.stats.keys():  # Renamed key to key_meta to avoid conflict
-        print(
-            f"Keys in metadata.stats[{key_meta}]: {metadata.stats[key_meta].keys()}")
-
-    # Process the metadata statistics for BidirectionalRTDiffusionPolicy (needs tensors on device)
-    # This version will be passed to BidirectionalRTDiffusionPolicy
     processed_dataset_stats = {}
-    for key, value in metadata.stats.items():
+    for key, value_dict in metadata.stats.items():
         processed_dataset_stats[key] = {}
-        for stat_key, stat_value in value.items():
-            if isinstance(stat_value, torch.Tensor):
-                processed_dataset_stats[key][stat_key] = stat_value.to(device)
-            else:
-                processed_dataset_stats[key][stat_key] = torch.tensor(
-                    stat_value, dtype=torch.float32, device=device)  # Ensure float32
-
-    # --- Load Bidirectional Transformer Model ---
-    bidirectional_ckpt_path = bidirectional_output_dir / "final_model.pt"
-    if not bidirectional_ckpt_path.is_file():
-        # Try model_weights.pt as fallback
-        model_weights_path = bidirectional_output_dir / "model_weights.pt"
-        if model_weights_path.is_file():
-            bidirectional_ckpt_path = model_weights_path
+        if isinstance(value_dict, dict):
+            for stat_key, stat_value in value_dict.items():
+                try:
+                    # Ensure all stats are float32 for consistency with model parameters
+                    processed_dataset_stats[key][stat_key] = torch.as_tensor(
+                        stat_value, dtype=torch.float32, device=device)
+                except Exception as e:
+                    print(
+                        f"Warning: Could not convert stat {stat_key} for {key} to tensor: {e}. Value: {stat_value}")
+                    # Keep original if conversion fails
+                    processed_dataset_stats[key][stat_key] = stat_value
         else:
-            # Try model_final.pth as another fallback
-            model_final_path = bidirectional_output_dir / "model_final.pth"
-            if model_final_path.is_file():
-                bidirectional_ckpt_path = model_final_path
-            else:
-                raise OSError(
-                    f"Bidirectional transformer checkpoint not found at {bidirectional_output_dir} with common names.")
+            # Handle cases where a top-level stat might not be a dict (e.g. fps)
+            processed_dataset_stats[key] = value_dict
+
+    # --- Load BidirectionalARTransformer Config and Model ---
+    bidir_config_path = bidirectional_output_dir / "config.json"
+    if bidir_config_path.is_file():
+        bidir_cfg = BidirectionalARTransformerConfig.from_pretrained(
+            bidirectional_output_dir)
+        print(
+            f"Loaded BidirectionalARTransformerConfig from {bidir_config_path}")
+    else:
+        print(
+            f"BidirectionalARTransformerConfig json not found at {bidir_config_path}. Using manual config.")
+        state_dim_from_meta = metadata.features.get(
+            "observation.state", {}).get("shape", [2])[-1]
+        # Ensure image_channels from metadata if available
+        image_example_key = next(iter(metadata.camera_keys), None)
+        image_channels_from_meta = 3  # default
+        if image_example_key and image_example_key in metadata.features:
+            image_channels_from_meta = metadata.features[image_example_key][
+                "shape"][-1] if metadata.features[image_example_key]["shape"][-1] in [1, 3] else 3
+
+        bidir_cfg = BidirectionalARTransformerConfig(
+            state_dim=state_dim_from_meta,
+            image_size=96,  # This should match training
+            image_channels=image_channels_from_meta,  # This should match training
+            forward_steps=16,  # This should match training
+            backward_steps=16,
+            input_features=metadata.features,  # Pass features for potential use in config
+            output_features={},  # Bidir model defines its own outputs conceptually
+        )
+        print(
+            f"Using state_dim={bidir_cfg.state_dim}, image_channels={bidir_cfg.image_channels} for BidirectionalARTransformer.")
+
+    bidirectional_ckpt_path = None
+    possible_bidir_ckpt_names = ["model_final.pth",
+                                 "final_model.pt", "model_weights.pt"]
+    for name in possible_bidir_ckpt_names:
+        path = bidirectional_output_dir / name
+        if path.is_file():
+            bidirectional_ckpt_path = path
+            break
+    if bidirectional_ckpt_path is None:
+        raise OSError(
+            f"BidirectionalARTransformer checkpoint not found in {bidirectional_output_dir} with names: {possible_bidir_ckpt_names}")
 
     transformer_model = BidirectionalARTransformer(bidir_cfg)
-    print(f"Loading bidirectional transformer from: {bidirectional_ckpt_path}")
-
-    # Load the checkpoint
-    checkpoint = torch.load(bidirectional_ckpt_path, map_location="cpu")
-
-    # Extract the model state dictionary - handle different checkpoint formats
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        # This is a training checkpoint with metadata
-        model_state_dict = checkpoint["model_state_dict"]
-    else:
-        # This might be a direct state dict
-        model_state_dict = checkpoint
-
-    # Load the state dictionary
-    transformer_model.load_state_dict(model_state_dict)
+    print(
+        f"Loading BidirectionalARTransformer from: {bidirectional_ckpt_path}")
+    checkpoint_bidir = torch.load(bidirectional_ckpt_path, map_location="cpu")
+    model_state_dict_bidir = checkpoint_bidir.get(
+        "model_state_dict", checkpoint_bidir)
+    transformer_model.load_state_dict(model_state_dict_bidir)
     transformer_model.eval()
     transformer_model.to(device)
 
-    # --- Load RT-Diffusion Model ---
-    # Load configuration by directly reading the JSON and instantiating DiffusionConfig
-    rtdiff_config_json_path = rtdiff_output_dir / \
-        "config.json"  # config.json 경로 확인은 유지
-    if not rtdiff_config_json_path.is_file():
+    # --- Load State Prediction Diffusion Model (CLDiffPhyConModel) ---
+    state_diffusion_config_json_path = state_diffusion_output_dir / "config.json"
+    if not state_diffusion_config_json_path.is_file():
         raise OSError(
-            f"RT-Diffusion config JSON not found at {rtdiff_config_json_path}")
+            f"State Diffusion config JSON not found at {state_diffusion_config_json_path}")
     print(
-        f"Loading RT-Diffusion configuration from directory: {rtdiff_output_dir}")
-    # from_pretrained 메서드를 사용하여 설정 로드
-    rtdiff_config = DiffusionConfig.from_pretrained(rtdiff_output_dir)
-    # rtdiff_config.device = device # DiffusionConfig might not have a device attribute, model is moved to device later
+        f"Loading State Diffusion configuration from directory: {state_diffusion_output_dir}")
+    state_diff_cfg = DiffusionConfig.from_pretrained(
+        state_diffusion_output_dir)
 
-    # Create model instance
-    # CLDiffPhyConModel (a PreTrainedPolicy) expects raw metadata.stats
-    rt_diffusion_model = CLDiffPhyConModel(
-        config=rtdiff_config,
-        dataset_stats=metadata.stats  # Pass the original metadata.stats
+    # CRITICAL CHECK: Ensure the loaded config is for state prediction
+    if not state_diff_cfg.interpolate_state:
+        print(f"CRITICAL WARNING: State Diffusion model config at {state_diffusion_output_dir} "
+              "has 'interpolate_state: False'. This model might be trained for ACTION prediction, "
+              "not state prediction as required for this pipeline stage.")
+
+    # The DiffusionTransformer within this CLDiffPhyConModel instance should be
+    # configured to output states. This is typically handled if state_diff_cfg.interpolate_state is True,
+    # as DiffusionConfig.diffusion_target_key will point to a state.
+    # The output_dim of the internal DiffusionTransformer is set based on config.action_feature,
+    # but if interpolate_state=True, the "action_feature" effectively becomes the state feature.
+    # This is managed by how CLDiffPhyConModel uses the config.
+
+    state_diffusion_model = CLDiffPhyConModel(
+        config=state_diff_cfg,
+        dataset_stats=metadata.stats
     )
 
-    # Load model weights - try various possible checkpoint file names
-    possible_ckpt_names = ["model.pth", "model_weights.pt",
-                           "model_final.pth", "final_model.pt"]
-    rtdiff_ckpt_path = None
-
-    for name in possible_ckpt_names:
-        path = rtdiff_output_dir / name
+    possible_state_diff_ckpt_names = [
+        "model.pth", "model_weights.pt", "model_final.pth", "final_model.pt"]
+    state_diff_ckpt_path = None
+    for name in possible_state_diff_ckpt_names:
+        path = state_diffusion_output_dir / name
         if path.is_file():
-            rtdiff_ckpt_path = path
+            state_diff_ckpt_path = path
             break
-
-    if rtdiff_ckpt_path is None:
+    if state_diff_ckpt_path is None:
         raise OSError(
-            f"RT-Diffusion checkpoint not found in {rtdiff_output_dir} with common names.")
+            f"State Diffusion checkpoint not found in {state_diffusion_output_dir} with names: {possible_state_diff_ckpt_names}")
 
-    print(f"Loading RT-Diffusion model from: {rtdiff_ckpt_path}")
-    checkpoint_rtdiff = torch.load(
-        rtdiff_ckpt_path, map_location="cpu")  # Renamed to avoid conflict
+    print(f"Loading State Diffusion model from: {state_diff_ckpt_path}")
+    checkpoint_statediff = torch.load(state_diff_ckpt_path, map_location="cpu")
+    model_state_dict_statediff = checkpoint_statediff.get(
+        "model_state_dict", checkpoint_statediff)
 
-    # Extract the model state dictionary - handle different checkpoint formats
-    if isinstance(checkpoint_rtdiff, dict) and "model_state_dict" in checkpoint_rtdiff:
-        rtdiff_state_dict = checkpoint_rtdiff["model_state_dict"]
-    else:
-        rtdiff_state_dict = checkpoint_rtdiff
+    # Handle potential key mismatches if the diffusion target was different during training
+    # (e.g. if DiffusionTransformer's output head was named based on 'action' but now predicts states)
+    # This might require careful loading if strict=False causes issues.
+    state_diffusion_model.load_state_dict(
+        model_state_dict_statediff, strict=False)
+    state_diffusion_model.eval()
+    state_diffusion_model.to(device)
 
-    rt_diffusion_model.load_state_dict(rtdiff_state_dict, strict=False)
+    # --- Load Inverse Dynamics Model (MlpInvDynamic) ---
+    invdyn_o_dim = metadata.features["observation.state"]["shape"][-1]
+    invdyn_a_dim = metadata.features["action"]["shape"][-1]
+    # Use inv_dyn_hidden_dim from the state diffusion config if available, or a default
+    invdyn_hidden_dim = getattr(state_diff_cfg, 'inv_dyn_hidden_dim', 512)
 
-    rt_diffusion_model.eval()
-    rt_diffusion_model.to(device)
+    inv_dyn_model = MlpInvDynamic(
+        # MlpInvDynamic expects o_dim per state, so if input is s_t, s_{t+1}, it's 2*o_dim internally
+        o_dim=invdyn_o_dim,
+        a_dim=invdyn_a_dim,
+        hidden_dim=invdyn_hidden_dim
+    )
+    invdyn_ckpt_path = invdyn_output_dir / "invdyn_final.pth"
+    if not invdyn_ckpt_path.is_file():
+        possible_invdyn_ckpt_names = ["invdyn_model.pth", "invdyn_weights.pt"]
+        for name in possible_invdyn_ckpt_names:
+            path = invdyn_output_dir / name
+            if path.is_file():
+                invdyn_ckpt_path = path
+                break
+        if not invdyn_ckpt_path or not invdyn_ckpt_path.is_file():  # Check again after loop
+            raise OSError(
+                f"Inverse Dynamics checkpoint not found in {invdyn_output_dir} with common names.")
 
-    # Create combined policy with bidirectional transformer and RT-Diffusion
+    print(f"Loading Inverse Dynamics model from: {invdyn_ckpt_path}")
+    checkpoint_invdyn = torch.load(invdyn_ckpt_path, map_location="cpu")
+    model_state_dict_invdyn = checkpoint_invdyn.get(
+        "model_state_dict", checkpoint_invdyn)
+    inv_dyn_model.load_state_dict(model_state_dict_invdyn)
+    inv_dyn_model.eval()
+    inv_dyn_model.to(device)
+
+    # --- Create Combined Policy ---
     combined_policy = BidirectionalRTDiffusionPolicy(
         bidirectional_transformer=transformer_model,
-        rt_diffusion_model=rt_diffusion_model,
-        dataset_stats=processed_dataset_stats,  # Pass the device-processed stats here
-        n_obs_steps=rtdiff_config.n_obs_steps
+        state_diffusion_model=state_diffusion_model,
+        inverse_dynamics_model=inv_dyn_model,
+        dataset_stats=processed_dataset_stats,
+        n_obs_steps=state_diff_cfg.n_obs_steps
     )
 
     # --- Environment Setup ---
     env = gym.make(
         "gym_pusht/PushT-v0",
-        obs_type="pixels_agent_pos",  # Ensure this matches config expectations
+        obs_type="pixels_agent_pos",
         max_episode_steps=500,
     )
 
@@ -176,67 +216,77 @@ def main():
     numpy_observation, info = env.reset(seed=42)
     rewards = []
     frames = []
-    frames.append(env.render())  # Render initial frame
+
+    initial_frame_render = env.render()
+    # env.render() might return None or list
+    if isinstance(initial_frame_render, numpy.ndarray):
+        frames.append(initial_frame_render.astype(numpy.uint8))
+
     step = 0
     done = False
 
-    print("Starting evaluation rollout with Bidirectional Transformer + RT-Diffusion...")
+    print("Starting evaluation rollout with 3-stage pipeline...")
     while not done:
-        # --- Prepare Observation ---
         state_np = numpy_observation["agent_pos"].astype(
-            np.float32)  # Ensure float32
-        image_np = numpy_observation["pixels"].astype(
-            np.float32)  # Ensure float32
+            numpy.float32)  # [StateDim]
+        image_np = numpy_observation["pixels"]  # [H,W,C] uint8
 
-        # Normalize image to [0,1] and permute to CHW
-        current_image_tensor = torch.from_numpy(
-            image_np / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+        # Policy expects BCHW float for image, Batch dim for state
         current_state_tensor = torch.from_numpy(
-            state_np).unsqueeze(0).to(device)
+            state_np).unsqueeze(0)  # Add batch dim
+        # image_np is HWC uint8. BidirectionalRTDiffusionPolicy._normalize_observation handles conversion
+        current_image_tensor_for_policy = torch.from_numpy(
+            image_np).unsqueeze(0)  # Add batch dim, still HWC uint8
 
-        # Create observation dictionary for the model
-        observation = {
+        observation_for_policy = {
             "observation.state": current_state_tensor,
-            "observation.image": current_image_tensor,
+            "observation.image": current_image_tensor_for_policy,
         }
 
-        # Reset combined policy if starting a new episode
         if step == 0:
             combined_policy.reset()
 
-        # Get action from the combined policy
         with torch.inference_mode():
-            action = combined_policy.select_action(observation)
+            action = combined_policy.select_action(observation_for_policy)
 
-        # Convert to numpy for environment step
         numpy_action = action.squeeze(0).cpu().numpy()
-
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 
-        print(f"{step=} {reward=} {terminated=}")
-
+        print(
+            f"Step: {step}, Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
         rewards.append(reward)
-        frames.append(env.render())
 
-        done = terminated or truncated  # Corrected done condition
+        rendered_frame = env.render()
+        if isinstance(rendered_frame, numpy.ndarray):
+            frames.append(rendered_frame.astype(numpy.uint8))
+
+        done = terminated or truncated
         step += 1
 
     print(f"Episode ended after {step} steps.")
     total_reward = sum(rewards)
     print(f"Total reward: {total_reward}")
-    if terminated and not truncated:  # Check for successful termination
+    if terminated and not truncated:
         print("Success!")
     else:
         print("Failure or Timed Out!")
 
-    # Get the speed of environment (i.e. its number of frames per second)
-    fps = env.metadata.get("render_fps", 30)  # Added default for fps
+    fps = env.metadata.get("render_fps", 30)
+    video_path = output_directory / "rollout_3stage.mp4"
+    if frames:  # Ensure frames list is not empty
+        try:
+            # Added macro_block_size for some codecs
+            imageio.mimsave(str(video_path), frames,
+                            fps=fps, macro_block_size=1)
+            print(f"Video of the evaluation is available in '{video_path}'.")
+        except Exception as e:
+            print(
+                f"Error saving video: {e}. Frames might be empty or have inconsistent shapes.")
+    else:
+        print("No frames recorded for video.")
 
-    # Save the video
-    video_path = output_directory / "rollout_bidir_rtdiff.mp4"  # Changed filename
-    imageio.mimsave(str(video_path), numpy.stack(frames), fps=fps)
-    print(f"Video of the evaluation is available in '{video_path}'.")
+    env.close()
 
 
 if __name__ == "__main__":

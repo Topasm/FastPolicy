@@ -164,10 +164,7 @@ class DiffusionConfig(PreTrainedConfig):
                     "When interpolate_state is True, output_features must contain at least one key ending with 'state' (e.g., 'observation.state') to be used as the interpolation target."
                 )
             # Ensure action is still in output_features for the final policy output
-            if "action" not in self.output_features:
-                raise ValueError(
-                    "'action' must be included in output_features even when interpolate_state is True, as it is the final policy output."
-                )
+
         else:
             # Ensure action is the only output if not interpolating state
             if "action" not in self.output_features:
@@ -236,11 +233,6 @@ class DiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
-
-        if "action" not in self.output_features:
-            raise ValueError(
-                "The key 'action' must be present in `output_features` for the final policy output."
-            )
 
     @property
     def observation_delta_indices(self) -> list:
