@@ -2,30 +2,36 @@ from collections import deque
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Optional, Dict  # Added Dict for type hint
+from typing import Optional, Dict
 
 from lerobot.common.policies.utils import get_device_from_parameters
+# Assuming populate_queues might be used or adapted from, but not strictly in this version
+# from lerobot.common.policies.utils import populate_queues
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+# For type hinting if needed, not for direct use here
+from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
 from model.predictor.bidirectional_autoregressive_transformer import BidirectionalARTransformer
-# CLDiffPhyConModel will be used as the State Diffusion Model
-from model.diffusion.modeling_clphycon import CLDiffPhyConModel
-from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
-from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE  # Import constants
+from model.diffusion.modeling_clphycon import CLDiffPhyConModel  # state_diffusion_model
+from model.invdyn.invdyn import MlpInvDynamic
+from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE
 
 
 class BidirectionalRTDiffusionPolicy(nn.Module):
     """
-    Combined policy class that uses:
-    1. A bidirectional transformer to predict an initial future state path from images/state.
-    2. A state diffusion model (e.g., CLDiffPhyConModel configured for state prediction)
-       to refine the initial state path.
-    3. An inverse dynamics model (MlpInvDynamic) to generate actions from the refined state path.
+    Refactored combined policy:
+    1. BidirectionalARTransformer: current_obs -> initial_future_state_path
+    2. StateDiffusionModel (CLDiffPhyConModel): initial_path + obs_history -> refined_future_state_path
+    3. MlpInvDynamic: refined_path + current_state -> action_sequence
+    Normalization is handled by instances created within this policy.
     """
 
     def __init__(
         self,
         bidirectional_transformer: BidirectionalARTransformer,
-        state_diffusion_model: CLDiffPhyConModel,  # Renamed for clarity
-        inverse_dynamics_model: MlpInvDynamic,    # Added inverse dynamics model
+        state_diffusion_model: CLDiffPhyConModel,
+        inverse_dynamics_model: MlpInvDynamic,
+        # Expects raw dataset_stats (e.g., from LeRobotDatasetMetadata.stats)
         dataset_stats: dict,
         n_obs_steps: int
     ):
@@ -33,10 +39,52 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self.bidirectional_transformer = bidirectional_transformer
         self.state_diffusion_model = state_diffusion_model
         self.inverse_dynamics_model = inverse_dynamics_model
-        self.stats = dataset_stats
-        self.n_obs_steps = n_obs_steps
-        self.device = get_device_from_parameters(bidirectional_transformer)
+        # Use the config from state_diffusion_model as it's central to conditioning and action specs
+        self.config = state_diffusion_model.config
+        self.device = get_device_from_parameters(
+            bidirectional_transformer)  # Or any main model component
 
+        # Process dataset_stats to be on the correct device
+        processed_dataset_stats = {}
+        if dataset_stats is not None:
+            for key, stat_group in dataset_stats.items():
+                processed_dataset_stats[key] = {}
+                for subkey, subval in stat_group.items():
+                    try:
+                        processed_dataset_stats[key][subkey] = torch.as_tensor(
+                            subval, dtype=torch.float32, device=self.device
+                        )
+                    except Exception as e:
+                        # print(f"Warning: Could not convert stat {key}.{subkey} to tensor: {e}. Using original value.")
+                        processed_dataset_stats[key][subkey] = subval
+        else:
+            print("Warning: No dataset_stats provided to BidirectionalRTDiffusionPolicy. Normalization may be incorrect.")
+
+        # Create normalizers using the processed stats and config from state_diffusion_model
+        # Ensure config has necessary attributes like input_features, action_feature, normalization_mapping
+        if hasattr(self.config, 'input_features') and \
+           hasattr(self.config, 'normalization_mapping') and \
+           hasattr(self.config, 'action_feature'):
+            self.normalize_inputs = Normalize(
+                self.config.input_features,
+                self.config.normalization_mapping,
+                processed_dataset_stats
+            )
+            self.unnormalize_action_output = Unnormalize(
+                # Unnormalize only the action
+                {"action": self.config.action_feature},
+                self.config.normalization_mapping,
+                processed_dataset_stats
+            )
+            # print("Successfully created normalizers in BidirectionalRTDiffusionPolicy")
+        else:
+            print(
+                "Warning: Missing attributes in config for normalizer creation. Using identity normalizers.")
+            self.normalize_inputs = lambda x: x  # Identity function
+            self.unnormalize_action_output = lambda x: x.get(
+                "action", x) if isinstance(x, dict) else x  # Identity
+
+        self.n_obs_steps = n_obs_steps
         self._obs_image_queue = deque(maxlen=self.n_obs_steps)
         self._obs_state_queue = deque(maxlen=self.n_obs_steps)
         self._action_execution_queue = deque()
@@ -50,114 +98,120 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if hasattr(self.state_diffusion_model, 'reset'):
             self.state_diffusion_model.reset()
 
-    def _normalize_observation(self, raw_img: Tensor, raw_state: Tensor) -> Dict[str, Tensor]:
-        """Normalizes raw image and state observations."""
-        norm_img = raw_img
-        if raw_img.ndim == 4 and raw_img.shape[1] == 3:
-            if raw_img.max() <= 1.0 and raw_img.min() >= 0.0:
-                norm_img = raw_img * 2.0 - 1.0
-        elif raw_img.ndim == 4 and raw_img.shape[3] == 3:
-            norm_img_permuted = raw_img.permute(0, 3, 1, 2)
-            if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
-                norm_img = norm_img_permuted * 2.0 - 1.0
-            elif raw_img.dtype == torch.uint8:
-                norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
-            else:
-                norm_img = norm_img_permuted
-        elif raw_img.ndim == 3 and raw_img.shape[2] == 3:  # HWC, no batch
-            norm_img_permuted = raw_img.permute(
-                2, 0, 1).unsqueeze(0)  # Add batch, to BCHW
-            if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
-                norm_img = norm_img_permuted * 2.0 - 1.0
-            elif raw_img.dtype == torch.uint8:
-                norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
-            else:
-                norm_img = norm_img_permuted
-        else:
-            # Attempt to handle B,H,W,C if not already caught
-            if raw_img.ndim == 4 and raw_img.shape[-1] == 3:  # B,H,W,C
-                norm_img_permuted = raw_img.permute(0, 3, 1, 2)  # B,C,H,W
-                if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
-                    norm_img = norm_img_permuted * 2.0 - 1.0
-                elif raw_img.dtype == torch.uint8:
-                    norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
-                else:
-                    norm_img = norm_img_permuted
-            else:
-                print(
-                    f"Warning: Unsupported image shape or channel order for normalization: {raw_img.shape}. Passing as is.")
-                norm_img = raw_img  # Pass as is if unsure
-
-        if self.stats and "observation.state" in self.stats:
-            state_mean = self.stats["observation.state"]["mean"].to(
-                raw_state.device)
-            state_std = self.stats["observation.state"]["std"].to(
-                raw_state.device)
-            norm_state = (raw_state - state_mean) / state_std
-        else:
-            # print("Warning: State normalization stats not found. Using raw state for norm_state.")
-            norm_state = raw_state
-        return {"image": norm_img.to(self.device), "state": norm_state.to(self.device)}
-
-    def _unnormalize_action(self, normalized_action_sequence: Tensor) -> Tensor:
-        """Unnormalizes the action sequence."""
-        if self.stats and "action" in self.stats:
-            action_mean = self.stats["action"]["mean"].to(self.device)
-            action_std = self.stats["action"]["std"].to(self.device)
-            return normalized_action_sequence * action_std + action_mean
-        else:
-            # print("Warning: Action unnormalization stats not found. Returning normalized actions.")
-            return normalized_action_sequence
-
     @torch.no_grad()
     def select_action(self, current_raw_observation: Dict[str, Tensor]) -> Tensor:
         """
-        Full pipeline:
-        1. BidirectionalARTransformer: current_obs -> initial_future_state_path
-        2. StateDiffusionModel: initial_future_state_path + obs_history -> refined_future_state_path
-        3. MlpInvDynamic: refined_future_state_path + current_state -> action_sequence
+        Full pipeline with refined normalization handling.
         """
-        raw_img_input = current_raw_observation["observation.image"].to(
-            self.device)
-        raw_state_input = current_raw_observation["observation.state"].to(
-            self.device)
+        # Ensure raw observation tensors are on the correct device before normalization
+        # self.normalize_inputs expects a dictionary of tensors.
+        # The keys in current_raw_observation should match those in self.config.input_features
+        raw_obs_on_device = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in current_raw_observation.items()
+        }
 
-        normalized_obs = self._normalize_observation(
-            raw_img_input, raw_state_input)
-        norm_img = normalized_obs["image"]
-        norm_state = normalized_obs["state"]
+        # 1. Normalize Current Observation using self.normalize_inputs
+        # This returns a dict with normalized tensors, e.g., normalized_obs["observation.state"]
+        normalized_obs_batch = self.normalize_inputs(raw_obs_on_device)
 
-        # Ensure norm_img is 4D (B,C,H,W) and norm_state is 2D (B,Dim) before adding to queue
-        if norm_img.ndim == 3:
-            norm_img = norm_img.unsqueeze(0)  # Add batch if missing
-        if norm_state.ndim == 1:
-            norm_state = norm_state.unsqueeze(0)  # Add batch if missing
+        # Extract specific normalized observations for pipeline steps
+        # Ensure keys match what `self.config.input_features` defined.
+        # Example: if input_features = {"observation.state": ..., "observation.image.cam1": ...}
+        # then normalized_obs_batch will contain these keys.
 
-        self._obs_image_queue.append(
-            norm_img.unsqueeze(1))  # Store as [B,1,C,H,W]
+        # For BidirectionalARTransformer input:
+        # It needs a single image tensor and a single state tensor.
+        # If multiple cameras, decide how to handle (e.g. use first, or BidirectionalARTransformer handles multiple)
+        # For simplicity, assume BidirARTransformer uses keys "observation.image" and "observation.state"
+        # from its own config (bidirectional_transformer.config.input_features).
+        # We need to provide these from our `normalized_obs_batch`.
+
+        # Infer primary state and image keys from the policy's main config (from state_diffusion_model)
+        # This assumes these keys are consistently used.
+        main_state_key = OBS_ROBOT  # "observation.state"
+
+        # For image, self.config.image_features is a dict. Pick the first one for BidirARTransformer.
+        # This is a simplification; BidirARTransformer might have its own specific image input key.
+        image_keys_in_config = list(
+            self.config.image_features.keys()) if self.config.image_features else []
+        main_image_key = image_keys_in_config[0] if image_keys_in_config else None
+
+        if main_state_key not in normalized_obs_batch:
+            raise KeyError(
+                f"Normalized batch missing required state key: {main_state_key}")
+        # Should be [B, StateDim]
+        norm_state_current = normalized_obs_batch[main_state_key]
+
+        norm_img_current = None
+        if main_image_key and main_image_key in normalized_obs_batch:
+            # Should be [B, C, H, W]
+            norm_img_current = normalized_obs_batch[main_image_key]
+        elif "observation.image" in normalized_obs_batch:  # Fallback to a generic key
+            norm_img_current = normalized_obs_batch["observation.image"]
+        else:
+            # This case should be handled if BidirARTransformer requires an image
+            if self.bidirectional_transformer.config.input_features.get("observation.image"):
+                raise KeyError(
+                    "Normalized batch missing required image key for BidirectionalARTransformer.")
+
+        # Ensure batch dimension exists for queue items (B=1 for single step inference)
+        if norm_state_current.ndim == 1:
+            norm_state_current = norm_state_current.unsqueeze(0)
+        if norm_img_current is not None and norm_img_current.ndim == 3:
+            norm_img_current = norm_img_current.unsqueeze(0)
+
+        # Update Observation Queues with current normalized observation
+        # Queues store history for state_diffusion_model's conditioning
         self._obs_state_queue.append(
-            norm_state.unsqueeze(1))  # Store as [B,1,D_state]
+            norm_state_current.unsqueeze(1))  # Store as [B,1,D_state]
+
+        # For image queue, stack all configured image features if multiple, then add to queue.
+        # This part feeds into `state_diffusion_model`'s `_prepare_global_conditioning`.
+        if self.config.image_features:
+            current_all_norm_images_stacked = []
+            for img_key in self.config.image_features:
+                if img_key in normalized_obs_batch:
+                    img_tensor = normalized_obs_batch[img_key]
+                    if img_tensor.ndim == 3:
+                        img_tensor = img_tensor.unsqueeze(
+                            0)  # Ensure batch dim
+                    current_all_norm_images_stacked.append(img_tensor)
+            if current_all_norm_images_stacked:
+                # Stack along a new "camera" dimension for `observation.images`
+                # Each item in queue should be [B, 1, N_cam, C, H, W]
+                # Here, current_all_norm_images_stacked is list of [B,C,H,W]
+                # Stack them to [B, N_cam, C,H,W], then unsqueeze for seq_dim=1
+                stacked_cams_for_step = torch.stack(
+                    current_all_norm_images_stacked, dim=1)  # [B, N_cam, C, H, W]
+                self._obs_image_queue.append(
+                    stacked_cams_for_step.unsqueeze(1))  # [B, 1, N_cam, C, H, W]
 
         if self._action_execution_queue:
-            return self._action_execution_queue.popleft()
+            return self.unnormalize_action_output({"action": self._action_execution_queue.popleft()})["action"]
 
         if len(self._obs_state_queue) < self.n_obs_steps:
-            action_dim_tensor = self.stats.get("action", {}).get(
-                "mean", torch.zeros(2, device=self.device))
-            action_dim = action_dim_tensor.shape[0] if hasattr(
-                action_dim_tensor, 'shape') else 2
+            action_dim = self.config.action_feature.shape[0]
             # print(f"Warning: Not enough obs history ({len(self._obs_state_queue)}/{self.n_obs_steps}). Returning zero action.")
-            return torch.zeros((raw_state_input.shape[0], action_dim), device=self.device)
+            # Return unnormalized zero action
+            zero_norm_action = torch.zeros(
+                (norm_state_current.shape[0], action_dim), device=self.device)
+            return self.unnormalize_action_output({"action": zero_norm_action})["action"]
 
+        # STAGE 1: BidirectionalARTransformer for initial future state path
         bidir_config_state_dim = self.bidirectional_transformer.config.state_dim
-        if norm_state.shape[-1] != bidir_config_state_dim:
-            norm_state_for_bidir = norm_state[:, :bidir_config_state_dim]
+        if norm_state_current.shape[-1] != bidir_config_state_dim:
+            norm_state_for_bidir = norm_state_current[:,
+                                                      :bidir_config_state_dim]
         else:
-            norm_state_for_bidir = norm_state
+            norm_state_for_bidir = norm_state_current
+
+        if norm_img_current is None and self.bidirectional_transformer.config.input_features.get("observation.image"):
+            raise ValueError(
+                "BidirectionalARTransformer requires an image input but it's missing from normalized_obs_batch.")
 
         transformer_predictions = self.bidirectional_transformer(
-            initial_images=norm_img,  # norm_img should be [B,C,H,W]
-            # norm_state_for_bidir should be [B, bidir_state_dim]
+            initial_images=norm_img_current,
             initial_states=norm_state_for_bidir,
             training=False
         )
@@ -166,44 +220,37 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             [norm_state_for_bidir.unsqueeze(1), norm_predicted_future_states], dim=1
         )
 
-        obs_history_img = torch.cat(list(self._obs_image_queue), dim=1)
+        # STAGE 2A: State Diffusion Model for state path refinement
+        # History from queues:
+        # [B, n_obs_steps, StateDim]
         obs_history_state = torch.cat(list(self._obs_state_queue), dim=1)
 
-        observation_batch_for_cond = {
-            OBS_ROBOT: obs_history_state,
-            # Renamed key for consistency if _prepare_global_conditioning expects "OBS_IMAGE"
-            OBS_IMAGE: obs_history_img
-            # However, CLDiffPhyConModel's _prepare_global_conditioning uses "observation.images" (plural)
-            # Let's ensure the key matches what _prepare_global_conditioning expects.
-            # The current CLDiffPhyConModel uses "observation.images"
-        }
-        if "OBS_IMAGE" in observation_batch_for_cond:  # Temporary fix if OBS_IMAGE was used
-            observation_batch_for_cond["observation.images"] = observation_batch_for_cond.pop(
-                "OBS_IMAGE")
+        observation_batch_for_cond = {OBS_ROBOT: obs_history_state}
+        if self.config.image_features and self._obs_image_queue:
+            obs_history_img_stacked = torch.cat(
+                list(self._obs_image_queue), dim=1)  # [B, n_obs_steps, N_cam, C,H,W]
+            observation_batch_for_cond["observation.images"] = obs_history_img_stacked
 
         diffusion_horizon = self.state_diffusion_model.config.horizon
-
         initial_state_plan_for_diffusion = initial_state_plan_normalized[:,
                                                                          :diffusion_horizon, :]
 
-        # --- MODIFICATION HERE ---
         refined_state_plan_normalized = self.state_diffusion_model.diffusion.refine_state_path(
             initial_state_path=initial_state_plan_for_diffusion,
             observation_batch_for_cond=observation_batch_for_cond
         )
-        # --- END MODIFICATION ---
 
+        # STAGE 2B: MlpInvDynamic for action generation
         inv_dyn_state_dim = self.inverse_dynamics_model.o_dim
-        current_norm_state_for_invdyn = norm_state
+        # Use the *actual current full state* (norm_state_current) for the first state pair with invdyn.
+        current_norm_state_for_invdyn = norm_state_current
 
         if current_norm_state_for_invdyn.shape[-1] != inv_dyn_state_dim:
-            # print(f"Warning: Current state dim ({current_norm_state_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Using slice.")
             current_norm_state_for_invdyn = current_norm_state_for_invdyn[:,
                                                                           :inv_dyn_state_dim]
 
         refined_plan_for_invdyn = refined_state_plan_normalized
         if refined_plan_for_invdyn.shape[-1] != inv_dyn_state_dim:
-            # print(f"Warning: Refined plan dim ({refined_plan_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Adjusting.")
             if refined_plan_for_invdyn.shape[-1] < inv_dyn_state_dim:
                 padding_size = inv_dyn_state_dim - \
                     refined_plan_for_invdyn.shape[-1]
@@ -220,35 +267,54 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                                                                   :, :inv_dyn_state_dim]
 
         num_planned_actions = refined_plan_for_invdyn.shape[1]
+        if num_planned_actions == 0:  # Should not happen if horizon > 0
+            action_dim = self.config.action_feature.shape[0]
+            zero_norm_action = torch.zeros(
+                (norm_state_current.shape[0], action_dim), device=self.device)
+            return self.unnormalize_action_output({"action": zero_norm_action})["action"]
 
-        s_prev_list = [current_norm_state_for_invdyn.unsqueeze(1)] + \
-                      [refined_plan_for_invdyn[:, i, :].unsqueeze(
-                          1) for i in range(num_planned_actions - 1)]
-        s_prev_seq = torch.cat(s_prev_list, dim=1)
-        s_curr_seq = refined_plan_for_invdyn[:, :num_planned_actions, :]
+        # Create state pairs for inverse dynamics model
+        # First pair: (current_actual_state, refined_plan_state_0)
+        # Subsequent pairs: (refined_plan_state_i, refined_plan_state_{i+1})
+        actions_normalized_list = []
 
-        inv_dyn_input_seq = torch.cat([s_prev_seq, s_curr_seq], dim=-1)
+        first_state_for_pair = current_norm_state_for_invdyn
+        for i in range(num_planned_actions):  # Iterate up to H_diffusion-1 actions
+            # This is s'_i
+            second_state_for_pair = refined_plan_for_invdyn[:, i, :]
 
-        B_inv, H_inv, D_inv_pair = inv_dyn_input_seq.shape
-        inv_dyn_input_flat = inv_dyn_input_seq.reshape(
-            B_inv * H_inv, D_inv_pair)
+            # [B, 2*inv_dyn_state_dim]
+            state_pair = torch.cat(
+                [first_state_for_pair, second_state_for_pair], dim=-1)
+            action_i_normalized = self.inverse_dynamics_model(
+                state_pair)  # [B, action_dim]
+            actions_normalized_list.append(action_i_normalized)
 
-        actions_normalized_flat = self.inverse_dynamics_model(
-            inv_dyn_input_flat)
-        actions_normalized_sequence = actions_normalized_flat.reshape(
-            B_inv, H_inv, -1)
+            # Update for next iteration: s'_i becomes s_t
+            first_state_for_pair = second_state_for_pair
 
-        actions_unnormalized = self._unnormalize_action(
-            actions_normalized_sequence)
+        actions_normalized_sequence = torch.stack(
+            actions_normalized_list, dim=1)  # [B, num_planned_actions, action_dim]
 
-        for i in range(actions_unnormalized.shape[1]):
-            self._action_execution_queue.append(actions_unnormalized[:, i, :])
+        # Unnormalize and queue actions
+        # The `unnormalize_action_output` expects a dict {"action": tensor}
+        # where tensor is [B, H, ActionDim] or [H, ActionDim]
+        # Our `actions_normalized_sequence` is [B, H_actions, ActionDim]
+        # If B=1 (typical for eval step), squeeze batch dim for unnormalizer if it expects [H, Dim]
+        # However, LeRobot Unnormalizer handles batched inputs.
+
+        # Store normalized actions in queue, unnormalize when popping.
+        for i in range(actions_normalized_sequence.shape[1]):
+            self._action_execution_queue.append(
+                actions_normalized_sequence[:, i, :])  # Store [B, ActionDim]
 
         if self._action_execution_queue:
-            return self._action_execution_queue.popleft()
-        else:
-            action_dim_tensor = self.stats.get("action", {}).get(
-                "mean", torch.zeros(2, device=self.device))
-            action_dim = action_dim_tensor.shape[0] if hasattr(
-                action_dim_tensor, 'shape') else 2
-            return torch.zeros((raw_state_input.shape[0], action_dim), device=self.device)
+            # Pop first normalized action, then unnormalize it
+            # [B, ActionDim]
+            next_normalized_action = self._action_execution_queue.popleft()
+            return self.unnormalize_action_output({"action": next_normalized_action})["action"]
+        else:  # Should not be reached if num_planned_actions > 0
+            action_dim = self.config.action_feature.shape[0]
+            zero_norm_action = torch.zeros(
+                (norm_state_current.shape[0], action_dim), device=self.device)
+            return self.unnormalize_action_output({"action": zero_norm_action})["action"]
