@@ -201,7 +201,8 @@ def main():
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,
         inverse_dynamics_model=inv_dyn_model,
-        dataset_stats=processed_dataset_stats,
+        dataset_stats=metadata.stats,  # Pass raw metadata.stats
+        all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
         n_obs_steps=state_diff_cfg.n_obs_steps
     )
 
