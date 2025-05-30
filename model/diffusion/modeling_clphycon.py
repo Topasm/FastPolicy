@@ -70,20 +70,9 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         if hasattr(config, 'plan_state_dim_for_rt_diffusion') and config.plan_state_dim_for_rt_diffusion is not None:
             plan_input_dim = config.plan_state_dim_for_rt_diffusion
 
-        # Embedding dimension for plan features
-        plan_feature_dim = getattr(config, 'plan_feature_dim', 64)
-
-        self.plan_embedder = nn.Sequential(
-            # Input dim matches each state in the plan
-            nn.Linear(plan_input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, plan_feature_dim)
-        )
-        self.plan_feature_dim = plan_feature_dim  # Store for DiffusionModel
-
         # Initialize the diffusion model with the plan feature dimension
         self.diffusion = DiffusionModel(
-            config, plan_feature_dim=self.plan_feature_dim
+            config,
         )
 
         self.reset()
@@ -142,15 +131,11 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             -1, original_shape[-1])
         embedded_plan_steps = self.plan_embedder(reshaped_plan_states)
         embedded_plan_sequence = embedded_plan_steps.reshape(
-            original_shape[0], original_shape[1], -1)  # [B, plan_horizon, plan_feature_dim]
+            original_shape[0], original_shape[1], -1)  # [B, plan_horizon]
 
         # Create a fixed-size plan feature vector by averaging or taking the first step's embedding.
-        # Averaging might be more robust.
-        plan_features = embedded_plan_sequence.mean(
-            dim=1)  # [B, plan_feature_dim]
-        plan_features = plan_features.to(device)
 
-        # 2. Prepare global conditioning from observation history + embedded plan
+        # 2. Prepare global conditioning from observation history
         # obs_dict should already contain features like OBS_ROBOT, "observation.images"
         # These are expected by _prepare_global_conditioning
         # Ensure keys in obs_dict match what _prepare_global_conditioning expects (OBS_ROBOT etc.)
@@ -168,8 +153,7 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             processed_obs_for_diffusion[OBS_ENV] = obs_dict["observation.environment_state"]
 
         global_cond_with_plan = self.diffusion._prepare_global_conditioning(
-            processed_obs_for_diffusion,
-            plan_features=plan_features
+            processed_obs_for_diffusion
         )
 
         # 3. Conditional Sampling Logic
@@ -271,11 +255,9 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         final_normalized_batch = self.normalize_targets(
             normalized_batch_with_images)
 
-        # The DiffusionModel.compute_loss expects global_cond to be prepared without plan_features
-        # as plan_features are specific to predict_action for plan following.
-        # For training, global_cond is based purely on observations.
+        # The DiffusionModel.compute_loss expects global_cond to be prepared
         global_cond_train = self.diffusion._prepare_global_conditioning(
-            final_normalized_batch, plan_features=None)
+            final_normalized_batch)
 
         loss = self.diffusion.compute_loss(
             final_normalized_batch, global_cond_override=global_cond_train)
@@ -298,9 +280,9 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         final_normalized_batch = self.normalize_targets(
             normalized_batch_with_images)
 
-        # Prepare global conditioning (without plan features for training async transformer)
+        # Prepare global conditioning
         global_cond_train_async = self.diffusion._prepare_global_conditioning(
-            final_normalized_batch, plan_features=None)
+            final_normalized_batch)
 
         actions = final_normalized_batch["action"]
         # Use config.horizon for async training target
@@ -338,10 +320,9 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
 
 
 class DiffusionModel(nn.Module):
-    def __init__(self, config: DiffusionConfig, plan_feature_dim: int = 0):
+    def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
-        self.plan_feature_dim = plan_feature_dim  # Store it
 
         # Build observation encoders
         # global_cond_dim here is for observation features only
@@ -366,9 +347,8 @@ class DiffusionModel(nn.Module):
         # Total dimension for observation part of global_cond, considering n_obs_steps
         global_cond_obs_part_dim_total = obs_only_cond_dim * config.n_obs_steps
 
-        # Final global_cond_dim_total includes the plan features
-        global_cond_dim_total_for_transformer = global_cond_obs_part_dim_total + \
-            self.plan_feature_dim
+        # Final global_cond_dim_total
+        global_cond_dim_total_for_transformer = global_cond_obs_part_dim_total
 
         self.transformer = DiffusionTransformer(
             config,
@@ -398,12 +378,11 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor], plan_features: Optional[Tensor] = None) -> Tensor:
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """
         Encode observation features and concatenate them with optional plan features.
         batch: Expected to contain keys like OBS_ROBOT, "observation.images", OBS_ENV.
                All tensors in batch are [B, n_obs_steps, ...].
-        plan_features: Optional tensor [B, plan_feature_dim].
         """
         batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:
                                                          2]  # Assuming OBS_ROBOT is always present
@@ -455,19 +434,15 @@ class DiffusionModel(nn.Module):
         # Now, prepare final conditioning list
         final_cond_list = [flattened_obs_feats]
 
-        if plan_features is not None:
-            # plan_features is [B, plan_feature_dim]
-            final_cond_list.append(plan_features)
-
-        # Concatenate flattened observation features and plan features
-        # [B, (n_obs_steps * D_obs_total) + plan_feature_dim]
+        # Concatenate flattened observation features and
+        # [B, (n_obs_steps * D_obs_total)
         final_global_cond = torch.cat(final_cond_list, dim=-1)
 
         return final_global_cond
 
     def conditional_sample(
-        # plan_features is now part of global_cond
-        self, batch_size: int, global_cond: Tensor, plan_features: Optional[Tensor] = None,
+
+        self, batch_size: int, global_cond: Tensor,
         generator: Optional[torch.Generator] = None
     ) -> Tensor:
         device = get_device_from_parameters(self)
@@ -485,7 +460,7 @@ class DiffusionModel(nn.Module):
                 sample,
                 torch.full((batch_size,), t, dtype=torch.long,
                            device=sample.device),
-                global_cond=global_cond,  # This global_cond already includes plan_features
+                global_cond=global_cond,
             )
             sample = self.noise_scheduler.step(
                 model_output, t, sample, generator=generator).prev_sample
@@ -493,8 +468,7 @@ class DiffusionModel(nn.Module):
 
     def async_conditional_sample(
         self, current_input_normalized: Tensor, global_cond: Tensor,
-        # plan_features is now part of global_cond
-        plan_features: Optional[Tensor] = None,
+
         generator: Optional[torch.Generator] = None
     ) -> Tensor:
         """
@@ -572,9 +546,9 @@ class DiffusionModel(nn.Module):
         """
         batch_size = batch[OBS_ROBOT].shape[0]  # Assuming OBS_ROBOT is always present
 
-        # Prepare global_cond without plan_features for standalone generation
+        # Prepare global_cond
         global_cond_obs_only = self._prepare_global_conditioning(
-            batch, plan_features=None)
+            batch)
 
         actions = self.conditional_sample(
             batch_size, global_cond=global_cond_obs_only)
@@ -602,9 +576,9 @@ class DiffusionModel(nn.Module):
         if global_cond_override is not None:
             current_global_cond = global_cond_override
         else:
-            # Prepare global_cond without plan_features for standard training
+            # Prepare global_cond
             current_global_cond = self._prepare_global_conditioning(
-                batch, plan_features=None)
+                batch)
 
         pred = self.transformer(
             noisy_trajectory, timesteps, global_cond=current_global_cond)
