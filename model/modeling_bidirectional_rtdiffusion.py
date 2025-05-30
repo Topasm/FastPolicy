@@ -6,7 +6,7 @@ from typing import Optional, Dict  # Added Dict for type hint
 
 from lerobot.common.policies.utils import get_device_from_parameters
 from model.predictor.bidirectional_autoregressive_transformer import BidirectionalARTransformer
-# RT-Diffusion model (CLDiffPhyConModel) will be passed as state_diffusion_model
+# CLDiffPhyConModel will be used as the State Diffusion Model
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
 from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE  # Import constants
@@ -41,44 +41,63 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self._obs_state_queue = deque(maxlen=self.n_obs_steps)
         self._action_execution_queue = deque()
 
-        # For CL-DiffPhyCon style feedback mechanism (can be removed if not used by state_diffusion_model)
-        # self._u_pred_async_rt_diffusion = None # This was for action diffusion
-
     def reset(self):
         """Clear all observation and action queues."""
         self._obs_image_queue.clear()
         self._obs_state_queue.clear()
         self._action_execution_queue.clear()
-        # self._u_pred_async_rt_diffusion = None
 
         if hasattr(self.state_diffusion_model, 'reset'):
             self.state_diffusion_model.reset()
 
     def _normalize_observation(self, raw_img: Tensor, raw_state: Tensor) -> Dict[str, Tensor]:
         """Normalizes raw image and state observations."""
-        norm_img = raw_img  # Assume raw_img is already [0,1] CHW or handled by BidirTransformer
-        # B,C,H,W, 0-1
-        if raw_img.max() <= 1.0 and raw_img.min() >= 0.0 and raw_img.ndim == 4 and raw_img.shape[1] == 3:
-            # Assuming BidirectionalARTransformer expects images in [-1, 1]
-            norm_img = raw_img * 2.0 - 1.0
-        # B,C,H,W, but not 0-1, assume already correct
-        elif raw_img.ndim == 4 and raw_img.shape[1] == 3:
-            norm_img = raw_img
-        else:  # HWC, 0-255
-            norm_img = (raw_img.float() / 255.0).permute(0,
-                                                         3, 1, 2)  # BHWC to BCHW
-            norm_img = norm_img * 2.0 - 1.0
+        norm_img = raw_img
+        if raw_img.ndim == 4 and raw_img.shape[1] == 3:
+            if raw_img.max() <= 1.0 and raw_img.min() >= 0.0:
+                norm_img = raw_img * 2.0 - 1.0
+        elif raw_img.ndim == 4 and raw_img.shape[3] == 3:
+            norm_img_permuted = raw_img.permute(0, 3, 1, 2)
+            if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
+                norm_img = norm_img_permuted * 2.0 - 1.0
+            elif raw_img.dtype == torch.uint8:
+                norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
+            else:
+                norm_img = norm_img_permuted
+        elif raw_img.ndim == 3 and raw_img.shape[2] == 3:  # HWC, no batch
+            norm_img_permuted = raw_img.permute(
+                2, 0, 1).unsqueeze(0)  # Add batch, to BCHW
+            if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
+                norm_img = norm_img_permuted * 2.0 - 1.0
+            elif raw_img.dtype == torch.uint8:
+                norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
+            else:
+                norm_img = norm_img_permuted
+        else:
+            # Attempt to handle B,H,W,C if not already caught
+            if raw_img.ndim == 4 and raw_img.shape[-1] == 3:  # B,H,W,C
+                norm_img_permuted = raw_img.permute(0, 3, 1, 2)  # B,C,H,W
+                if norm_img_permuted.max() <= 1.0 and norm_img_permuted.min() >= 0.0:
+                    norm_img = norm_img_permuted * 2.0 - 1.0
+                elif raw_img.dtype == torch.uint8:
+                    norm_img = (norm_img_permuted.float() / 255.0) * 2.0 - 1.0
+                else:
+                    norm_img = norm_img_permuted
+            else:
+                print(
+                    f"Warning: Unsupported image shape or channel order for normalization: {raw_img.shape}. Passing as is.")
+                norm_img = raw_img  # Pass as is if unsure
 
         if self.stats and "observation.state" in self.stats:
             state_mean = self.stats["observation.state"]["mean"].to(
-                self.device)
-            state_std = self.stats["observation.state"]["std"].to(self.device)
-            norm_state = (raw_state.to(self.device) - state_mean) / state_std
+                raw_state.device)
+            state_std = self.stats["observation.state"]["std"].to(
+                raw_state.device)
+            norm_state = (raw_state - state_mean) / state_std
         else:
-            print(
-                "Warning: State normalization stats not found. Using raw state for norm_state.")
-            norm_state = raw_state.to(self.device)
-        return {"image": norm_img.to(self.device), "state": norm_state}
+            # print("Warning: State normalization stats not found. Using raw state for norm_state.")
+            norm_state = raw_state
+        return {"image": norm_img.to(self.device), "state": norm_state.to(self.device)}
 
     def _unnormalize_action(self, normalized_action_sequence: Tensor) -> Tensor:
         """Unnormalizes the action sequence."""
@@ -87,8 +106,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             action_std = self.stats["action"]["std"].to(self.device)
             return normalized_action_sequence * action_std + action_mean
         else:
-            print(
-                "Warning: Action unnormalization stats not found. Returning normalized actions.")
+            # print("Warning: Action unnormalization stats not found. Returning normalized actions.")
             return normalized_action_sequence
 
     @torch.no_grad()
@@ -99,21 +117,21 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         2. StateDiffusionModel: initial_future_state_path + obs_history -> refined_future_state_path
         3. MlpInvDynamic: refined_future_state_path + current_state -> action_sequence
         """
-        # Ensure input tensors are on the correct device (if not already)
         raw_img_input = current_raw_observation["observation.image"].to(
             self.device)
         raw_state_input = current_raw_observation["observation.state"].to(
             self.device)
 
-        # 1. Prepare Current Observation (Normalize & Update Queues)
-        # Assuming current_raw_observation["observation.image"] is [B,C,H,W] or [B,H,W,C]
-        # Assuming current_raw_observation["observation.state"] is [B, env_state_dim]
         normalized_obs = self._normalize_observation(
             raw_img_input, raw_state_input)
-        # Expected by BidirARTransformer: [B,C,H,W]
         norm_img = normalized_obs["image"]
-        # Expected by BidirARTransformer: [B,D_state]
         norm_state = normalized_obs["state"]
+
+        # Ensure norm_img is 4D (B,C,H,W) and norm_state is 2D (B,Dim) before adding to queue
+        if norm_img.ndim == 3:
+            norm_img = norm_img.unsqueeze(0)  # Add batch if missing
+        if norm_state.ndim == 1:
+            norm_state = norm_state.unsqueeze(0)  # Add batch if missing
 
         self._obs_image_queue.append(
             norm_img.unsqueeze(1))  # Store as [B,1,C,H,W]
@@ -126,107 +144,78 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if len(self._obs_state_queue) < self.n_obs_steps:
             action_dim_tensor = self.stats.get("action", {}).get(
                 "mean", torch.zeros(2, device=self.device))
-            action_dim = action_dim_tensor.shape[0]
-            print(
-                f"Warning: Not enough obs history ({len(self._obs_state_queue)}/{self.n_obs_steps}). Returning zero action.")
+            action_dim = action_dim_tensor.shape[0] if hasattr(
+                action_dim_tensor, 'shape') else 2
+            # print(f"Warning: Not enough obs history ({len(self._obs_state_queue)}/{self.n_obs_steps}). Returning zero action.")
             return torch.zeros((raw_state_input.shape[0], action_dim), device=self.device)
 
-        # STAGE 1: BidirectionalARTransformer for initial future state path
-        # Ensure norm_state for bidir_transformer matches its expected state_dim
         bidir_config_state_dim = self.bidirectional_transformer.config.state_dim
         if norm_state.shape[-1] != bidir_config_state_dim:
-            # Assuming the BidirARTransformer was trained on a specific part of the state
-            # (e.g., first `bidir_config_state_dim` elements)
             norm_state_for_bidir = norm_state[:, :bidir_config_state_dim]
         else:
             norm_state_for_bidir = norm_state
 
         transformer_predictions = self.bidirectional_transformer(
-            initial_images=norm_img,
+            initial_images=norm_img,  # norm_img should be [B,C,H,W]
+            # norm_state_for_bidir should be [B, bidir_state_dim]
             initial_states=norm_state_for_bidir,
             training=False
         )
-        # norm_predicted_future_states: [B, F-1, D_state_bidir] (st_1 to st_{F-1})
         norm_predicted_future_states = transformer_predictions['predicted_forward_states']
-        # initial_state_plan_normalized: [B, F, D_state_bidir] (st_0 to st_{F-1})
         initial_state_plan_normalized = torch.cat(
             [norm_state_for_bidir.unsqueeze(1), norm_predicted_future_states], dim=1
         )
 
-        # STAGE 2A: State Diffusion Model for state path refinement
-        obs_history_img = torch.cat(
-            list(self._obs_image_queue), dim=1)    # [B, n_obs, C, H, W]
-        obs_history_state = torch.cat(
-            list(self._obs_state_queue), dim=1)  # [B, n_obs, D_state_full]
+        obs_history_img = torch.cat(list(self._obs_image_queue), dim=1)
+        obs_history_state = torch.cat(list(self._obs_state_queue), dim=1)
 
-        # state_diffusion_model._prepare_global_conditioning expects keys like OBS_ROBOT, OBS_IMAGE
         observation_batch_for_cond = {
             OBS_ROBOT: obs_history_state,
+            # Renamed key for consistency if _prepare_global_conditioning expects "OBS_IMAGE"
             OBS_IMAGE: obs_history_img
-            # Add OBS_ENV if used by state_diffusion_model's config
+            # However, CLDiffPhyConModel's _prepare_global_conditioning uses "observation.images" (plural)
+            # Let's ensure the key matches what _prepare_global_conditioning expects.
+            # The current CLDiffPhyConModel uses "observation.images"
         }
+        if "OBS_IMAGE" in observation_batch_for_cond:  # Temporary fix if OBS_IMAGE was used
+            observation_batch_for_cond["observation.images"] = observation_batch_for_cond.pop(
+                "OBS_IMAGE")
 
         diffusion_horizon = self.state_diffusion_model.config.horizon
-        # Ensure initial_state_plan_normalized matches the state dim expected by state_diffusion_model
-        # The state_diffusion_model refines states in its own configured state space.
-        # If bidir_state_dim is different from state_diffusion_model's state_dim,
-        # a projection/padding might be needed. For now, assume they match or
-        # state_diffusion_model.config.robot_state_feature.shape[0] is bidir_config_state_dim
-        if initial_state_plan_normalized.shape[-1] != self.state_diffusion_model.config.robot_state_feature.shape[0]:
-            print(
-                f"Warning: State dim mismatch between BidirTransformer output ({initial_state_plan_normalized.shape[-1]}) and StateDiffusion input ({self.state_diffusion_model.config.robot_state_feature.shape[0]}). Ensure this is handled or dimensions match.")
-            # Example: if state_diffusion expects more dims, pad with zeros or repeat
-            # For now, we'll proceed assuming they match or the diffusion model handles it internally via its target key.
 
         initial_state_plan_for_diffusion = initial_state_plan_normalized[:,
                                                                          :diffusion_horizon, :]
 
-        # refined_state_plan_normalized will be in the state space of state_diffusion_model
-        refined_state_plan_normalized = self.state_diffusion_model.refine_state_path(
+        # --- MODIFICATION HERE ---
+        refined_state_plan_normalized = self.state_diffusion_model.diffusion.refine_state_path(
             initial_state_path=initial_state_plan_for_diffusion,
             observation_batch_for_cond=observation_batch_for_cond
-        )  # Output: [B, diffusion_horizon, D_state_diffusion] (normalized)
-
-        # STAGE 2B: MlpInvDynamic for action generation
-        # refined_state_plan_normalized contains s'_0, s'_1, ..., s'_{H_diff-1}
-        # We need to use the *current actual normalized state* (norm_state) as the first state for invdyn
-        # The state dimension for inv_dyn_model is self.inverse_dynamics_model.o_dim
-        # Ensure norm_state and refined_state_plan_normalized match this dimension.
-        # Typically, MlpInvDynamic is trained on the full robot state.
-        # So, norm_state (full dim) and refined_state_plan (potentially partial dim if Bidir was partial)
+        )
+        # --- END MODIFICATION ---
 
         inv_dyn_state_dim = self.inverse_dynamics_model.o_dim
-
-        # If refined_state_plan_normalized dim != inv_dyn_state_dim, projection/padding is needed.
-        # For this example, let's assume refined_state_plan_normalized output by state_diffusion_model
-        # already matches the inv_dyn_state_dim. If not, this is a point of careful handling.
-        # And norm_state (full current state) should also be sliced if inv_dyn expects a specific sub-part.
-        # However, MlpInvDynamic usually takes the full state.
-
-        # Use the full current normalized state
         current_norm_state_for_invdyn = norm_state
+
         if current_norm_state_for_invdyn.shape[-1] != inv_dyn_state_dim:
-            print(
-                f"Warning: Current state dim ({current_norm_state_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Slicing/Padding may be needed.")
-            # Simplistic slice
+            # print(f"Warning: Current state dim ({current_norm_state_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Using slice.")
             current_norm_state_for_invdyn = current_norm_state_for_invdyn[:,
                                                                           :inv_dyn_state_dim]
 
         refined_plan_for_invdyn = refined_state_plan_normalized
         if refined_plan_for_invdyn.shape[-1] != inv_dyn_state_dim:
-            print(
-                f"Warning: Refined plan dim ({refined_plan_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Slicing/Padding may be needed.")
-            # Example: if refined plan is 2D (x,y) from Bidir->StateDiff, but InvDyn needs 7D state
-            # This would require mapping 2D plan to 7D plan, which is non-trivial and outside scope here.
-            # For now, assume state_diffusion_model outputs states compatible with MlpInvDynamic.
-            # Or, a simple slice/pad if dimensions are close:
-            # Pad with zeros
+            # print(f"Warning: Refined plan dim ({refined_plan_for_invdyn.shape[-1]}) mismatch for InvDyn ({inv_dyn_state_dim}). Adjusting.")
             if refined_plan_for_invdyn.shape[-1] < inv_dyn_state_dim:
-                padding = torch.zeros(refined_plan_for_invdyn.shape[0], refined_plan_for_invdyn.shape[1],
-                                      inv_dyn_state_dim - refined_plan_for_invdyn.shape[-1], device=self.device)
+                padding_size = inv_dyn_state_dim - \
+                    refined_plan_for_invdyn.shape[-1]
+                padding = torch.zeros(
+                    refined_plan_for_invdyn.shape[0],
+                    refined_plan_for_invdyn.shape[1],
+                    padding_size,
+                    device=self.device
+                )
                 refined_plan_for_invdyn = torch.cat(
                     [refined_plan_for_invdyn, padding], dim=-1)
-            else:  # Slice
+            else:
                 refined_plan_for_invdyn = refined_plan_for_invdyn[:,
                                                                   :, :inv_dyn_state_dim]
 
@@ -236,7 +225,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                       [refined_plan_for_invdyn[:, i, :].unsqueeze(
                           1) for i in range(num_planned_actions - 1)]
         s_prev_seq = torch.cat(s_prev_list, dim=1)
-
         s_curr_seq = refined_plan_for_invdyn[:, :num_planned_actions, :]
 
         inv_dyn_input_seq = torch.cat([s_prev_seq, s_curr_seq], dim=-1)
@@ -261,5 +249,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         else:
             action_dim_tensor = self.stats.get("action", {}).get(
                 "mean", torch.zeros(2, device=self.device))
-            action_dim = action_dim_tensor.shape[0]
+            action_dim = action_dim_tensor.shape[0] if hasattr(
+                action_dim_tensor, 'shape') else 2
             return torch.zeros((raw_state_input.shape[0], action_dim), device=self.device)
