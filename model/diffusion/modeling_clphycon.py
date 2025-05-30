@@ -97,144 +97,190 @@ class CLDiffPhyConModel(PreTrainedPolicy):
                 maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action(self,
-                       obs_dict: dict[str, Tensor],
-                       plan_states_normalized: Tensor,  # Plan from Bidirectional Transformer
-                       previous_rt_diffusion_plan: Optional[Tensor] = None
-                       ) -> Tensor:
+    def predict_action(self, obs_dict: dict[str, Tensor], previous_rt_diffusion_plan: Optional[Tensor] = None) -> Tensor:
         """
-        Generate actions using the RT-Diffusion model, conditioned on observation history
-        and the planned state trajectory from Bidirectional Transformer.
-
-        Args:
-            obs_dict: Dictionary containing normalized observation history tensors.
-                      Expected keys: "observation.state" ([B, n_obs_steps, state_dim]),
-                                     "observation.image" ([B, n_obs_steps, NumCameras, C,H,W]).
-            plan_states_normalized: Normalized planned state path from Bidirectional Transformer
-                                     Shape: [B, plan_horizon, plan_state_dim].
-            previous_rt_diffusion_plan: Optional normalized action plan from the previous step
-                                         for CL-DiffPhyCon style feedback. Shape: [B, action_horizon, action_dim].
-
-        Returns:
-            normalized_action_sequence: Predicted normalized action sequence.
-                                         Shape: [B, action_horizon, action_dim].
-        """
+            Generate actions using the RT-Diffusion model, conditioned on observation history.
+            Plan features are no longer used for global conditioning.
+            """
         batch_size = obs_dict["observation.state"].shape[0]
         device = get_device_from_parameters(self)
 
-        # 1. Embed the plan_states_normalized
-        # plan_states_normalized is [B, plan_horizon, plan_state_dim]
-        # self.plan_embedder expects [N, plan_state_dim]
-        # We can either process it step-wise or reshape. Reshaping is more efficient.
-        original_shape = plan_states_normalized.shape
-        reshaped_plan_states = plan_states_normalized.reshape(
-            -1, original_shape[-1])
-        embedded_plan_steps = self.plan_embedder(reshaped_plan_states)
-        embedded_plan_sequence = embedded_plan_steps.reshape(
-            original_shape[0], original_shape[1], -1)  # [B, plan_horizon]
-
-        # Create a fixed-size plan feature vector by averaging or taking the first step's embedding.
-
-        # 2. Prepare global conditioning from observation history
-        # obs_dict should already contain features like OBS_ROBOT, "observation.images"
-        # These are expected by _prepare_global_conditioning
-        # Ensure keys in obs_dict match what _prepare_global_conditioning expects (OBS_ROBOT etc.)
-        # The obs_dict passed from BidirectionalRTDiffusionPolicy uses "observation.state" and "observation.image"
-        # We need to map them if _prepare_global_conditioning uses OBS_ROBOT.
-
-        # Create processed_obs for _prepare_global_conditioning
+        # 2. Prepare global conditioning from observation history ONLY
         processed_obs_for_diffusion = {}
-        if "observation.state" in obs_dict:
+        if OBS_ROBOT in obs_dict:  # lerobot.common.constants에서 OBS_ROBOT 등을 import 해야 할 수 있습니다.
             processed_obs_for_diffusion[OBS_ROBOT] = obs_dict["observation.state"]
-        if "observation.image" in obs_dict and self.config.image_features:
-            # _prepare_global_conditioning expects "observation.images" if using images
+        if self.config.image_features and "observation.image" in obs_dict:
             processed_obs_for_diffusion["observation.images"] = obs_dict["observation.image"]
-        if "observation.environment_state" in obs_dict and self.config.env_state_feature:
+        if self.config.env_state_feature and OBS_ENV in obs_dict:  # OBS_ENV도 import 필요
             processed_obs_for_diffusion[OBS_ENV] = obs_dict["observation.environment_state"]
 
-        global_cond_with_plan = self.diffusion._prepare_global_conditioning(
-            processed_obs_for_diffusion
-        )
+        global_cond = self.diffusion._prepare_global_conditioning(
+            processed_obs_for_diffusion)
 
         # 3. Conditional Sampling Logic
         action_sequence: Tensor
         if previous_rt_diffusion_plan is not None:
-            print(
-                f"[{self.__class__.__name__}] Refining plan with feedback (async)...")
+            # print(f"[{self.__class__.__name__}] Refining plan with feedback (async)...")
             action_sequence = self.diffusion.async_conditional_sample(
                 current_input_normalized=previous_rt_diffusion_plan,
-                global_cond=global_cond_with_plan  # This now includes plan features
+                global_cond=global_cond  # plan_features가 없는 global_cond 사용
             )
         else:
-            print(f"[{self.__class__.__name__}] Generating initial plan (sync)...")
+            # print(f"[{self.__class__.__name__}] Generating initial plan (sync)...") # 디버깅용 출력은 유지 가능
             action_sequence = self.diffusion.conditional_sample(
                 batch_size=batch_size,
-                global_cond=global_cond_with_plan  # This now includes plan features
+                global_cond=global_cond  # plan_features가 없는 global_cond 사용
             )
 
         return action_sequence
 
     @torch.no_grad()
-    def select_action(
-        self,
-        observation: dict[str, Tensor],
-        episode_return: Optional[float] = None,
-        episode_step: Optional[int] = None,
-        training_progress: Optional[float] = None,
-        deterministic: bool = False,
-    ) -> Tensor:  # 반환 타입은 실제 반환하는 것에 맞게 조정할 수 있으나, Tensor로 우선 둡니다.
-        """Select action for evaluation (when used as a standalone policy)."""
-        from lerobot.common.policies.utils import populate_queues
+    def select_action(self, current_raw_observation: dict[str, Tensor]) -> Tensor:
+        # ... (1. 현재 관찰 준비: norm_img, norm_state 생성 및 큐 업데이트 - 기존 로직 활용) ...
+        # raw_img = current_raw_observation["observation.image"]
+        # raw_state = current_raw_observation["observation.state"]
+        # # MyDiffusionModel의 normalizer를 사용하거나, BidirectionalRTDiffusionPolicy에서 직접 정규화
+        # # 여기서는 MyDiffusionModel이 내부적으로 처리한다고 가정하거나, stats를 사용해 직접 정규화
+        # # 예시:
+        # norm_img = (raw_img.to(self.device) / 255.0) * 2.0 - 1.0 # 만약 0-1 범위라면
+        # state_mean = self.stats["observation.state"]["mean"].to(self.device)
+        # state_std = self.stats["observation.state"]["std"].to(self.device)
+        # norm_state = (raw_state.to(self.device) - state_mean) / state_std
 
-        current_obs_for_norm = {}
-        # input_features는 Dict[str, FeatureSpec] 형태이므로, key로 직접 순회합니다.
-        for cfg_key in self.config.input_features:
-            obs_part_key = cfg_key.split("observation.")[-1]
-            if obs_part_key in observation:
-                current_obs_for_norm[cfg_key] = observation[obs_part_key]
+        # self._obs_image_queue.append(norm_img.unsqueeze(1)) # 큐에는 [B,1,C,H,W] 또는 [B,1,D]
+        # self._obs_state_queue.append(norm_state.unsqueeze(1))
 
-        current_obs_normalized = self.normalize_inputs(current_obs_for_norm)
+        # 위 관찰 준비는 eval_bidirectional_rtdiffusion.py의 기존 로직 참고하여 적용
+        raw_img = current_raw_observation["observation.image"].to(
+            self.device)  # CHW, Batch
+        raw_state = current_raw_observation["observation.state"].to(
+            self.device)  # Batch, StateDim
 
-        if self.config.image_features:
-            current_obs_normalized_for_queue = dict(current_obs_normalized)
-            current_obs_normalized_for_queue["observation.images"] = torch.stack(
-                [current_obs_normalized[key] for key in self.config.image_features], dim=-4
-            )
+        # LeRobot 방식의 정규화 (MyDiffusionPolicy 참고)
+        # MyDiffusionModel은 자체적으로 normalize_inputs를 가지고 있지 않으므로,
+        # BidirectionalRTDiffusionPolicy에서 직접 처리하거나,
+        # MyDiffusionModel.config.input_features 등을 참조하여 정규화 수행
+        # 여기서는 간단히 stats를 직접 사용한다고 가정
+        # 예시 조건
+        if self.stats and "observation.image" in self.stats and self.stats["observation.image"]["mean"].numel() > 1:
+            img_mean = self.stats["observation.image"]["mean"].to(self.device)
+            img_std = self.stats["observation.image"]["std"].to(self.device)
+            norm_img = (raw_img - img_mean) / img_std
+        elif raw_img.max() <= 1.0 and raw_img.min() >= 0.0:  # 0-1 범위 이미지를 -1~1로
+            norm_img = raw_img * 2.0 - 1.0
+        else:  # 이미 적절히 정규화되었다고 가정
+            norm_img = raw_img
+
+        if self.stats and "observation.state" in self.stats:
+            state_mean = self.stats["observation.state"]["mean"].to(
+                self.device)
+            state_std = self.stats["observation.state"]["std"].to(self.device)
+            norm_state = (raw_state - state_mean) / state_std
         else:
-            current_obs_normalized_for_queue = current_obs_normalized
+            norm_state = raw_state  # 정규화 통계 없으면 원본 사용 (경고 필요)
 
-        self._queues = populate_queues(
-            self._queues, current_obs_normalized_for_queue)
+        self._obs_image_queue.append(norm_img.unsqueeze(1))  # 큐에는 [B,1,C,H,W]
+        self._obs_state_queue.append(
+            norm_state.unsqueeze(1))  # 큐에는 [B,1,D_state]
 
-        if len(self._queues["action"]) == 0:
-            if len(self._queues["observation.state"]) < self.config.n_obs_steps:
-                action_dim = self.config.action_feature.shape[0]
-                device = get_device_from_parameters(self)
-                return torch.zeros((observation[list(observation.keys())[0]].shape[0], action_dim), device=device)
+        if self._action_execution_queue:
+            return self._action_execution_queue.popleft()
 
-            obs_history_batch = {}
-            for queue_key in self._queues:
-                if queue_key.startswith("observation") and len(self._queues[queue_key]) > 0:
-                    if queue_key == "observation.state":
-                        obs_history_batch[OBS_ROBOT] = torch.stack(
-                            list(self._queues[queue_key]), dim=1)
-                    elif queue_key == "observation.images" and self.config.image_features:
-                        obs_history_batch["observation.images"] = torch.stack(
-                            list(self._queues[queue_key]), dim=1)
-                    elif queue_key == "observation.environment_state" and self.config.env_state_feature:
-                        obs_history_batch[OBS_ENV] = torch.stack(
-                            list(self._queues[queue_key]), dim=1)
+        if len(self._obs_state_queue) < self.n_obs_steps:
+            # ... (기본 행동 반환 로직) ...
+            # action_dim은 self.inverse_dynamics_model.a_dim 또는 config에서 가져옴
+            action_dim = self.inverse_dynamics_model.a_dim
+            return torch.zeros((raw_state.shape[0], action_dim), device=self.device)
 
-            actions_normalized = self.diffusion.generate_actions(
-                obs_history_batch)
-            actions_unnormalized = self.unnormalize_outputs(
-                {"action": actions_normalized})["action"]
-            self._queues["action"].extend(actions_unnormalized.transpose(0, 1))
+        # 3. 초기 상태 경로 생성 (BidirectionalARTransformer)
+        # BidirectionalARTransformer는 정규화된 입력을 받을 것으로 예상됨
+        # 현재 `norm_img`, `norm_state`는 가장 최신 프레임임
+        transformer_predictions = self.bidirectional_transformer(
+            initial_images=norm_img,  # 현재 최신 이미지 [B,C,H,W]
+            initial_states=norm_state,  # 현재 최신 상태 [B,D_state] (필요시 차원 조정)
+            training=False
+        )
+        # norm_predicted_future_states: [B, F-1, D_state_bidir] (st_1 to st_{F-1})
+        norm_predicted_future_states = transformer_predictions['predicted_forward_states']
+        # initial_state_plan_normalized: [B, F, D_state_bidir] (st_0 to st_{F-1})
+        initial_state_plan_normalized = torch.cat(
+            [norm_state.unsqueeze(1), norm_predicted_future_states], dim=1
+        )
 
-        selected_action = self._queues["action"].popleft()
-        return selected_action
+        # 4. 상태 경로 정제 (State Diffusion Model - MyDiffusionModel)
+        # observation_batch_for_cond 준비
+        obs_history_img = torch.cat(
+            list(self._obs_image_queue), dim=1)    # [B, n_obs, C, H, W]
+        obs_history_state = torch.cat(
+            list(self._obs_state_queue), dim=1)  # [B, n_obs, D_state]
+
+        # MyDiffusionModel의 _prepare_global_conditioning이 기대하는 키로 맞춰줌
+        # (OBS_ROBOT, OBS_IMAGE 등)
+        observation_batch_for_cond = {
+            OBS_ROBOT: obs_history_state,  # lerobot.common.constants 에서 OBS_ROBOT import
+            OBS_IMAGE: obs_history_img    # lerobot.common.constants 에서 OBS_IMAGE import
+            # 필요시 OBS_ENV 등 추가
+        }
+
+        # state_diffusion_model의 horizon에 맞게 initial_state_plan 슬라이싱
+        diffusion_horizon = self.state_diffusion_model.config.horizon
+        initial_state_plan_for_diffusion = initial_state_plan_normalized[:,
+                                                                         :diffusion_horizon, :]
+
+        refined_state_plan_normalized = self.state_diffusion_model.refine_state_path(
+            initial_state_path=initial_state_plan_for_diffusion,
+            observation_batch_for_cond=observation_batch_for_cond
+            # num_refinement_steps 등은 refine_state_path 내부 기본값 사용 또는 전달
+        )  # 출력: [B, diffusion_horizon, D_state] (정규화됨)
+
+        # 5. 행동 변환 (Inverse Dynamics Model)
+        # refined_state_plan_normalized는 st_0', st_1', ..., st_{H_diff-1}'를 포함
+        # 행동 a_t는 (s_t, s_{t+1})로부터 예측. 현재 상태 norm_state와 s_0'로부터 a_0 예측.
+        num_planned_actions = refined_state_plan_normalized.shape[1]
+
+        # 입력 상태 쌍 준비: (현재 상태, s_0'), (s_0', s_1'), (s_1', s_2'), ...
+        s_prev_list = [norm_state.unsqueeze(1)] + \
+            [refined_state_plan_normalized[:, i, :].unsqueeze(
+                1) for i in range(num_planned_actions - 1)]
+        # [B, num_planned_actions, D_state]
+        s_prev_seq = torch.cat(s_prev_list, dim=1)
+
+        # [B, num_planned_actions, D_state]
+        s_curr_seq = refined_state_plan_normalized[:, :num_planned_actions, :]
+
+        # [B, num_actions, D_state*2]
+        inv_dyn_input_seq = torch.cat([s_prev_seq, s_curr_seq], dim=-1)
+
+        B_inv, H_inv, D_inv_pair = inv_dyn_input_seq.shape
+        inv_dyn_input_flat = inv_dyn_input_seq.reshape(
+            B_inv * H_inv, D_inv_pair)
+
+        # MlpInvDynamic은 정규화된 입력을 받는다고 가정 (MYDiffusionPolicy의 from_pretrained 참고)
+        # 또는 여기서 self.normalize_state_for_invdyn 사용
+        # 예: inv_dyn_input_flat_norm = self.normalize_state_for_invdyn({"observation.state": inv_dyn_input_flat.view(B_inv*H_inv, 2, -1)})
+        # -> MlpInvDynamic의 o_dim에 맞게 처리 필요. MlpInvDynamic이 [B, o_dim*2]를 받는다고 가정.
+
+        actions_normalized_flat = self.inverse_dynamics_model(
+            inv_dyn_input_flat)  # [B*H_inv, D_action]
+        actions_normalized_sequence = actions_normalized_flat.reshape(
+            B_inv, H_inv, -1)  # [B, H_inv, D_action]
+
+        # 6. 행동 역정규화 및 큐 저장
+        actions_unnormalized = self.unnormalize_action_output(
+            {"action": actions_normalized_sequence})["action"]
+
+        for i in range(actions_unnormalized.shape[1]):
+            self._action_execution_queue.append(actions_unnormalized[:, i, :])
+
+        if self._action_execution_queue:
+            return self._action_execution_queue.popleft()
+        else:
+            # ... (기본 행동 반환) ...
+            action_dim = self.inverse_dynamics_model.a_dim
+            return torch.zeros((raw_state.shape[0], action_dim), device=self.device)
 
     # This is the training method
+
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
         """Run the batch through the model and compute the loss for training or validation."""
         # Normalize inputs (observations)
@@ -558,6 +604,74 @@ class DiffusionModel(nn.Module):
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
         return actions
+
+    @torch.no_grad()
+    def refine_state_path(
+        self,
+        # BidirectionalARTransformer가 생성한 정규화된 상태 경로 [B, H_transformer, D_state]
+        initial_state_path: Tensor,
+        observation_batch_for_cond: dict[str, Tensor],  # 현재 및 과거 관찰 이력 (정규화됨)
+        num_refinement_steps: Optional[int] = None,  # 정제에 사용할 디퓨전 스텝 수
+        generator: Optional[torch.Generator] = None
+    ) -> Tensor:  # 정제된 상태 경로 [B, H_transformer_or_diffusion, D_state] 반환
+
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+        batch_size = initial_state_path.shape[0]
+        # 디퓨전 모델의 horizon (cfg.horizon)과 initial_state_path의 horizon이 다를 수 있으므로 주의
+        # 여기서는 initial_state_path의 horizon을 사용하거나, cfg.horizon에 맞게 슬라이싱/패딩 필요
+        # 간단하게는 cfg.horizon과 동일한 길이의 initial_state_path를 받는다고 가정
+        if initial_state_path.shape[1] != self.config.horizon:
+            # 필요시 initial_state_path의 길이를 self.config.horizon에 맞춤 (예: 앞부분 사용)
+            # 또는 에러 발생. 여기서는 동일하다고 가정.
+            pass
+
+        # 1. 글로벌 컨디셔닝 준비 (관찰 이력 기반)
+        # _prepare_global_conditioning는 OBS_ROBOT, OBS_IMAGE 등을 키로 사용함
+        # observation_batch_for_cond는 이 키들을 포함해야 함
+        global_cond = self._prepare_global_conditioning(
+            observation_batch_for_cond)
+
+        # 2. 정제 스텝 수 설정
+        if num_refinement_steps is None:
+            # 예: 학습 스텝의 일부 또는 고정된 작은 값
+            num_refinement_steps = min(
+                20, self.noise_scheduler.config.num_train_timesteps // 10)
+            if num_refinement_steps == 0:
+                num_refinement_steps = 1  # 최소 1스텝
+
+        self.noise_scheduler.set_timesteps(num_refinement_steps, device=device)
+
+        # 3. 초기 상태 경로(initial_state_path)를 디퓨전 시작점으로 설정
+        # initial_state_path를 x0로 간주하고, 가장 높은 노이즈 레벨(또는 정제 시작 레벨)의 노이즈를 추가
+        noise = torch.randn_like(
+            initial_state_path, device=device, dtype=dtype)
+        # 가장 높은 노이즈를 가진 스텝 (DDPM 기준)
+        start_timestep_for_refinement = self.noise_scheduler.timesteps[0]
+
+        # initial_state_path에 노이즈 추가하여 sample 초기화
+        sample = self.noise_scheduler.add_noise(
+            initial_state_path,
+            noise,
+            torch.full((batch_size,), start_timestep_for_refinement,
+                       device=device, dtype=torch.long)
+        )
+
+        # 4. 디퓨전 정제 루프
+        for t in self.noise_scheduler.timesteps:
+            model_input_timesteps = torch.full(
+                (batch_size,), t, dtype=torch.long, device=device)
+            # MyDiffusionModel의 self.transformer는 DiffusionTransformer를 사용함
+            predicted_noise_or_sample = self.transformer(
+                sample,  # 현재 노이즈가 낀 상태 경로
+                model_input_timesteps,
+                global_cond=global_cond
+            )
+            sample = self.noise_scheduler.step(
+                predicted_noise_or_sample, t, sample, generator=generator
+            ).prev_sample  # 디노이징된 상태 경로
+
+        return sample  # 정제된 (정규화된) 상태 경로
 
     def compute_loss(self, batch: dict[str, Tensor], global_cond_override: Optional[Tensor] = None) -> Tensor:
         """
