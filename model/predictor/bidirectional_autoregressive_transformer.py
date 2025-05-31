@@ -212,13 +212,30 @@ class BidirectionalARTransformer(nn.Module):
         self.image_latent_projection = nn.Linear(
             config.image_latent_dim, config.hidden_dim)
 
-        # Token type embeddings (0: image, 1: state, 2: goal_image)
-        self.token_type_embedding = nn.Embedding(3, config.hidden_dim)
+        # Token type embeddings (0: image, 1: state, 2: goal_image, 3: forward_query, 4: goal_query, 5: backward_query)
+        self.token_type_embedding = nn.Embedding(6, config.hidden_dim)
 
         # Position embeddings for the full sequence
         # We need positions for: 1 initial_image + 16 forward_states + 1 goal_image + 16 backward_states
         max_seq_len = 1 + config.forward_steps + 1 + config.backward_steps
         self.position_embedding = nn.Embedding(max_seq_len, config.hidden_dim)
+
+        # Special readout tokens for non-autoregressive inference
+        self.forward_seq_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+        self.goal_image_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+        self.backward_seq_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+
+        # Output prediction heads for the query tokens
+        # Modified: Ensure we predict F-1 states for forward trajectory (as we have initial state)
+        self.forward_state_head = nn.Linear(
+            config.hidden_dim, (config.forward_steps-1) * config.state_dim)
+        self.goal_image_latent_head = nn.Linear(
+            config.hidden_dim, config.image_latent_dim)
+        self.backward_state_head = nn.Linear(
+            config.hidden_dim, config.backward_steps * config.state_dim)
 
         # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -269,6 +286,318 @@ class BidirectionalARTransformer(nn.Module):
         )
         return mask
 
+    def _create_query_based_mask(self, seq_len: int, device: torch.device, num_condition_tokens: int = 2) -> torch.Tensor:
+        """
+        Create attention mask for query-based non-autoregressive generation.
+
+        In this mask, the query tokens can attend to the conditioning tokens (initial image and state)
+        but not to each other, creating a parallelizable inference pattern.
+
+        Args:
+            seq_len: Total sequence length including condition and query tokens
+            device: Device to create the mask on
+            num_condition_tokens: Number of conditioning tokens (initial image + initial state)
+
+        Returns:
+            Attention mask of shape [seq_len, seq_len]
+        """
+        # Start with a fully masked tensor
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+
+        # Allow all tokens to attend to the conditioning tokens (initial image, initial state)
+        mask[:, :num_condition_tokens] = False
+
+        # Allow regular attention pattern for conditioning tokens (can attend to previous tokens)
+        for i in range(num_condition_tokens):
+            mask[i, i+1:] = True  # Can't attend to future tokens
+
+        return mask
+
+    def _forward_training(
+        self,
+        initial_image_latents: torch.Tensor,
+        initial_states: torch.Tensor,
+        forward_states: torch.Tensor,
+        goal_images: torch.Tensor,
+        backward_states: torch.Tensor,
+        device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Training forward pass using both autoregressive and query-based approaches."""
+        batch_size = initial_image_latents.shape[0]
+
+        # Encode goal images
+        goal_image_latents = self.image_encoder(
+            goal_images)  # [B, image_latent_dim]
+
+        # === Autoregressive part (for better sequence learning) ===
+        # Prepare sequence tokens for autoregressive learning
+        ar_tokens = []
+        ar_token_types = []
+
+        # 1. Initial image latent
+        ar_tokens.append(self.image_latent_projection(initial_image_latents))
+        ar_token_types.append(0)  # image token
+
+        # 2. Initial state (st_0)
+        ar_tokens.append(self.state_projection(initial_states))
+        ar_token_types.append(1)  # state token
+
+        # 3. Forward trajectory states (st_1 to st_{F-1})
+        future_forward_states_for_input = forward_states[:,
+                                                         1:self.config.forward_steps]
+        for i in range(self.config.forward_steps - 1):
+            ar_tokens.append(self.state_projection(
+                future_forward_states_for_input[:, i]))
+            ar_token_types.append(1)  # state token
+
+        # 4. Goal image latent
+        ar_tokens.append(self.image_latent_projection(goal_image_latents))
+        ar_token_types.append(2)  # goal image token
+
+        # 5. Backward trajectory states
+        for i in range(self.config.backward_steps):
+            ar_tokens.append(self.state_projection(backward_states[:, i]))
+            ar_token_types.append(1)  # state token
+
+        # Stack tokens
+        ar_sequence = torch.stack(ar_tokens, dim=1)  # [B, seq_len, hidden_dim]
+        ar_seq_len = ar_sequence.shape[1]
+
+        # Add token type embeddings
+        ar_token_types_tensor = torch.tensor(
+            ar_token_types, device=device).unsqueeze(0).expand(batch_size, -1)
+        ar_type_embeddings = self.token_type_embedding(ar_token_types_tensor)
+        ar_sequence = ar_sequence + ar_type_embeddings
+
+        # Add position embeddings
+        ar_positions = torch.arange(ar_seq_len, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        ar_pos_embeddings = self.position_embedding(ar_positions)
+        ar_sequence = ar_sequence + ar_pos_embeddings
+
+        # Create causal mask for autoregressive learning
+        ar_causal_mask = self._create_causal_mask(ar_seq_len, device)
+
+        # Pass through transformer for autoregressive learning
+        ar_hidden_states = self.transformer(
+            src=ar_sequence,
+            mask=ar_causal_mask
+        )
+
+        # Extract predictions for different parts of the sequence (autoregressive)
+        ar_results = {}
+        F = self.config.forward_steps
+        B = self.config.backward_steps
+
+        # Forward states predictions (st_1 to st_{F-1})
+        forward_hidden = ar_hidden_states[:, 1:F]
+        ar_results['predicted_forward_states'] = self.state_output_head(
+            forward_hidden)
+
+        # Goal image prediction
+        goal_image_predictor_hidden = ar_hidden_states[:, F]
+        predicted_goal_latents = self.image_latent_output_head(
+            goal_image_predictor_hidden)
+        ar_results['predicted_goal_images'] = self.image_decoder(
+            predicted_goal_latents)
+        ar_results['predicted_goal_latents'] = predicted_goal_latents
+
+        # Backward states predictions
+        backward_hidden = ar_hidden_states[:, F + 1: F + 1 + B]
+        ar_results['predicted_backward_states'] = self.state_output_head(
+            backward_hidden)
+
+        # === Query-based part (matching inference approach) ===
+        # Project initial image latents and state to hidden dimension
+        projected_initial_image = self.image_latent_projection(
+            initial_image_latents)
+        projected_initial_state = self.state_projection(initial_states)
+
+        # Reshape to [B, 1, D] for sequence processing
+        projected_initial_image = projected_initial_image.unsqueeze(1)
+        projected_initial_state = projected_initial_state.unsqueeze(1)
+
+        # Expand query tokens for the batch
+        batch_forward_query = self.forward_seq_query_token.expand(
+            batch_size, -1, -1)
+        batch_goal_query = self.goal_image_query_token.expand(
+            batch_size, -1, -1)
+        batch_backward_query = self.backward_seq_query_token.expand(
+            batch_size, -1, -1)
+
+        # Construct the input sequence: [initial_image, initial_state, forward_query, goal_query, backward_query]
+        query_sequence = torch.cat([
+            projected_initial_image,
+            projected_initial_state,
+            batch_forward_query,
+            batch_goal_query,
+            batch_backward_query
+        ], dim=1)  # [B, 5, D]
+
+        # Define token types: 0=image, 1=state, 3=forward_query, 4=goal_query, 5=backward_query
+        query_token_types_tensor = torch.tensor(
+            [0, 1, 3, 4, 5], device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Add token type embeddings
+        query_type_embeddings = self.token_type_embedding(
+            query_token_types_tensor)
+        query_sequence = query_sequence + query_type_embeddings
+
+        # Add position embeddings
+        query_positions = torch.arange(
+            5, device=device).unsqueeze(0).expand(batch_size, -1)
+        query_pos_embeddings = self.position_embedding(query_positions)
+        query_sequence = query_sequence + query_pos_embeddings
+
+        # Create attention mask for query-based approach
+        num_condition_tokens = 2  # initial_image and initial_state
+        query_attn_mask = self._create_query_based_mask(
+            5, device, num_condition_tokens)
+
+        # Pass through transformer for query-based learning
+        query_hidden_states = self.transformer(
+            src=query_sequence,
+            mask=query_attn_mask
+        )
+
+        # Extract hidden states for the query tokens
+        forward_query_hidden = query_hidden_states[:, 2]  # [B, D]
+        goal_query_hidden = query_hidden_states[:, 3]     # [B, D]
+        backward_query_hidden = query_hidden_states[:, 4]  # [B, D]
+
+        # Predict forward states sequence (F-1 states, as the initial state is given)
+        query_predicted_fwd_states_flat = self.forward_state_head(
+            forward_query_hidden)
+
+        # Fix: Ensure the reshaping is consistent with the linear layer output
+        # We're predicting (F-1) states, each of state_dim dimensions
+        query_fwd_states = query_predicted_fwd_states_flat.view(
+            batch_size, self.config.forward_steps-1, self.config.state_dim
+        )
+
+        # Predict goal image latent
+        query_predicted_goal_latents = self.goal_image_latent_head(
+            goal_query_hidden)
+        query_goal_images = self.image_decoder(query_predicted_goal_latents)
+
+        # Predict backward states sequence
+        query_predicted_bwd_states_flat = self.backward_state_head(
+            backward_query_hidden)
+        query_bwd_states = query_predicted_bwd_states_flat.view(
+            batch_size, self.config.backward_steps, self.config.state_dim
+        )
+
+        # Combine results from both approaches
+        results = {
+            # Autoregressive results
+            'predicted_forward_states': ar_results['predicted_forward_states'],
+            'predicted_goal_images': ar_results['predicted_goal_images'],
+            'predicted_goal_latents': ar_results['predicted_goal_latents'],
+            'predicted_backward_states': ar_results['predicted_backward_states'],
+
+            # Query-based results (for training the query approach to match autoregressive)
+            'query_predicted_forward_states': query_fwd_states,
+            'query_predicted_goal_images': query_goal_images,
+            'query_predicted_goal_latents': query_predicted_goal_latents,
+            'query_predicted_backward_states': query_bwd_states
+        }
+
+        return results
+
+    def _forward_inference(
+        self,
+        initial_image_latents: torch.Tensor,
+        initial_states: torch.Tensor,
+        device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Non-autoregressive inference using special query tokens."""
+        batch_size = initial_image_latents.shape[0]
+        results = {}
+
+        # Project initial image latents and state to hidden dimension
+        projected_initial_image = self.image_latent_projection(
+            initial_image_latents)  # [B, D]
+        projected_initial_state = self.state_projection(
+            initial_states)  # [B, D]
+
+        # Reshape to [B, 1, D] for sequence processing
+        projected_initial_image = projected_initial_image.unsqueeze(
+            1)  # [B, 1, D]
+        projected_initial_state = projected_initial_state.unsqueeze(
+            1)  # [B, 1, D]
+
+        # Expand query tokens for the batch
+        batch_forward_query = self.forward_seq_query_token.expand(
+            batch_size, -1, -1)  # [B, 1, D]
+        batch_goal_query = self.goal_image_query_token.expand(
+            batch_size, -1, -1)  # [B, 1, D]
+        batch_backward_query = self.backward_seq_query_token.expand(
+            batch_size, -1, -1)  # [B, 1, D]
+
+        # Construct the input sequence: [initial_image, initial_state, forward_query, goal_query, backward_query]
+        sequence = torch.cat([
+            projected_initial_image,       # [B, 1, D]
+            projected_initial_state,       # [B, 1, D]
+            batch_forward_query,           # [B, 1, D]
+            batch_goal_query,              # [B, 1, D]
+            batch_backward_query           # [B, 1, D]
+        ], dim=1)  # [B, 5, D]
+
+        # Define token types: 0=image, 1=state, 3=forward_query, 4=goal_query, 5=backward_query
+        token_types_tensor = torch.tensor(
+            [0, 1, 3, 4, 5], device=device
+        ).unsqueeze(0).expand(batch_size, -1)  # [B, 5]
+
+        # Add token type embeddings
+        type_embeddings = self.token_type_embedding(token_types_tensor)
+        sequence = sequence + type_embeddings
+
+        # Add position embeddings
+        positions = torch.arange(5, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        pos_embeddings = self.position_embedding(positions)
+        sequence = sequence + pos_embeddings
+
+        # Create attention mask - query tokens can attend only to condition tokens
+        num_condition_tokens = 2  # initial_image and initial_state
+        attn_mask = self._create_query_based_mask(
+            5, device, num_condition_tokens)
+
+        # Pass through transformer
+        hidden_states = self.transformer(
+            src=sequence,
+            mask=attn_mask
+        )
+
+        # Extract hidden states for the query tokens
+        forward_query_hidden = hidden_states[:, 2]  # [B, D]
+        goal_query_hidden = hidden_states[:, 3]     # [B, D]
+        backward_query_hidden = hidden_states[:, 4]  # [B, D]
+
+        # Predict forward states sequence
+        predicted_fwd_states_flat = self.forward_state_head(
+            forward_query_hidden)
+
+        # Fix: Ensure the reshaping is consistent with the linear layer output
+        results['predicted_forward_states'] = predicted_fwd_states_flat.view(
+            batch_size, self.config.forward_steps-1, self.config.state_dim
+        )
+
+        # Predict goal image latent
+        predicted_goal_latents = self.goal_image_latent_head(goal_query_hidden)
+        results['predicted_goal_latents'] = predicted_goal_latents
+        results['predicted_goal_images'] = self.image_decoder(
+            predicted_goal_latents)
+
+        # Predict backward states sequence
+        predicted_bwd_states_flat = self.backward_state_head(
+            backward_query_hidden)
+        results['predicted_backward_states'] = predicted_bwd_states_flat.view(
+            batch_size, self.config.backward_steps, self.config.state_dim
+        )
+
+        return results
+
     def forward(
         self,
         initial_images: torch.Tensor,
@@ -305,231 +634,8 @@ class BidirectionalARTransformer(nn.Module):
                 goal_images, backward_states, device
             )
         else:
-            # Inference mode: autoregressive generation
+            # Inference mode: non-autoregressive generation with query tokens
             return self._forward_inference(initial_image_latents, initial_states, device)
-
-    def _forward_training(
-        self,
-        initial_image_latents: torch.Tensor,
-        initial_states: torch.Tensor,
-        forward_states: torch.Tensor,
-        goal_images: torch.Tensor,
-        backward_states: torch.Tensor,
-        device: torch.device
-    ) -> Dict[str, torch.Tensor]:
-        """Training forward pass with teacher forcing."""
-        batch_size = initial_image_latents.shape[0]
-
-        # Encode goal images
-        goal_image_latents = self.image_encoder(
-            goal_images)  # [B, image_latent_dim]
-
-        # Prepare sequence tokens
-        tokens = []
-        token_types = []
-
-        # 1. Initial image latent
-        tokens.append(self.image_latent_projection(initial_image_latents))
-        token_types.append(0)  # image token
-
-        # 2. Initial state (st_0)
-        tokens.append(self.state_projection(initial_states))
-        token_types.append(1)  # state token
-
-        # 3. Forward trajectory states (st_1 to st_{F-1})
-        # forward_states contains [st_0, st_1, ..., st_{F-1}]
-        # We need to add tokens for st_1, ..., st_{F-1}
-        # This corresponds to (self.config.forward_steps - 1) states.
-        # Selects st_1, ..., st_{F-1}
-        future_forward_states_for_input = forward_states[:,
-                                                         1:self.config.forward_steps]
-        for i in range(self.config.forward_steps - 1):  # Loop F-1 times
-            # Add emb(st_1), ..., emb(st_{F-1})
-            tokens.append(self.state_projection(
-                future_forward_states_for_input[:, i]))
-            token_types.append(1)  # state token
-
-        # 4. Goal image latent
-        tokens.append(self.image_latent_projection(goal_image_latents))
-        token_types.append(2)  # goal image token
-
-        # 5. Backward trajectory states
-        for i in range(self.config.backward_steps):
-            tokens.append(self.state_projection(backward_states[:, i]))
-            token_types.append(1)  # state token
-
-        # Stack tokens
-        sequence = torch.stack(tokens, dim=1)  # [B, seq_len, hidden_dim]
-        seq_len = sequence.shape[1]
-
-        # Add token type embeddings
-        token_types_tensor = torch.tensor(
-            token_types, device=device).unsqueeze(0).expand(batch_size, -1)
-        type_embeddings = self.token_type_embedding(token_types_tensor)
-        sequence = sequence + type_embeddings
-
-        # Add position embeddings
-        positions = torch.arange(seq_len, device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        pos_embeddings = self.position_embedding(positions)
-        sequence = sequence + pos_embeddings
-
-        # Create causal mask
-        causal_mask = self._create_causal_mask(seq_len, device)
-
-        # Pass through transformer
-        hidden_states = self.transformer(
-            src=sequence,
-            mask=causal_mask
-        )
-
-        # Extract predictions for different parts of the sequence
-        results = {}
-        F = self.config.forward_steps  # e.g., 16 (st_0 ... st_{F-1})
-        B = self.config.backward_steps  # e.g., 16
-
-        # Forward states predictions (st_1 to st_{F-1}, total F-1 states)
-        # Use hidden_states from emb(st_0) (idx 1) to emb(st_{F-2}) (idx F-1)
-        forward_hidden = hidden_states[:, 1:F]
-        results['predicted_forward_states'] = self.state_output_head(
-            forward_hidden)
-
-        # Goal image prediction (i_{F-1})
-        # Use hidden_states from emb(st_{F-1}) (idx F)
-        goal_image_predictor_hidden = hidden_states[:, F]
-        predicted_goal_latents = self.image_latent_output_head(
-            goal_image_predictor_hidden)  # No squeeze needed as input is [B, H]
-        results['predicted_goal_images'] = self.image_decoder(
-            predicted_goal_latents)
-        results['predicted_goal_latents'] = predicted_goal_latents
-
-        # Backward states predictions (st'_{F-1} to st'_{F-B}, total B states)
-        # Use hidden_states from emb(i_{F-1}) (idx F+1) to emb(st'_{F-B+1}) (idx F+B)
-        # Note: st'_{F-B+1} is the (B-1)th backward state input token, which is bst_{B-2}
-        backward_hidden = hidden_states[:, F + 1: F + 1 + B]
-        results['predicted_backward_states'] = self.state_output_head(
-            backward_hidden)
-
-        return results
-
-    def _forward_inference(
-        self,
-        initial_image_latents: torch.Tensor,
-        initial_states: torch.Tensor,
-        device: torch.device
-    ) -> Dict[str, torch.Tensor]:
-        """Inference forward pass with autoregressive generation."""
-        batch_size = initial_image_latents.shape[0]
-
-        # Start with initial image and state
-        tokens = [
-            self.image_latent_projection(initial_image_latents),
-            self.state_projection(initial_states)
-        ]
-        token_types = [0, 1]  # image, state
-
-        results = {
-            'predicted_forward_states': [],
-            'predicted_backward_states': []
-        }
-
-        # Generate forward trajectory autoregressively
-        for step in range(self.config.forward_steps - 1):
-            # [B, current_len, hidden_dim]
-            current_seq = torch.stack(tokens, dim=1)
-            current_len = current_seq.shape[1]
-
-            # Add embeddings
-            token_types_tensor = torch.tensor(
-                token_types, device=device).unsqueeze(0).expand(batch_size, -1)
-            type_embeddings = self.token_type_embedding(token_types_tensor)
-            current_seq = current_seq + type_embeddings
-
-            positions = torch.arange(current_len, device=device).unsqueeze(
-                0).expand(batch_size, -1)
-            pos_embeddings = self.position_embedding(positions)
-            current_seq = current_seq + pos_embeddings
-
-            # Create causal mask
-            causal_mask = self._create_causal_mask(current_len, device)
-
-            # Forward pass
-            hidden_states = self.transformer(src=current_seq, mask=causal_mask)
-
-            # Predict next state
-            next_state = self.state_output_head(
-                hidden_states[:, -1])  # [B, state_dim]
-            results['predicted_forward_states'].append(next_state)
-
-            # Add to sequence
-            tokens.append(self.state_projection(next_state))
-            token_types.append(1)  # state token
-
-        # Generate goal image from final forward state
-        current_seq = torch.stack(tokens, dim=1)
-        current_len = current_seq.shape[1]
-
-        # Add embeddings
-        token_types_tensor = torch.tensor(
-            token_types, device=device).unsqueeze(0).expand(batch_size, -1)
-        type_embeddings = self.token_type_embedding(token_types_tensor)
-        current_seq = current_seq + type_embeddings
-
-        positions = torch.arange(current_len, device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        pos_embeddings = self.position_embedding(positions)
-        current_seq = current_seq + pos_embeddings
-
-        causal_mask = self._create_causal_mask(current_len, device)
-        hidden_states = self.transformer(src=current_seq, mask=causal_mask)
-
-        # Predict goal image latent
-        predicted_goal_latents = self.image_latent_output_head(
-            hidden_states[:, -1])
-        results['predicted_goal_images'] = self.image_decoder(
-            predicted_goal_latents)
-        results['predicted_goal_latents'] = predicted_goal_latents
-
-        # Add goal image to sequence
-        tokens.append(self.image_latent_projection(predicted_goal_latents))
-        token_types.append(2)  # goal image token
-
-        # Generate backward trajectory autoregressively
-        for step in range(self.config.backward_steps):
-            current_seq = torch.stack(tokens, dim=1)
-            current_len = current_seq.shape[1]
-
-            # Add embeddings
-            token_types_tensor = torch.tensor(
-                token_types, device=device).unsqueeze(0).expand(batch_size, -1)
-            type_embeddings = self.token_type_embedding(token_types_tensor)
-            current_seq = current_seq + type_embeddings
-
-            positions = torch.arange(current_len, device=device).unsqueeze(
-                0).expand(batch_size, -1)
-            pos_embeddings = self.position_embedding(positions)
-            current_seq = current_seq + pos_embeddings
-
-            causal_mask = self._create_causal_mask(current_len, device)
-            hidden_states = self.transformer(src=current_seq, mask=causal_mask)
-
-            # Predict next backward state
-            next_state = self.state_output_head(hidden_states[:, -1])
-            results['predicted_backward_states'].append(next_state)
-
-            # Add to sequence
-            tokens.append(self.state_projection(next_state))
-            token_types.append(1)  # state token
-
-        # Stack the lists into tensors
-        if results['predicted_forward_states']:
-            results['predicted_forward_states'] = torch.stack(
-                results['predicted_forward_states'], dim=1)
-        if results['predicted_backward_states']:
-            results['predicted_backward_states'] = torch.stack(
-                results['predicted_backward_states'], dim=1)
-
-        return results
 
 
 def compute_loss(
@@ -550,7 +656,7 @@ def compute_loss(
     """
     losses = {}
 
-    # State prediction losses (MSE)
+    # State prediction losses (MSE) - for autoregressive outputs
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         losses['forward_state_loss'] = F.mse_loss(
             predictions['predicted_forward_states'],
@@ -580,12 +686,45 @@ def compute_loss(
             goal_image_latents
         )
 
+    # Query-based prediction losses (to align with autoregressive outputs)
+    if 'query_predicted_forward_states' in predictions and 'forward_states' in targets:
+        losses['query_forward_state_loss'] = F.mse_loss(
+            predictions['query_predicted_forward_states'],
+            targets['forward_states'][:, 1:]
+        )
+
+    if 'query_predicted_backward_states' in predictions and 'backward_states' in targets:
+        losses['query_backward_state_loss'] = F.mse_loss(
+            predictions['query_predicted_backward_states'],
+            targets['backward_states']
+        )
+
+    if 'query_predicted_goal_images' in predictions and 'goal_images' in targets:
+        losses['query_goal_image_loss'] = F.mse_loss(
+            predictions['query_predicted_goal_images'],
+            targets['goal_images']
+        )
+
+    if 'query_predicted_goal_latents' in predictions and 'goal_images' in targets:
+        with torch.no_grad():
+            goal_image_latents = model.image_encoder(targets['goal_images'])
+        losses['query_goal_latent_consistency_loss'] = F.mse_loss(
+            predictions['query_predicted_goal_latents'],
+            goal_image_latents
+        )
+
     # Compute weighted total loss
     weights = {
+        # Original autoregressive weights
         'forward_state_loss': 1.0,
         'backward_state_loss': 1.0,
         'goal_image_loss': 2.0,
         'goal_latent_consistency_loss': 1.0,
+        # Query-based weights
+        'query_forward_state_loss': 1.0,
+        'query_backward_state_loss': 1.0,
+        'query_goal_image_loss': 2.0,
+        'query_goal_latent_consistency_loss': 1.0,
     }
 
     total_loss = torch.tensor(

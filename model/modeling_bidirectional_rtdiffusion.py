@@ -61,6 +61,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self.config = state_diffusion_model.config
         self.device = get_device_from_parameters(bidirectional_transformer)
 
+        # CL-DiffPhyCon parameters
+        self.use_cl_diffphycon = True  # Set to True to enable CL-DiffPhyCon
+        self.cl_diffphycon_state = None
+        self.cl_diffphycon_step_size = 10  # Number of diffusion steps per policy step
+
         processed_dataset_stats = {}
         if dataset_stats is not None:
             for key, stat_group in dataset_stats.items():
@@ -267,6 +272,9 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self._obs_state_queue = deque(maxlen=self.n_obs_steps)
         self._action_execution_queue = deque()
 
+        # Reset CL-DiffPhyCon state
+        self.cl_diffphycon_state = None
+
     @torch.no_grad()
     def select_action(self, current_raw_observation: Dict[str, Tensor]) -> Tensor:
         raw_obs_on_device = {
@@ -380,256 +388,80 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                 (norm_state_current.shape[0], action_dim), device=self.device)
             return self.unnormalize_action_output({"action": zero_norm_action})["action"]
 
-        bidir_config_state_dim = self.bidirectional_transformer.config.state_dim
-        if norm_state_current.shape[-1] != bidir_config_state_dim:
-            norm_state_for_bidir = norm_state_current[:,
-                                                      :bidir_config_state_dim]
-        else:
-            norm_state_for_bidir = norm_state_current
-
-        # Ensure norm_img_current is not None if BidirARTransformer expects an image
-        if bidir_uses_image and norm_img_current is None:
-            raise ValueError(
-                "BidirectionalARTransformer requires an image but norm_img_current is None.")
-
-        transformer_predictions = self.bidirectional_transformer(
-            initial_images=norm_img_current,
-            initial_states=norm_state_for_bidir,
-            training=False
-        )
-        norm_predicted_future_states = transformer_predictions['predicted_forward_states']
-        initial_state_plan_normalized = torch.cat(
-            [norm_state_for_bidir.unsqueeze(1), norm_predicted_future_states], dim=1
-        )
-
         obs_history_state = torch.cat(list(self._obs_state_queue), dim=1)
 
-        # Try to prepare full conditioning with images first
-        try:
-            # Start with state conditioning
-            observation_batch_for_cond = {OBS_ROBOT: obs_history_state}
+        # Prepare conditioning information for the diffusion model
+        observation_batch_for_cond = {OBS_ROBOT: obs_history_state}
+        if self.config.image_features and self._obs_image_queue:
+            obs_history_img_stacked = torch.cat(
+                list(self._obs_image_queue), dim=1)
+            image_key = OBS_IMAGE
+            observation_batch_for_cond[image_key] = obs_history_img_stacked
 
-            # Add image conditioning if available
-            if self.config.image_features and self._obs_image_queue:
-                obs_history_img_stacked = torch.cat(
-                    list(self._obs_image_queue), dim=1)
-                # The key might be "observation.images" or OBS_IMAGE based on config
-                image_key = OBS_IMAGE  # Default from constants
-                print(
-                    f"Using image history with shape {obs_history_img_stacked.shape}")
-                observation_batch_for_cond[image_key] = obs_history_img_stacked
+        # CL-DiffPhyCon implementation
+        if self.use_cl_diffphycon:
+            print("Using CL-DiffPhyCon algorithm")
 
-                # Try a test pass to see if we have the right dimensions with images
-                global_cond_test = None
-                try:
-                    global_cond_test = self.state_diffusion_model.diffusion._prepare_global_conditioning(
-                        observation_batch_for_cond
-                    )
-                    print(
-                        f"Full conditioning (with images) passed dimension check! Shape: {global_cond_test.shape}")
-                    # If we get here, the conditioning with images worked correctly
-                except Exception as e:
-                    print(
-                        f"Image conditioning test failed: {e}. Will try state-only conditioning.")
-                    # Remove the image key since it's causing problems
-                    del observation_batch_for_cond[image_key]
-        except Exception as e:
-            print(f"Warning: Error preparing full conditioning: {e}")
-            observation_batch_for_cond = {}
+            # Initialize CL-DiffPhyCon state if needed
+            if self.cl_diffphycon_state is None:
+                print("Initializing CL-DiffPhyCon state")
+                self.cl_diffphycon_state = self.state_diffusion_model.initialize_cl_diffphycon_state(
+                    observation_batch_for_cond
+                )
 
-        # If full conditioning failed or wasn't fully tested, try our exact dimensional conditioning
-        if not observation_batch_for_cond or OBS_ROBOT not in observation_batch_for_cond:
-            # Try conditioning with exact dimensions to fix matrix multiplication errors
-            observation_batch_for_cond = self._prepare_correct_conditioning(
-                obs_history_state)
-
-        diffusion_horizon = self.state_diffusion_model.config.horizon
-        initial_state_plan_for_diffusion = initial_state_plan_normalized[:,
-                                                                         :diffusion_horizon, :]
-
-        # Try to run refinement with diffusion model, but fall back to skipping if dimension error
-        try:
-            print("Attempting diffusion refinement...")
-            # Log shapes for debugging
-            print(
-                f"Initial state plan shape: {initial_state_plan_for_diffusion.shape}")
-
-            # Get the expected dimensions for the conditioning
-            if hasattr(self.state_diffusion_model.diffusion, 'transformer'):
-                transformer = self.state_diffusion_model.diffusion.transformer
-                if hasattr(transformer, 'cond_embed'):
-                    cond_dim = transformer.cond_embed.in_features
-                    time_dim = transformer.time_embed[-1].out_features if hasattr(
-                        transformer, 'time_embed') else 0
-                    expected_global_cond_dim = cond_dim - time_dim
-                    print(
-                        f"Transformer expects global conditioning dim: {expected_global_cond_dim}")
-
-            # Get expected obs history shape
-            expected_n_obs_steps = self.state_diffusion_model.config.n_obs_steps
-            robot_state_dim = getattr(
-                self.state_diffusion_model.config.robot_state_feature, 'shape', [None])[0]
-            print(
-                f"Expected history shape: [B, {expected_n_obs_steps}, {robot_state_dim}]")
-
-            # Check what we're actually providing
-            if OBS_ROBOT in observation_batch_for_cond:
-                robot_state = observation_batch_for_cond[OBS_ROBOT]
-                print(f"Actual robot state shape: {robot_state.shape}")
-
-                # Directly calculate what the flattened dimension will be
-                flattened_dim = robot_state.shape[1] * \
-                    robot_state.shape[2] if robot_state.ndim >= 3 else robot_state.shape[1]
-                print(f"This will flatten to dimension: {flattened_dim}")
-
-                # Check if it matches the expected conditioning dimension
-                if flattened_dim != expected_global_cond_dim:
-                    print(
-                        f"⚠️ Dimension mismatch: {flattened_dim} vs expected {expected_global_cond_dim}")
-                    print("Attempting to fix with direct dynamic reshaping...")
-
-                    # Last resort: try direct reshaping to match dimensions exactly
-                    batch_size = robot_state.shape[0]
-                    reshaped_state = robot_state.reshape(
-                        batch_size, -1)  # Flatten to [B, flattened_dim]
-
-                    if flattened_dim < expected_global_cond_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            batch_size,
-                            expected_global_cond_dim - flattened_dim,
-                            device=robot_state.device
-                        )
-                        reshaped_state = torch.cat(
-                            [reshaped_state, padding], dim=1)
-                    else:
-                        # Truncate
-                        reshaped_state = reshaped_state[:,
-                                                        :expected_global_cond_dim]
-
-                    # Put back in the observation dict with original structure if possible
-                    if expected_global_cond_dim % expected_n_obs_steps == 0:
-                        dim_per_step = expected_global_cond_dim // expected_n_obs_steps
-                        fixed_state = reshaped_state.reshape(
-                            batch_size, expected_n_obs_steps, dim_per_step)
-                    else:
-                        fixed_state = reshaped_state.reshape(
-                            batch_size, 1, expected_global_cond_dim)
-
-                    observation_batch_for_cond[OBS_ROBOT] = fixed_state
-                    print(f"Fixed state shape: {fixed_state.shape}")
-
-            # Try to run the diffusion refinement
-            refined_state_plan_normalized = self.state_diffusion_model.diffusion.refine_state_path(
-                initial_state_path=initial_state_plan_for_diffusion,
-                observation_batch_for_cond=observation_batch_for_cond
+            # Perform a CL-DiffPhyCon step
+            self.cl_diffphycon_state = self.state_diffusion_model.sample_cl_diffphycon_step(
+                self.cl_diffphycon_state,
+                step_size=self.cl_diffphycon_step_size
             )
-            print("✅ Diffusion refinement completed successfully!")
 
-        except RuntimeError as e:
-            error_msg = str(e)
-            print(f"Error during diffusion refinement: {error_msg}")
+            # Get the current plan from the CL-DiffPhyCon state
+            refined_state_plan_normalized = self.cl_diffphycon_state["x_t"]
+            print(
+                f"CL-DiffPhyCon timestep: {self.cl_diffphycon_state['timestep']}, finished: {self.cl_diffphycon_state['finished']}")
 
-            if 'mat1 and mat2 shapes cannot be multiplied' in error_msg:
-                # Extract the actual dimensions from the error message for better debugging
-                import re
-                dims_match = re.search(
-                    r'mat1 and mat2 shapes cannot be multiplied \(([0-9x]+) and ([0-9x]+)\)', error_msg)
-                if dims_match:
-                    mat1_shape = dims_match.group(1)
-                    mat2_shape = dims_match.group(2)
-                    print(
-                        f"Matrix multiplication error: {mat1_shape} × {mat2_shape}")
+        else:
+            # Fall back to the original implementation
+            print("Using original bidirectional + diffusion refinement")
 
-                    # Try to extract exact dimensions for a direct fix
-                    try:
-                        # Parse the transformer dimension from error message (typically "mat2" in the error)
-                        # Example: "mat1 and mat2 shapes cannot be multiplied (1x516 and 644x512)"
-                        transformer_input_dim = int(mat2_shape.split('x')[0])
-                        time_embed_dim = transformer.time_embed[-1].out_features if hasattr(
-                            transformer, 'time_embed') else 0
-
-                        print(
-                            "Attempting direct dimension fix based on error message...")
-                        print(
-                            f"Transformer input requires dimension: {transformer_input_dim}")
-                        print(f"Time embedding dimension: {time_embed_dim}")
-                        print(
-                            f"Therefore global conditioning must be: {transformer_input_dim - time_embed_dim}")
-
-                        # Create a global conditioning tensor with exactly the right dimensions
-                        batch_size = initial_state_plan_for_diffusion.shape[0]
-                        correct_global_cond = torch.zeros(
-                            batch_size, transformer_input_dim - time_embed_dim,
-                            device=initial_state_plan_for_diffusion.device
-                        )
-
-                        # If we have state history, copy as much data as possible
-                        if OBS_ROBOT in observation_batch_for_cond:
-                            robot_state = observation_batch_for_cond[OBS_ROBOT]
-                            flattened_state = robot_state.reshape(
-                                batch_size, -1)
-                            copy_size = min(
-                                flattened_state.shape[1], transformer_input_dim - time_embed_dim)
-                            correct_global_cond[:,
-                                                :copy_size] = flattened_state[:, :copy_size]
-
-                        # Try to directly create the global conditioning
-                        print(
-                            "Trying direct approach with manually constructed global conditioning...")
-
-                        # Monkey patch the _prepare_global_conditioning method temporarily to return our fixed tensor
-                        original_prepare_fn = self.state_diffusion_model.diffusion._prepare_global_conditioning
-
-                        def fixed_prepare_global_conditioning(batch_for_cond):
-                            print(
-                                f"Using fixed global conditioning with shape: {correct_global_cond.shape}")
-                            return correct_global_cond
-
-                        self.state_diffusion_model.diffusion._prepare_global_conditioning = fixed_prepare_global_conditioning
-
-                        try:
-                            # Try refinement with the patched function
-                            refined_state_plan_normalized = self.state_diffusion_model.diffusion.refine_state_path(
-                                initial_state_path=initial_state_plan_for_diffusion,
-                                observation_batch_for_cond=observation_batch_for_cond
-                            )
-                            print(
-                                "✅ Diffusion refinement succeeded with direct dimension fix!")
-
-                            # Restore the original function
-                            self.state_diffusion_model.diffusion._prepare_global_conditioning = original_prepare_fn
-                            return refined_state_plan_normalized
-                        except Exception as patch_error:
-                            # Restore original function if direct approach fails
-                            self.state_diffusion_model.diffusion._prepare_global_conditioning = original_prepare_fn
-                            print(
-                                f"Direct dimension fix failed: {patch_error}")
-                    except Exception as fix_error:
-                        print(
-                            f"Error during dimension fix attempt: {fix_error}")
-
-                # If direct fix failed, skip diffusion refinement
-                refined_state_plan_normalized = self._skip_diffusion_refinement(
-                    initial_state_plan_for_diffusion)
-            elif 'size mismatch' in error_msg:
-                # Size mismatch error - log details if possible
-                size_mismatch = re.search(
-                    r'size mismatch, got ([^,]+), expected ([^,\)]+)', error_msg)
-                if size_mismatch:
-                    got_size = size_mismatch.group(1)
-                    expected_size = size_mismatch.group(2)
-                    print(
-                        f"Size mismatch: got {got_size}, expected {expected_size}")
-
-                # Skip diffusion refinement
-                refined_state_plan_normalized = self._skip_diffusion_refinement(
-                    initial_state_plan_for_diffusion)
+            bidir_config_state_dim = self.bidirectional_transformer.config.state_dim
+            if norm_state_current.shape[-1] != bidir_config_state_dim:
+                norm_state_for_bidir = norm_state_current[:,
+                                                          :bidir_config_state_dim]
             else:
-                # Some other error, re-raise it
-                print(f"Unexpected error, re-raising: {error_msg}")
-                raise
+                norm_state_for_bidir = norm_state_current
 
+            # Ensure norm_img_current is not None if BidirARTransformer expects an image
+            if bidir_uses_image and norm_img_current is None:
+                raise ValueError(
+                    "BidirectionalARTransformer requires an image but norm_img_current is None.")
+
+            transformer_predictions = self.bidirectional_transformer(
+                initial_images=norm_img_current,
+                initial_states=norm_state_for_bidir,
+                training=False
+            )
+            norm_predicted_future_states = transformer_predictions['predicted_forward_states']
+            initial_state_plan_normalized = torch.cat(
+                [norm_state_for_bidir.unsqueeze(1), norm_predicted_future_states], dim=1
+            )
+
+            diffusion_horizon = self.state_diffusion_model.config.horizon
+            initial_state_plan_for_diffusion = initial_state_plan_normalized[:,
+                                                                             :diffusion_horizon, :]
+
+            try:
+                # Try to run the diffusion refinement
+                refined_state_plan_normalized = self.state_diffusion_model.diffusion.refine_state_path(
+                    initial_state_path=initial_state_plan_for_diffusion,
+                    observation_batch_for_cond=observation_batch_for_cond
+                )
+                print("✅ Diffusion refinement completed successfully!")
+            except RuntimeError as e:
+                print(f"Error during diffusion refinement: {e}")
+                refined_state_plan_normalized = initial_state_plan_for_diffusion
+
+        # Run inverse dynamics on the refined plan
         inv_dyn_state_dim = self.inverse_dynamics_model.o_dim
         current_norm_state_for_invdyn = norm_state_current
 

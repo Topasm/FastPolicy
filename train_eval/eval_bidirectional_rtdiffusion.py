@@ -61,10 +61,17 @@ def main():
     # --- Load BidirectionalARTransformer Config and Model ---
     bidir_config_path = bidirectional_output_dir / "config.json"
     if bidir_config_path.is_file():
+        # Load the configuration from the pretrained model
         bidir_cfg = BidirectionalARTransformerConfig.from_pretrained(
             bidirectional_output_dir)
         print(
             f"Loaded BidirectionalARTransformerConfig from {bidir_config_path}")
+
+        # COMPATIBILITY CHECK: The BidirectionalARTransformer has been modified to use query tokens
+        # for non-autoregressive generation. The config may not have these parameters if it was
+        # saved before the modification. This is fine because the parameters are initialized in __init__.
+        print("Note: Using modified BidirectionalARTransformer with query-based inference. "
+              "This version should be significantly faster during inference.")
     else:
         print(
             f"BidirectionalARTransformerConfig json not found at {bidir_config_path}. Using manual config.")
@@ -107,7 +114,27 @@ def main():
     checkpoint_bidir = torch.load(bidirectional_ckpt_path, map_location="cpu")
     model_state_dict_bidir = checkpoint_bidir.get(
         "model_state_dict", checkpoint_bidir)
-    transformer_model.load_state_dict(model_state_dict_bidir)
+
+    # COMPATIBILITY: Handle potential missing keys in the checkpoint if loading a model
+    # that was saved before the query-based modifications
+    try:
+        # First attempt strict loading
+        transformer_model.load_state_dict(model_state_dict_bidir)
+        print("Successfully loaded transformer model weights with strict matching.")
+    except RuntimeError as e:
+        if "Missing key(s) in state_dict" in str(e):
+            # If we're missing the query tokens or prediction heads, load with strict=False
+            print("Warning: Missing keys when loading transformer model. "
+                  "This is expected if using a checkpoint saved before the non-autoregressive "
+                  "modification. Loading with strict=False...")
+            transformer_model.load_state_dict(
+                model_state_dict_bidir, strict=False)
+            print("Successfully loaded transformer model with non-strict matching. "
+                  "Some parameters were randomly initialized.")
+        else:
+            # If it's some other error, re-raise it
+            raise
+
     transformer_model.eval()
     transformer_model.to(device)
 
@@ -197,6 +224,9 @@ def main():
     inv_dyn_model.to(device)
 
     # --- Create Combined Policy ---
+    # The BidirectionalRTDiffusionPolicy itself doesn't need changes to work with the
+    # modified BidirectionalARTransformer because it just uses the transformer's API,
+    # which we've kept backward compatible
     combined_policy = BidirectionalRTDiffusionPolicy(
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,

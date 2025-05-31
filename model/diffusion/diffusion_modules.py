@@ -1,13 +1,35 @@
 import math
-from typing import Callable
-import einops
+from typing import Callable, Optional
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import torchvision
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.diffusion.configuration_mymodel import DiffusionConfig
+
+
+def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
+    """Create a noise scheduler based on the specified name.
+
+    Args:
+        name: The scheduler type, either "DDPM" or "DDIM"
+        **kwargs: Additional arguments to pass to the scheduler constructor
+
+    Returns:
+        An instance of the specified noise scheduler
+
+    Raises:
+        ValueError: If an unsupported noise scheduler type is specified
+    """
+    if name == "DDPM":
+        return DDPMScheduler(**kwargs)
+    elif name == "DDIM":
+        return DDIMScheduler(**kwargs)
+    else:
+        raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
 class SpatialSoftmax(nn.Module):
@@ -402,7 +424,6 @@ class DiffusionTransformer(nn.Module):
             (B, T_horizon, output_dim) Predicted noise or clean data.
         """
         B, T, D = noisy_input.shape
-        device = noisy_input.device
 
         # 1. Embeddings
         # (B, transformer_dim)
@@ -446,3 +467,571 @@ class DiffusionTransformer(nn.Module):
         pred = self.denoising_head(x)
 
         return pred
+
+
+class DiffusionModel(nn.Module):
+    """
+    Main diffusion model for conditional generation of trajectories.
+    Handles preprocessing of observations, conditioning, and diffusion sampling.
+    """
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.config = config
+
+        # Calculate conditioning dimensions
+        obs_only_cond_dim = 0
+        if self.config.robot_state_feature:
+            obs_only_cond_dim += self.config.robot_state_feature.shape[0]
+
+        if self.config.image_features:
+            num_images = len(self.config.image_features)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                self.rgb_encoder = nn.ModuleList(
+                    [DiffusionRgbEncoder(config) for _ in range(num_images)])
+                if self.rgb_encoder:
+                    obs_only_cond_dim += self.rgb_encoder[0].feature_dim * num_images
+            else:
+                self.rgb_encoder = DiffusionRgbEncoder(config)
+                obs_only_cond_dim += self.rgb_encoder.feature_dim * num_images
+
+        if self.config.env_state_feature:
+            obs_only_cond_dim += self.config.env_state_feature.shape[0]
+
+        global_cond_dim_per_step = obs_only_cond_dim
+        global_cond_dim_total_for_transformer = global_cond_dim_per_step * config.n_obs_steps
+
+        # Verify target configuration
+        diffusion_target_key = config.diffusion_target_key
+        if diffusion_target_key not in config.output_features:
+            raise ValueError(
+                f"Diffusion target key '{diffusion_target_key}' not found in config.output_features. "
+                f"Ensure config.output_features includes the target. "
+                f"Available output_features: {list(config.output_features.keys())}"
+            )
+        target_feature_spec = config.output_features[diffusion_target_key]
+        if not hasattr(target_feature_spec, 'shape') or not target_feature_spec.shape:
+            raise ValueError(
+                f"Shape for diffusion target key '{diffusion_target_key}' is not properly defined in output_features."
+            )
+        diffusion_output_dim = target_feature_spec.shape[0]
+
+        # Initialize models
+        self.transformer = DiffusionTransformer(
+            config,
+            global_cond_dim=global_cond_dim_total_for_transformer,
+            output_dim=diffusion_output_dim
+        )
+
+        # Initialize the async transformer only if needed
+        self.async_transformer = None
+        if hasattr(config, 'use_async_transformer') and config.use_async_transformer:
+            from model.diffusion.async_modules import DenoisingTransformer
+            self.async_transformer = DenoisingTransformer(
+                config,
+                global_cond_dim=global_cond_dim_total_for_transformer,
+                output_dim=diffusion_output_dim
+            )
+
+        # Initialize noise scheduler
+        self.noise_scheduler = _make_noise_scheduler(
+            config.noise_scheduler_type,
+            num_train_timesteps=config.num_train_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            clip_sample_range=config.clip_sample_range,
+            prediction_type=config.prediction_type,
+        )
+
+        # Set inference steps
+        if config.num_inference_steps is None:
+            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+        else:
+            self.num_inference_steps = config.num_inference_steps
+
+    def _prepare_global_conditioning(self, batch_for_cond: dict[str, Tensor]) -> Tensor:
+        """
+        Prepare global conditioning from observation data.
+
+        Args:
+            batch_for_cond: Dictionary of conditioning tensors including robot state, images, etc.
+
+        Returns:
+            Global conditioning tensor of shape [B, global_cond_dim]
+        """
+        # Import constants from lerobot
+        from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+
+        conditioning_horizon = self.config.n_obs_steps
+        batch_size = -1
+        first_valid_tensor_for_device = None
+
+        # Determine batch_size and perform sanity checks on sequence lengths
+        for key_to_check in [OBS_ROBOT, "observation.images", OBS_ENV]:
+            if key_to_check in batch_for_cond and batch_for_cond[key_to_check] is not None:
+                current_tensor = batch_for_cond[key_to_check]
+                if batch_size == -1:  # Set batch_size from the first available tensor
+                    batch_size = current_tensor.shape[0]
+                    first_valid_tensor_for_device = current_tensor
+                # Check for batch size consistency
+                elif batch_size != current_tensor.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch in conditioning data. Expected {batch_size}, got {current_tensor.shape[0]} for {key_to_check}")
+
+                # Check sequence length: this should now pass due to prior slicing
+                if current_tensor.shape[1] != conditioning_horizon:
+                    raise ValueError(
+                        f"Sequence length for conditioning key '{key_to_check}' ({current_tensor.shape[1]}) "
+                        f"in _prepare_global_conditioning's input batch does not match config.n_obs_steps ({conditioning_horizon}). "
+                        f"This indicates an issue with how `batch_for_cond` was prepared."
+                    )
+
+        if batch_size == -1:  # No conditioning data provided
+            # Handle cases where model might be unconditional or time-conditional only
+            time_emb_dim = self.transformer.time_embed[-1].out_features
+            if self.transformer.cond_embed.in_features == time_emb_dim:
+                if first_valid_tensor_for_device is None:  # Should not happen if batch_for_cond wasn't empty
+                    raise ValueError(
+                        "Cannot determine batch_size for empty conditioning input and no fallback tensor.")
+                return torch.empty(batch_size, 0, device=first_valid_tensor_for_device.device)
+            else:
+                raise ValueError(
+                    "No conditioning features found in batch_for_cond, but DiffusionTransformer expects them.")
+
+        processed_features_list = []
+
+        if OBS_ROBOT in batch_for_cond and self.config.robot_state_feature and batch_for_cond[OBS_ROBOT] is not None:
+            processed_features_list.append(batch_for_cond[OBS_ROBOT])
+
+        if self.config.image_features and "observation.images" in batch_for_cond and batch_for_cond["observation.images"] is not None:
+            images_data_cond = batch_for_cond["observation.images"]
+
+            # Get shapes for proper reshaping
+            s_img_cond = images_data_cond.shape[1]  # Sequence length
+            n_cam_cond = images_data_cond.shape[2]  # Number of cameras
+
+            if self.config.use_separate_rgb_encoder_per_camera:
+                img_features_all_cams = []
+                for i in range(n_cam_cond):
+                    # Extract images for camera i: [B, S, C, H, W]
+                    cam_images = images_data_cond[:, :, i]
+                    # Flatten batch and sequence dims: [(B*S), C, H, W]
+                    cam_images_flat = cam_images.reshape(
+                        -1, *cam_images.shape[2:])
+                    # Encode images: [(B*S), D]
+                    cam_features_encoded = self.rgb_encoder[i](cam_images_flat)
+                    # Reshape back to [B, S, D]
+                    cam_features_reshaped = cam_features_encoded.reshape(
+                        batch_size, s_img_cond, -1)
+                    img_features_all_cams.append(cam_features_reshaped)
+                # Concatenate features from all cameras: [B, S, (N*D)]
+                img_features_processed = torch.cat(
+                    img_features_all_cams, dim=2)
+            else:
+                # Flatten all dimensions except the channel, height, and width: [(B*S*N), C, H, W]
+                flat_batch_size = batch_size * s_img_cond * n_cam_cond
+                images_flat_for_encoder = images_data_cond.reshape(
+                    flat_batch_size, *images_data_cond.shape[3:])
+                # Process with encoder: [(B*S*N), D]
+                img_features_encoded = self.rgb_encoder(
+                    images_flat_for_encoder)
+                # Reshape to [B, S, (N*D)]
+                img_features_processed = img_features_encoded.reshape(
+                    batch_size, s_img_cond, n_cam_cond *
+                    img_features_encoded.shape[1]
+                )
+            processed_features_list.append(img_features_processed)
+
+        if OBS_ENV in batch_for_cond and self.config.env_state_feature and batch_for_cond[OBS_ENV] is not None:
+            processed_features_list.append(batch_for_cond[OBS_ENV])
+
+        if not processed_features_list:
+            # This case means global_cond_dim_total_for_transformer should be 0.
+            # Already handled by batch_size == -1 logic if all inputs were None or absent.
+            # If keys were present but data was None and not caught, this is a fallback.
+            device_to_use = first_valid_tensor_for_device.device if first_valid_tensor_for_device is not None else torch.device(
+                "cpu")
+            return torch.empty(batch_size, 0, device=device_to_use)
+
+        # Concatenate all features along the feature dimension
+        concatenated_per_step_feats = torch.cat(
+            processed_features_list, dim=-1)  # [B, S, D]
+        # Flatten sequence and feature dimensions: [B, (S*D)]
+        flattened_global_cond = concatenated_per_step_feats.flatten(
+            start_dim=1)
+
+        return flattened_global_cond
+
+    def conditional_sample(self, batch_size: int, global_cond: Tensor, generator: Optional[torch.Generator] = None) -> Tensor:
+        """
+        Perform conditional sampling from the diffusion model.
+
+        Args:
+            batch_size: Number of samples to generate
+            global_cond: Global conditioning tensor
+            generator: Optional random generator for reproducibility
+
+        Returns:
+            Generated trajectory samples
+        """
+        device = global_cond.device
+        dtype = global_cond.dtype
+
+        sample_output_dim = self.transformer.denoising_head.net[-1].out_features
+
+        # Start with random noise
+        sample = torch.randn(
+            size=(batch_size, self.config.horizon, sample_output_dim),
+            dtype=dtype, device=device, generator=generator,
+        )
+
+        # Set up noise scheduler timesteps
+        self.noise_scheduler.set_timesteps(
+            self.num_inference_steps, device=device)
+
+        # Iteratively denoise
+        for t in self.noise_scheduler.timesteps:
+            model_output = self.transformer(
+                sample,
+                torch.full((batch_size,), t, dtype=torch.long,
+                           device=sample.device),
+                global_cond=global_cond,
+            )
+            sample = self.noise_scheduler.step(
+                model_output, t, sample, generator=generator).prev_sample
+
+        return sample
+
+    def async_conditional_sample(self, current_input_normalized: Tensor, global_cond: Tensor,
+                                 generator: Optional[torch.Generator] = None) -> Tensor:
+        """
+        Perform asynchronous conditional sampling for iterative refinement.
+
+        Args:
+            current_input_normalized: Current normalized trajectory to refine
+            global_cond: Global conditioning tensor
+            generator: Optional random generator for reproducibility
+
+        Returns:
+            Refined trajectory samples
+        """
+        # Check if async transformer is available
+        if self.async_transformer is None:
+            raise ValueError(
+                "async_transformer is not initialized. Set config.use_async_transformer=True to use this method.")
+
+        device = current_input_normalized.device
+        sample = current_input_normalized.clone()
+
+        # Get number of refinement steps from config
+        async_num_steps = getattr(
+            self.config, 'async_refinement_steps', self.num_inference_steps)
+
+        if async_num_steps == 0 and self.num_inference_steps > 0:
+            async_num_steps = 1
+        elif self.num_inference_steps == 0:
+            async_num_steps = 0
+
+        if async_num_steps == 0:
+            return sample
+
+        # Set up noise scheduler timesteps
+        self.noise_scheduler.set_timesteps(async_num_steps, device=device)
+        timesteps_to_refine = self.noise_scheduler.timesteps
+
+        if not len(timesteps_to_refine):
+            return sample
+
+        # Iteratively refine
+        for t in timesteps_to_refine:
+            model_input_timesteps = t.repeat(sample.shape[0])
+            use_async_mode_for_transformer = False
+
+            model_output = self.async_transformer(
+                sample,
+                model_input_timesteps,
+                global_cond=global_cond,
+                async_mode=use_async_mode_for_transformer
+            )
+            sample = self.noise_scheduler.step(
+                model_output, t, sample, generator=generator).prev_sample
+
+        refined_plan = sample
+        return refined_plan
+
+    @torch.no_grad()
+    def refine_state_path(self, initial_state_path: Tensor, observation_batch_for_cond: dict[str, Tensor],
+                          num_refinement_steps: Optional[int] = None,
+                          generator: Optional[torch.Generator] = None) -> Tensor:
+        """
+        Refine an existing state path using the diffusion model.
+
+        Args:
+            initial_state_path: Initial state path to refine
+            observation_batch_for_cond: Observation batch for conditioning
+            num_refinement_steps: Number of refinement steps (overrides config default)
+            generator: Optional random generator
+
+        Returns:
+            Refined state path
+        """
+        device = initial_state_path.device
+        dtype = initial_state_path.dtype
+        batch_size = initial_state_path.shape[0]
+
+        # Adjust horizon if necessary
+        current_horizon = initial_state_path.shape[1]
+        target_horizon = self.config.horizon
+
+        if current_horizon != target_horizon:
+            if current_horizon > target_horizon:
+                initial_state_path_adjusted = initial_state_path[:,
+                                                                 :target_horizon]
+            else:
+                padding_needed = target_horizon - current_horizon
+                last_frame = initial_state_path[:, -1:, :]
+                padding = last_frame.repeat(1, padding_needed, 1)
+                initial_state_path_adjusted = torch.cat(
+                    [initial_state_path, padding], dim=1)
+        else:
+            initial_state_path_adjusted = initial_state_path
+
+        # Prepare conditioning
+        global_cond = self._prepare_global_conditioning(
+            observation_batch_for_cond)
+
+        # Determine refinement steps
+        effective_num_refinement_steps = num_refinement_steps
+        if effective_num_refinement_steps is None:
+            effective_num_refinement_steps = getattr(self.config, 'num_refinement_steps_default',
+                                                     min(10, self.noise_scheduler.config.num_train_timesteps // 20) or 1)
+
+        if effective_num_refinement_steps == 0:
+            return initial_state_path_adjusted
+
+        # Set up noise scheduler timesteps
+        self.noise_scheduler.set_timesteps(
+            effective_num_refinement_steps, device=device)
+
+        if not len(self.noise_scheduler.timesteps):
+            return initial_state_path_adjusted
+
+        # Add noise to the initial state path
+        noise = torch.randn_like(
+            initial_state_path_adjusted, device=device, dtype=dtype)
+        start_timestep_for_refinement = self.noise_scheduler.timesteps[0]
+
+        sample = self.noise_scheduler.add_noise(
+            initial_state_path_adjusted, noise,
+            torch.full((batch_size,), start_timestep_for_refinement,
+                       device=device, dtype=torch.long)
+        )
+
+        # Refine through denoising steps
+        for t in self.noise_scheduler.timesteps:
+            model_input_timesteps = torch.full(
+                (batch_size,), t, dtype=torch.long, device=device)
+            predicted_noise_or_sample = self.transformer(
+                sample, model_input_timesteps, global_cond=global_cond
+            )
+            sample = self.noise_scheduler.step(
+                predicted_noise_or_sample, t, sample, generator=generator).prev_sample
+
+        return sample
+
+    def compute_loss(self, trajectory_to_diffuse: Tensor, global_cond: Tensor,
+                     batch_info_for_masking: Optional[dict[str, Tensor]] = None) -> Tensor:
+        """
+        Compute diffusion loss for training.
+
+        Args:
+            trajectory_to_diffuse: Target trajectory to diffuse
+            global_cond: Global conditioning tensor
+            batch_info_for_masking: Optional batch info for masking padding
+
+        Returns:
+            Loss tensor (scalar)
+        """
+        # Generate random noise
+        eps = torch.randn(trajectory_to_diffuse.shape,
+                          device=trajectory_to_diffuse.device)
+
+        # Sample random timesteps
+        timesteps = torch.randint(
+            low=0, high=self.noise_scheduler.config.num_train_timesteps,
+            size=(trajectory_to_diffuse.shape[0],),
+            device=trajectory_to_diffuse.device,
+        ).long()
+
+        # Add noise according to timesteps
+        noisy_trajectory = self.noise_scheduler.add_noise(
+            trajectory_to_diffuse, eps, timesteps)
+
+        # Get model prediction
+        pred = self.transformer(
+            noisy_trajectory, timesteps, global_cond=global_cond)
+
+        # Determine target based on prediction type
+        if self.config.prediction_type == "epsilon":
+            target = eps
+        elif self.config.prediction_type == "sample":
+            target = trajectory_to_diffuse
+        else:
+            raise ValueError(
+                f"Unsupported prediction type {self.config.prediction_type}")
+
+        # Compute MSE loss
+        loss = F.mse_loss(pred, target, reduction="none")
+
+        # Apply masking for padding if configured
+        if self.config.do_mask_loss_for_padding and batch_info_for_masking is not None:
+            pad_mask_key = None
+            specific_pad_mask_key = f"{self.config.diffusion_target_key}_is_pad"
+
+            if specific_pad_mask_key in batch_info_for_masking:
+                pad_mask_key = specific_pad_mask_key
+            elif self.config.diffusion_target_key == "action" and "action_is_pad" in batch_info_for_masking:
+                pad_mask_key = "action_is_pad"
+            elif "is_pad" in batch_info_for_masking and batch_info_for_masking["is_pad"].shape[1] == trajectory_to_diffuse.shape[1]:
+                pad_mask_key = "is_pad"
+
+            if pad_mask_key and pad_mask_key in batch_info_for_masking:
+                is_pad_mask = batch_info_for_masking[pad_mask_key]
+                current_horizon = trajectory_to_diffuse.shape[1]
+
+                if is_pad_mask.shape[1] < current_horizon:
+                    padding_amount = current_horizon - is_pad_mask.shape[1]
+                    mask_padding = torch.zeros(
+                        is_pad_mask.shape[0], padding_amount, dtype=torch.bool, device=is_pad_mask.device)
+                    is_pad_mask_adjusted = torch.cat(
+                        [is_pad_mask, mask_padding], dim=1)
+                else:
+                    is_pad_mask_adjusted = is_pad_mask[:, :current_horizon]
+
+                in_episode_bound = ~is_pad_mask_adjusted
+                if loss.ndim == 3 and in_episode_bound.ndim == 2:
+                    loss = loss * in_episode_bound.unsqueeze(-1)
+                elif loss.ndim == in_episode_bound.ndim:
+                    loss = loss * in_episode_bound
+                else:
+                    print(
+                        f"Warning: Loss shape {loss.shape} and padding mask shape {in_episode_bound.shape} are not compatible for broadcasting in masking.")
+
+            elif self.config.do_mask_loss_for_padding:
+                print(
+                    f"Warning: `do_mask_loss_for_padding` is True, but a suitable padding mask key ('{specific_pad_mask_key}', 'action_is_pad', or 'is_pad') was not found in `batch_info_for_masking` for target '{self.config.diffusion_target_key}'. Loss will not be masked for padding.")
+
+        return loss.mean()
+
+    @torch.no_grad()
+    def sample_asynchronous_step(self, x_t: Tensor, timestep: int, global_cond: Tensor,
+                                 generator: Optional[torch.Generator] = None,
+                                 num_async_inference_steps: Optional[int] = None) -> Tensor:
+        """
+        Perform asynchronous denoising for the CL-DiffPhyCon algorithm.
+
+        This implementation follows Algorithm 1 from the CL-DiffPhyCon paper, performing
+        progressive denoising for each token in the sequence according to its physical timestep.
+        Each token is denoised from time τ/H·T to 0 through multiple steps.
+
+        Args:
+            x_t (Tensor): The noisy input trajectory with varying noise levels per token, shape [B, H, D]
+            timestep (int): Initial diffusion timestep (typically T/H)
+            global_cond (Tensor): Global conditioning tensor for the transformer model, shape [B, global_cond_dim]
+            generator (Optional[torch.Generator]): Random number generator for reproducible sampling
+            num_async_inference_steps (Optional[int]): Number of denoising steps to perform (defaults to config value)
+
+        Returns:
+            Tensor: Fully denoised trajectory (at diffusion time 0), shape [B, H, D]
+        """
+        batch_size, horizon, feat_dim = x_t.shape
+        device = x_t.device
+
+        # Check if async transformer is available - required for this method
+        if self.async_transformer is None:
+            raise ValueError(
+                "async_transformer is not initialized but required for asynchronous sampling. "
+                "Set config.use_async_transformer=True to use this method."
+            )
+
+        # Determine number of inference steps
+        if num_async_inference_steps is None:
+            # Default to either a config value or a reasonable fraction of train timesteps
+            num_async_inference_steps = getattr(
+                self.config, 'num_async_inference_steps',
+                min(timestep + 1, max(10,
+                    self.noise_scheduler.config.num_train_timesteps // 20))
+            )
+
+        # Set up noise scheduler timesteps for the denoising process
+        # Starting from the provided timestep (typically T/H) down to 0
+        self.noise_scheduler.set_timesteps(
+            num_async_inference_steps, device=device
+        )
+
+        # Get the actual timestep values for the denoising process
+        timesteps_for_denoising = self.noise_scheduler.timesteps
+
+        # Filter timesteps to start from the provided timestep or lower
+        valid_timestep_indices = timesteps_for_denoising <= timestep
+        if not valid_timestep_indices.any():
+            # If no valid timesteps (which shouldn't happen), just return input
+            return x_t
+
+        filtered_timesteps = timesteps_for_denoising[valid_timestep_indices]
+
+        # Initialize the current noisy sample with the input
+        sample = x_t.clone()
+
+        # Perform progressive denoising through multiple steps
+        for t in filtered_timesteps:
+            # Create per-token timesteps tensor with shape [B, H]
+            # For the asynchronous mode, each token in the sequence has its own timestep
+            # The shape must be [B, H] for the DenoisingTransformer's async_mode=True
+            token_timesteps = torch.full(
+                (batch_size, horizon), t, dtype=torch.long, device=device)
+
+            # Predict noise or sample using the async transformer in async mode
+            model_output = self.async_transformer(
+                sample,               # Current noisy sample
+                token_timesteps,      # Current timesteps for each token
+                global_cond=global_cond,  # Global conditioning
+                async_mode=True       # Critical: enable async mode for per-token conditioning
+            )
+
+            # Use scheduler to get sample for next timestep
+            # Note: For the scheduler to work with per-token timesteps, we need to use it in a batch mode
+            # or reshape our data appropriately
+
+            # Step the scheduler to denoise the sample
+            # Note: t is already a scalar value that the scheduler can use directly
+            sample = self.noise_scheduler.step(
+                model_output,  # Predicted noise or sample
+                t,             # Current timestep value
+                sample,        # Current noisy sample
+                generator=generator  # Optional RNG for reproducibility
+            ).prev_sample
+
+        # Return the completely denoised trajectory
+        return sample
+
+
+def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
+    """
+    Calculate the output shape of a module given an input shape.
+
+    Args:
+        module: PyTorch module
+        input_shape: Input tensor shape (batch_size, channels, height, width)
+
+    Returns:
+        Output shape as a tuple
+    """
+    with torch.no_grad():
+        # Create a dummy tensor with the specified input shape
+        dummy_input = torch.zeros(input_shape)
+        # Forward pass through the module
+        out = module(dummy_input)
+        return out.shape
