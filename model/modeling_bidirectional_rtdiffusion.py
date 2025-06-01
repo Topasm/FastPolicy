@@ -192,10 +192,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if self._action_execution_queue:
             return self._get_next_action()
 
-        # # If we don't have enough history yet, return zero action
-        # if len(self._obs_state_queue) < self.n_obs_steps:
-        #     return self._get_zero_action(norm_state.shape[0])
-
         #        Args:
         # model_input_batch: Dict with observation history
         # batch_size: Batch size for diffusion model
@@ -226,7 +222,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if self._action_execution_queue:
             return self._get_next_action()
         else:
-            return self._get_zero_action(norm_state.shape[0])
+            # Create zero action directly
+            batch_size = norm_state.shape[0]
+            action_dim = getattr(self.inverse_dynamics_model, 'a_dim',
+                                 getattr(self.config.action_feature, 'shape', [2])[0])
+            return torch.zeros((batch_size, action_dim), device=self.device)
 
     def _preprocess_observation(self, raw_obs):
         """Preprocess raw observations, particularly adjusting image dimensions."""
@@ -305,31 +305,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             # Return the action as-is in case of error
             return next_action
 
-    def _get_zero_action(self, batch_size):
-        """Get a zero action tensor with the correct dimensions."""
-        # Get action dimension from inverse dynamics model or config
-        if hasattr(self.inverse_dynamics_model, 'a_dim'):
-            action_dim = self.inverse_dynamics_model.a_dim
-        elif hasattr(self.config, 'action_feature') and hasattr(self.config.action_feature, 'shape'):
-            action_dim = self.config.action_feature.shape[0]
-        else:
-            # Last resort fallback
-            print("Warning: Using fallback method to determine action_dim")
-            action_dim = 2  # Default minimal value
-
-        zero_action = torch.zeros((batch_size, action_dim), device=self.device)
-        try:
-            unnorm_result = self.unnormalize_action_output(
-                {"action": zero_action})
-            # Check if the result is a dictionary or tensor
-            if isinstance(unnorm_result, dict) and "action" in unnorm_result:
-                return unnorm_result["action"]
-            else:
-                return unnorm_result
-        except Exception as e:
-            print(f"Error in unnormalizing zero action: {e}")
-            return zero_action
-
     def _generate_state_plan(self, model_input_batch):
         """Generate refined state plan using bidirectional transformer and diffusion.
 
@@ -404,10 +379,29 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             else:
                 initial_clean_plan_for_diffusion = initial_clean_plan
 
-            # Step 2: Initialize the Asynchronously Noised Latent State
-            self.cl_diffphycon_latent_z_prev = self.state_diffusion_model.initialize_cl_diffphycon_state(
-                initial_clean_plan_for_diffusion
-            )
+            # Normalize the plan before passing to diffusion model
+            # The bidirectional transformer outputs may not be properly normalized for the diffusion model
+            if hasattr(self.state_diffusion_model, 'normalize_targets'):
+                # First reshape to match expected input format for normalizer
+                batch_size, seq_len, state_dim = initial_clean_plan_for_diffusion.shape
+                reshaped_plan = initial_clean_plan_for_diffusion.view(
+                    -1, state_dim)
+
+                # Create a batch dictionary with the proper target key
+                target_key = self.state_diffusion_model.config.diffusion_target_key
+                plan_batch = {target_key: reshaped_plan}
+
+                # Normalize
+                normalized_batch = self.state_diffusion_model.normalize_targets(
+                    plan_batch)
+
+                # Reshape back to original dimensions
+                initial_clean_plan_for_diffusion = normalized_batch[target_key].view(
+                    batch_size, seq_len, state_dim)
+                print(f"Normalized initial plan. Original range: [{initial_clean_plan.min():.4f}, {initial_clean_plan.max():.4f}], "
+                      f"Normalized range: [{initial_clean_plan_for_diffusion.min():.4f}, {initial_clean_plan_for_diffusion.max():.4f}]")
+
+            self.cl_diffphycon_latent_z_prev = initial_clean_plan_for_diffusion
 
         # Step 3: Perform CL-DiffPhyCon Asynchronous Denoising Step
         # observation_batch_for_cond_history is used by _prepare_global_conditioning inside sample_cl_diffphycon_step

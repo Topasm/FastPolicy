@@ -44,47 +44,6 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         self.reset()
 
     @torch.no_grad()
-    def initialize_cl_diffphycon_state(self, initial_clean_plan: torch.Tensor) -> torch.Tensor:
-        """
-        Initialize CL-DiffPhyCon state from clean plan with noise at different timesteps.
-
-        Args:
-            initial_clean_plan: Clean trajectory (B, H, target_dim)
-
-        Returns:
-            Noisy trajectory at progressive timesteps (B, H, target_dim)
-        """
-        device = initial_clean_plan.device
-        batch_size, horizon, _ = initial_clean_plan.shape
-
-        if horizon != self.config.horizon:
-            raise ValueError(
-                f"Input plan horizon {horizon} doesn't match config.horizon {self.config.horizon}")
-
-        T_total = self.diffusion.noise_scheduler.config.num_train_timesteps
-
-        # Create timesteps [T/H, 2T/H, 3T/H, ..., T]
-        target_timesteps = torch.linspace(
-            T_total/horizon, T_total, horizon, device=device)
-        target_timesteps = target_timesteps.round(
-        ).long().unsqueeze(0).expand(batch_size, -1)
-        target_timesteps = torch.clamp(target_timesteps, 0, T_total - 1)
-
-        # Generate noise and flatten data for scheduler
-        noise = torch.randn_like(initial_clean_plan)
-        flat_plan = initial_clean_plan.reshape(-1,
-                                               initial_clean_plan.shape[-1])
-        flat_noise = noise.reshape(-1, noise.shape[-1])
-        flat_timesteps = target_timesteps.reshape(-1)
-
-        # Add noise according to timestep schedule
-        noised_data = self.diffusion.noise_scheduler.add_noise(
-            flat_plan, flat_noise, flat_timesteps
-        )
-
-        return noised_data.reshape(batch_size, horizon, -1)
-
-    @torch.no_grad()
     def sample_cl_diffphycon_step(
         self,
         prev_noisy_sequence: torch.Tensor,
@@ -139,15 +98,36 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         )
 
         # Get current output and prepare next sequence
-        current_output = denoised_sequence[:, 0, :]
-        shifted_sequence = denoised_sequence[:, 1:, :]
+        # Check if first token is -1.0, -1.0 or similar (sentinel value)
+        first_token = denoised_sequence[:, 0, :]
+        # Check if all values in the first token are close to -1.0
+        is_first_token_sentinel = torch.all(torch.isclose(first_token, torch.tensor(
+            [-1.0], device=first_token.device), rtol=0.05, atol=0.05), dim=1)
 
-        # Create new noise element for next sequence
-        batch_size, _, target_dim = prev_noisy_sequence.shape
-        new_noise = torch.randn(
-            (batch_size, 1, target_dim),
-            device=prev_noisy_sequence.device
-        )
+        # If first token seems to be a sentinel value, use the second token as the current output
+        if torch.any(is_first_token_sentinel):
+            print(
+                "Detected sentinel value (-1.0) in first token, using the second token as current output")
+            current_output = denoised_sequence[:, 1, :]
+            # When using second token as output, shift sequence starts from third token
+            shifted_sequence = denoised_sequence[:, 2:, :]
+            # Create two new noise elements to maintain sequence length
+            batch_size, _, target_dim = prev_noisy_sequence.shape
+            new_noise = torch.randn(
+                (batch_size, 2, target_dim),
+                device=prev_noisy_sequence.device
+            )
+        else:
+            # Normal case: use first token as output
+            current_output = denoised_sequence[:, 0, :]
+            # Shift sequence starts from second token
+            shifted_sequence = denoised_sequence[:, 1:, :]
+            # Create one new noise element
+            batch_size, _, target_dim = prev_noisy_sequence.shape
+            new_noise = torch.randn(
+                (batch_size, 1, target_dim),
+                device=prev_noisy_sequence.device
+            )
 
         # Form sequence for next step
         next_noisy_sequence = torch.cat([shifted_sequence, new_noise], dim=1)
