@@ -9,6 +9,8 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.diffusion.configuration_mymodel import DiffusionConfig
+from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE, OBS_ENV
+import einops
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -551,118 +553,108 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
-    def _prepare_global_conditioning(self, batch_for_cond: dict[str, Tensor]) -> Tensor:
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+        """Encode image features and concatenate them all together along with the state vector.
+           Expects batch to have normalized 'observation.state' and potentially 'observation.image'.
         """
-        Prepare global conditioning from observation data.
+        # Check required keys exist
+        if OBS_ROBOT not in batch:
+            raise KeyError(
+                f"Missing '{OBS_ROBOT}' in batch for _prepare_global_conditioning")
 
-        Args:
-            batch_for_cond: Dictionary of conditioning tensors including robot state, images, etc.
+        batch_size = batch[OBS_ROBOT].shape[0]
+        n_obs_steps = self.config.n_obs_steps
 
-        Returns:
-            Global conditioning tensor of shape [B, global_cond_dim]
-        """
-        # Import constants from lerobot
-        from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+        if batch[OBS_ROBOT].shape[1] < n_obs_steps:
+            raise ValueError(
+                f"{OBS_ROBOT} sequence length ({batch[OBS_ROBOT].shape[1]}) "
+                f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
+            )
+        cond_state = batch[OBS_ROBOT][:, :n_obs_steps, :]
+        global_cond_feats = [cond_state]
 
-        conditioning_horizon = self.config.n_obs_steps
-        batch_size = -1
-        first_valid_tensor_for_device = None
+        # Check if images are configured AND present in the batch before processing
+        if self.config.image_features and OBS_IMAGE in batch:
+            images = batch[OBS_IMAGE]
+            _B = images.shape[0]
+            n_img_steps = images.shape[1]
 
-        # Determine batch_size and perform sanity checks on sequence lengths
-        for key_to_check in [OBS_ROBOT, "observation.images", OBS_ENV]:
-            if key_to_check in batch_for_cond and batch_for_cond[key_to_check] is not None:
-                current_tensor = batch_for_cond[key_to_check]
-                if batch_size == -1:  # Set batch_size from the first available tensor
-                    batch_size = current_tensor.shape[0]
-                    first_valid_tensor_for_device = current_tensor
-                # Check for batch size consistency
-                elif batch_size != current_tensor.shape[0]:
+            # Handle different image tensor shapes
+            if len(images.shape) == 6:  # Shape: [b, t, n_cam, c, h, w]
+                # Special case for 6D tensor
+                if images.shape[2] == 1:  # If there's just one camera, squeeze that dimension
+                    images = images.squeeze(2)  # Convert to [b, t, c, h, w]
+                else:
+                    # Use the _encode_images method which can handle multi-camera input
+                    try:
+                        img_features = self._encode_images(images)
+                        global_cond_feats.append(img_features)
+                        # Skip the rest of the processing for this case
+                        goto_next_condition = True
+                    except Exception as e:
+                        print(f"Error processing 6D image tensor: {e}")
+                        print(f"Image shape: {images.shape}")
+                        # Create a fallback feature tensor
+                        img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                                   device=batch["observation.state"].device)
+                        global_cond_feats.append(img_features)
+                        goto_next_condition = True
+
+            # If we need to skip to the next condition
+            if 'goto_next_condition' in locals() and goto_next_condition:
+                pass
+            # Standard processing for 5D tensor [b, t, c, h, w]
+            elif len(images.shape) == 5:
+                if n_img_steps != n_obs_steps:
                     raise ValueError(
-                        f"Batch size mismatch in conditioning data. Expected {batch_size}, got {current_tensor.shape[0]} for {key_to_check}")
-
-                # Check sequence length: this should now pass due to prior slicing
-                if current_tensor.shape[1] != conditioning_horizon:
-                    raise ValueError(
-                        f"Sequence length for conditioning key '{key_to_check}' ({current_tensor.shape[1]}) "
-                        f"in _prepare_global_conditioning's input batch does not match config.n_obs_steps ({conditioning_horizon}). "
-                        f"This indicates an issue with how `batch_for_cond` was prepared."
+                        f"Image sequence length ({n_img_steps}) in batch does not match "
+                        f"configured n_obs_steps ({n_obs_steps}). Check dataset delta_timestamps "
+                        f"and policy config."
                     )
+                assert _B == batch_size
 
-        if batch_size == -1:  # No conditioning data provided
-            # Handle cases where model might be unconditional or time-conditional only
-            time_emb_dim = self.transformer.time_embed[-1].out_features
-            if self.transformer.cond_embed.in_features == time_emb_dim:
-                if first_valid_tensor_for_device is None:  # Should not happen if batch_for_cond wasn't empty
-                    raise ValueError(
-                        "Cannot determine batch_size for empty conditioning input and no fallback tensor.")
-                return torch.empty(batch_size, 0, device=first_valid_tensor_for_device.device)
+                try:
+                    images_reshaped = einops.rearrange(
+                        images, "b t c h w -> (b t) c h w")
+                    img_features = self.rgb_encoder(images_reshaped)
+                    img_features = einops.rearrange(
+                        img_features, "(b t) d -> b t d", b=batch_size, t=n_obs_steps
+                    )
+                    global_cond_feats.append(img_features)
+                except Exception as e:
+                    print(f"Error during standard image processing: {e}")
+                    print(f"Image shape: {images.shape}")
+                    # Create a fallback feature tensor
+                    img_features = torch.zeros((batch_size, n_obs_steps, self.config.transformer_dim),
+                                               device=batch["observation.state"].device)
+                    global_cond_feats.append(img_features)
             else:
+                # Unknown image tensor format
                 raise ValueError(
-                    "No conditioning features found in batch_for_cond, but DiffusionTransformer expects them.")
+                    f"Unsupported image tensor shape: {images.shape}")
 
-        processed_features_list = []
+        elif self.config.image_features and "observation.image" not in batch:
+            # If images configured but not provided in this specific batch, print warning
+            print("Warning: image_features configured but 'observation.image' not found in batch for _prepare_global_conditioning.")
+            # Continue without image features for this batch
 
-        if OBS_ROBOT in batch_for_cond and self.config.robot_state_feature and batch_for_cond[OBS_ROBOT] is not None:
-            processed_features_list.append(batch_for_cond[OBS_ROBOT])
-
-        if self.config.image_features and "observation.images" in batch_for_cond and batch_for_cond["observation.images"] is not None:
-            images_data_cond = batch_for_cond["observation.images"]
-
-            # Get shapes for proper reshaping
-            s_img_cond = images_data_cond.shape[1]  # Sequence length
-            n_cam_cond = images_data_cond.shape[2]  # Number of cameras
-
-            if self.config.use_separate_rgb_encoder_per_camera:
-                img_features_all_cams = []
-                for i in range(n_cam_cond):
-                    # Extract images for camera i: [B, S, C, H, W]
-                    cam_images = images_data_cond[:, :, i]
-                    # Flatten batch and sequence dims: [(B*S), C, H, W]
-                    cam_images_flat = cam_images.reshape(
-                        -1, *cam_images.shape[2:])
-                    # Encode images: [(B*S), D]
-                    cam_features_encoded = self.rgb_encoder[i](cam_images_flat)
-                    # Reshape back to [B, S, D]
-                    cam_features_reshaped = cam_features_encoded.reshape(
-                        batch_size, s_img_cond, -1)
-                    img_features_all_cams.append(cam_features_reshaped)
-                # Concatenate features from all cameras: [B, S, (N*D)]
-                img_features_processed = torch.cat(
-                    img_features_all_cams, dim=2)
-            else:
-                # Flatten all dimensions except the channel, height, and width: [(B*S*N), C, H, W]
-                flat_batch_size = batch_size * s_img_cond * n_cam_cond
-                images_flat_for_encoder = images_data_cond.reshape(
-                    flat_batch_size, *images_data_cond.shape[3:])
-                # Process with encoder: [(B*S*N), D]
-                img_features_encoded = self.rgb_encoder(
-                    images_flat_for_encoder)
-                # Reshape to [B, S, (N*D)]
-                img_features_processed = img_features_encoded.reshape(
-                    batch_size, s_img_cond, n_cam_cond *
-                    img_features_encoded.shape[1]
+        # Check if env state is configured AND present
+        if self.config.env_state_feature and OBS_ENV in batch:
+            if batch[OBS_ENV].shape[1] < n_obs_steps:
+                raise ValueError(
+                    f"{OBS_ENV} sequence length ({batch[OBS_ENV].shape[1]}) "
+                    f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
                 )
-            processed_features_list.append(img_features_processed)
+            cond_env_state = batch[OBS_ENV][:, :n_obs_steps, :]
+            global_cond_feats.append(cond_env_state)
+        elif self.config.env_state_feature and OBS_ENV not in batch:
+            print(
+                f"Warning: env_state_feature configured but '{OBS_ENV}' not found in batch for _prepare_global_conditioning.")
+            # Continue without env state features for this batch
 
-        if OBS_ENV in batch_for_cond and self.config.env_state_feature and batch_for_cond[OBS_ENV] is not None:
-            processed_features_list.append(batch_for_cond[OBS_ENV])
-
-        if not processed_features_list:
-            # This case means global_cond_dim_total_for_transformer should be 0.
-            # Already handled by batch_size == -1 logic if all inputs were None or absent.
-            # If keys were present but data was None and not caught, this is a fallback.
-            device_to_use = first_valid_tensor_for_device.device if first_valid_tensor_for_device is not None else torch.device(
-                "cpu")
-            return torch.empty(batch_size, 0, device=device_to_use)
-
-        # Concatenate all features along the feature dimension
-        concatenated_per_step_feats = torch.cat(
-            processed_features_list, dim=-1)  # [B, S, D]
-        # Flatten sequence and feature dimensions: [B, (S*D)]
-        flattened_global_cond = concatenated_per_step_feats.flatten(
-            start_dim=1)
-
-        return flattened_global_cond
+        concatenated_features = torch.cat(global_cond_feats, dim=-1)
+        global_cond = concatenated_features.flatten(start_dim=1)
+        return global_cond
 
     def conditional_sample(self, batch_size: int, global_cond: Tensor, generator: Optional[torch.Generator] = None) -> Tensor:
         """

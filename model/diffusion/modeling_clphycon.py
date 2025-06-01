@@ -12,7 +12,7 @@ from lerobot.common.policies.normalize import Normalize, Unnormalize
 # Import the refactored diffusion modules
 from model.diffusion.diffusion_modules import DiffusionModel
 from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.policies.utils import get_device_from_parameters, populate_queues
 
 
 class CLDiffPhyConModel(PreTrainedPolicy):
@@ -28,186 +28,131 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Initialize normalization modules
+        # Initialize normalization and model
         self.normalize_inputs = Normalize(
             config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
+            config.output_features, config.normalization_mapping, dataset_stats)
         self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
+            config.output_features, config.normalization_mapping, dataset_stats)
 
-        # Initialize the diffusion model
-        config.use_async_transformer = True  # Enable async transformer for CLDiffPhyCon
+        config.use_async_transformer = True
         self.model = DiffusionModel(config)
+        self.diffusion = self.model
 
         self._queues = None
-        self.diffusion = self.model  # Use the initialized model
         self.reset()
 
     @torch.no_grad()
-    def initialize_cl_diffphycon_state(
-        self,
-        # Plan from BidirectionalARTransformer, shape (B, H, target_dim)
-        initial_clean_plan: torch.Tensor
-    ) -> torch.Tensor:
+    def initialize_cl_diffphycon_state(self, initial_clean_plan: torch.Tensor) -> torch.Tensor:
         """
-        Initialize the CL-DiffPhyCon state from a clean plan, producing the initial
-        noisy trajectory at SDE time T/H for asynchronous diffusion.
-
-        This method implements the initialization step for CL-DiffPhyCon by adding noise
-        according to a specific timestep schedule that varies across the horizon.
+        Initialize CL-DiffPhyCon state from clean plan with noise at different timesteps.
 
         Args:
-            initial_clean_plan: Clean trajectory from which to initialize, shape (B, H, target_dim)
+            initial_clean_plan: Clean trajectory (B, H, target_dim)
 
         Returns:
-            torch.Tensor: Noisy trajectory at time T/H for each timestep in the sequence, shape (B, H, target_dim)
+            Noisy trajectory at progressive timesteps (B, H, target_dim)
         """
         device = initial_clean_plan.device
         batch_size, horizon, _ = initial_clean_plan.shape
 
-        # Verify that horizon matches config
         if horizon != self.config.horizon:
             raise ValueError(
-                f"Input plan horizon {horizon} does not match config.horizon {self.config.horizon}")
+                f"Input plan horizon {horizon} doesn't match config.horizon {self.config.horizon}")
 
-        # Get total number of timesteps in the diffusion process
         T_total = self.diffusion.noise_scheduler.config.num_train_timesteps
 
-        # For each token j (0 to H-1) in the plan, compute its target timestep
-        # using the formula (j+1)*(T_total/H)
-        # This creates timesteps [T/H, 2T/H, 3T/H, ..., T]
-        target_sde_times = torch.linspace(
+        # Create timesteps [T/H, 2T/H, 3T/H, ..., T]
+        target_timesteps = torch.linspace(
             T_total/horizon, T_total, horizon, device=device)
+        target_timesteps = target_timesteps.round(
+        ).long().unsqueeze(0).expand(batch_size, -1)
+        target_timesteps = torch.clamp(target_timesteps, 0, T_total - 1)
 
-        # Convert to integer timesteps for the DDPM scheduler
-        # Round to integers since DDPM timesteps are discrete
-        target_ddpm_timesteps = target_sde_times.round().long()
-
-        # Expand to match batch size: [B, H]
-        target_ddpm_timesteps = target_ddpm_timesteps.unsqueeze(
-            0).expand(batch_size, -1)
-
-        # Generate random noise
+        # Generate noise and flatten data for scheduler
         noise = torch.randn_like(initial_clean_plan)
+        flat_plan = initial_clean_plan.reshape(-1,
+                                               initial_clean_plan.shape[-1])
+        flat_noise = noise.reshape(-1, noise.shape[-1])
+        flat_timesteps = target_timesteps.reshape(-1)
 
-        # Add noise according to the timestep schedule
-        # For diffusers' add_noise, need to flatten the timesteps to match the batch dimension
-        flattened_clean_plan = initial_clean_plan.reshape(
-            -1, initial_clean_plan.shape[-1])
-        flattened_noise = noise.reshape(-1, noise.shape[-1])
-        flattened_timesteps = target_ddpm_timesteps.reshape(-1)
-
-        # Add noise for each (sample, timestep) pair
-        noised_flattened = self.diffusion.noise_scheduler.add_noise(
-            flattened_clean_plan,
-            flattened_noise,
-            flattened_timesteps
+        # Add noise according to timestep schedule
+        noised_data = self.diffusion.noise_scheduler.add_noise(
+            flat_plan, flat_noise, flat_timesteps
         )
 
-        # Reshape back to [B, H, D]
-        async_noised_plan = noised_flattened.reshape(batch_size, horizon, -1)
-
-        return async_noised_plan
+        return noised_data.reshape(batch_size, horizon, -1)
 
     @torch.no_grad()
     def sample_cl_diffphycon_step(
         self,
-        prev_async_noisy_sequence_at_T_div_H: torch.Tensor,  # From previous step or init
-        current_env_state_feedback: torch.Tensor,  # Actual u_env,τ-1
-    ) -> tuple[torch.Tensor, torch.Tensor]:  # (current_step_output_z_tau_at_0, noisy_sequence_for_next_step)
+        prev_noisy_sequence: torch.Tensor,
+        current_env_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Perform a single step of the CL-DiffPhyCon algorithm.
-
-        This implements Algorithm 1, lines 3-10 from the CL-DiffPhyCon paper. It:
-        1. Denoises the current noisy sequence to get the clean output for the current step
-        2. Prepares the noisy sequence for the next physical time step by shifting and adding new noise
+        Single CL-DiffPhyCon algorithm step: denoise current and prepare next sequence.
 
         Args:
-            prev_async_noisy_sequence_at_T_div_H: The noisy trajectory from previous step, at time T/H
-                for each token, shape (B, H, target_dim)
-            current_env_state_feedback: Current environmental state for conditioning, shape (B, state_dim)
-                or dictionary of observation tensors
+            prev_noisy_sequence: Noisy trajectory from previous step (B, H, target_dim)
+            current_env_state: Current environmental state for conditioning
 
         Returns:
-            tuple containing:
-                - current_step_output_z_tau_at_0: Clean output for current step τ, shape (B, target_dim)
-                - noisy_sequence_for_next_step: Prepared noisy sequence for step τ+1, shape (B, H, target_dim)
+            current_output: Clean output for current step (B, target_dim)
+            next_noisy_sequence: Prepared noisy sequence for next step (B, H, target_dim)
         """
-        # Prepare global conditioning properly from environmental state feedback
-        # Check if current_env_state_feedback is already a dictionary
-        if isinstance(current_env_state_feedback, dict):
-            # It's already a dictionary of observation tensors
-            obs_dict_for_conditioning = current_env_state_feedback
+        # Prepare conditioning from environment state
+        if isinstance(current_env_state, dict):
+            obs_dict = current_env_state
         else:
-            # It's a raw state tensor, convert to proper observation dict
-            batch_size = prev_async_noisy_sequence_at_T_div_H.shape[0]
-            device = prev_async_noisy_sequence_at_T_div_H.device
+            batch_size = prev_noisy_sequence.shape[0]
+            device = prev_noisy_sequence.device
 
-            # Create observation dict with proper sequence length for conditioning
+            # Create observation dict with expanded state
             from lerobot.common.constants import OBS_ROBOT
+            obs_state = current_env_state.unsqueeze(
+                1).expand(-1, self.config.n_obs_steps, -1)
+            obs_dict = {OBS_ROBOT: obs_state}
 
-            # Create observations with proper sequence dimension [B, n_obs_steps, D]
-            # Repeat the current state for all observation steps
-            obs_state = current_env_state_feedback.unsqueeze(1).expand(
-                -1, self.config.n_obs_steps, -1)
-
-            obs_dict_for_conditioning = {OBS_ROBOT: obs_state}
-
-            # Add image observations if configured and available
+            # Add image observations if available
             if hasattr(self, '_queues') and self.config.image_features and 'observation.images' in self._queues:
                 if len(self._queues['observation.images']) == self.config.n_obs_steps:
-                    # Stack image observations from queue
                     img_obs = torch.stack(
                         list(self._queues['observation.images']), dim=0)
-                    # Add batch dimension if needed and move to correct device
                     if img_obs.dim() == 4:  # [S, C, H, W]
                         img_obs = img_obs.unsqueeze(0).expand(
                             batch_size, -1, -1, -1, -1).to(device)
-                    obs_dict_for_conditioning['observation.images'] = img_obs
+                    obs_dict['observation.images'] = img_obs
 
-        # Process observations to get proper global conditioning
-        global_cond = self.diffusion._prepare_global_conditioning(
-            obs_dict_for_conditioning)
-
-        # Get the time step corresponding to T/H
+        # Get global conditioning and timestep for denoising
+        global_cond = self.diffusion._prepare_global_conditioning(obs_dict)
         timestep_T_div_H = int(
             self.diffusion.noise_scheduler.config.num_train_timesteps // self.config.horizon)
 
-        # Get the fully denoised sequence for the current step
-        # This performs the denoising from time T/H to time 0 for the entire sequence
-        denoised_sequence_at_t0 = self.diffusion.sample_asynchronous_step(
-            prev_async_noisy_sequence_at_T_div_H,  # x_t - noisy input
-            timestep_T_div_H,  # timestep T/H
-            global_cond,       # Properly prepared global conditioning
+        # Denoise the sequence
+        denoised_sequence = self.diffusion.sample_asynchronous_step(
+            prev_noisy_sequence,
+            timestep_T_div_H,
+            global_cond,
             num_async_inference_steps=getattr(
                 self.config, 'num_async_inference_steps', None)
         )
 
-        # Extract the first element which is the current step output z_τ(0)
-        current_step_output_z_tau_at_0 = denoised_sequence_at_t0[:, 0, :]
+        # Get current output and prepare next sequence
+        current_output = denoised_sequence[:, 0, :]
+        shifted_sequence = denoised_sequence[:, 1:, :]
 
-        # Prepare noisy sequence for the next physical time step
-        # 1. Shift left: take elements 1 to H-1 from denoised_sequence
-        shifted_sequence = denoised_sequence_at_t0[:, 1:, :]
-
-        # 2. Create new last element z_τ+H(T) with pure Gaussian noise
-        batch_size = prev_async_noisy_sequence_at_T_div_H.shape[0]
-        target_dim = prev_async_noisy_sequence_at_T_div_H.shape[2]
-        new_last_element_noise = torch.randn(
+        # Create new noise element for next sequence
+        batch_size, _, target_dim = prev_noisy_sequence.shape
+        new_noise = torch.randn(
             (batch_size, 1, target_dim),
-            device=prev_async_noisy_sequence_at_T_div_H.device
+            device=prev_noisy_sequence.device
         )
 
-        # 3. Concatenate to form the sequence for the next step
-        noisy_sequence_for_next_step = torch.cat(
-            [shifted_sequence, new_last_element_noise],
-            dim=1
-        )
+        # Form sequence for next step
+        next_noisy_sequence = torch.cat([shifted_sequence, new_noise], dim=1)
 
-        return current_step_output_z_tau_at_0, noisy_sequence_for_next_step
+        return current_output, next_noisy_sequence
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
@@ -287,14 +232,13 @@ class CLDiffPhyConModel(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action(self, obs_dict: dict[str, Tensor], previous_rt_diffusion_plan: Optional[Tensor] = None) -> Tensor:
         batch_size = -1
-        # Determine batch_size from a key that is expected to be in obs_dict for conditioning
         if OBS_ROBOT in obs_dict and obs_dict[OBS_ROBOT] is not None:
             batch_size = obs_dict[OBS_ROBOT].shape[0]
         elif "observation.images" in obs_dict and obs_dict["observation.images"] is not None:
             batch_size = obs_dict["observation.images"].shape[0]
         elif OBS_ENV in obs_dict and obs_dict[OBS_ENV] is not None:
             batch_size = obs_dict[OBS_ENV].shape[0]
-        else:  # Fallback, assumes obs_dict is not empty
+        else:
             if not obs_dict:
                 raise ValueError("obs_dict is empty in predict_action")
             first_key = next(iter(obs_dict.keys()))
@@ -302,142 +246,114 @@ class CLDiffPhyConModel(PreTrainedPolicy):
 
         global_cond = self.diffusion._prepare_global_conditioning(obs_dict)
 
-        output_sequence: Tensor
         if previous_rt_diffusion_plan is not None:
-            output_sequence = self.diffusion.async_conditional_sample(
+            return self.diffusion.async_conditional_sample(
                 current_input_normalized=previous_rt_diffusion_plan,
                 global_cond=global_cond
             )
-        else:
-            output_sequence = self.diffusion.conditional_sample(
-                batch_size=batch_size,
-                global_cond=global_cond
-            )
-        return output_sequence
+        return self.diffusion.conditional_sample(
+            batch_size=batch_size,
+            global_cond=global_cond
+        )
 
     def _prepare_batch_for_cond_logic(self, normalized_batch_inputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """Helper to prepare the batch specifically for _prepare_global_conditioning."""
-        batch_for_global_cond = {}
+        """Prepare batch for global conditioning."""
+        result = {}
         cond_horizon = self.config.n_obs_steps
 
-        # Process OBS_ROBOT (state) for conditioning
+        # Process robot state
         if OBS_ROBOT in normalized_batch_inputs and self.config.robot_state_feature:
-            # [B, S_loaded, Dim]
-            state_input_full = normalized_batch_inputs[OBS_ROBOT]
-            # Slice to the required conditioning horizon.
-            # Assumes the *first* cond_horizon steps of the loaded OBS_ROBOT are for conditioning.
-            # This aligns with how LeRobotDataset typically loads based on observation_delta_indices.
-            if state_input_full.shape[1] < cond_horizon:
+            state_input = normalized_batch_inputs[OBS_ROBOT]
+            if state_input.shape[1] < cond_horizon:
                 raise ValueError(
-                    f"Full state input seq len {state_input_full.shape[1]} < cond_horizon {cond_horizon} for {OBS_ROBOT}")
-            batch_for_global_cond[OBS_ROBOT] = state_input_full[:,
-                                                                :cond_horizon, :]
+                    f"State input length {state_input.shape[1]} < cond_horizon {cond_horizon}")
+            result[OBS_ROBOT] = state_input[:, :cond_horizon, :]
 
-        # Process image features for conditioning
+        # Process image features
         if self.config.image_features:
-            list_of_image_tensors_for_cond = []
-            # `self.config.image_features` is a dict like {"obs.image.cam1": FeatureSpec}
+            image_tensors = []
             for key in self.config.image_features:
                 if key in normalized_batch_inputs:
-                    # [B, S_img_loaded, C, H, W]
-                    img_input_full = normalized_batch_inputs[key]
-                    if img_input_full.shape[1] < cond_horizon:
+                    img_input = normalized_batch_inputs[key]
+                    if img_input.shape[1] < cond_horizon:
                         raise ValueError(
-                            f"Full image input seq len {img_input_full.shape[1]} < cond_horizon {cond_horizon} for key {key}")
-                    list_of_image_tensors_for_cond.append(
-                        img_input_full[:, :cond_horizon, :, :, :])
-            if list_of_image_tensors_for_cond:
-                # Stack to create NumCameras dimension: [B, cond_horizon, N_cam, C, H, W]
-                batch_for_global_cond["observation.images"] = torch.stack(
-                    list_of_image_tensors_for_cond, dim=2)
+                            f"Image input length {img_input.shape[1]} < cond_horizon {cond_horizon}")
+                    image_tensors.append(img_input[:, :cond_horizon, :, :, :])
+            if image_tensors:
+                result["observation.images"] = torch.stack(
+                    image_tensors, dim=2)
 
-        # Process OBS_ENV for conditioning
+        # Process environment state
         if OBS_ENV in normalized_batch_inputs and self.config.env_state_feature:
-            # [B, S_env_loaded, Dim]
-            env_input_full = normalized_batch_inputs[OBS_ENV]
-            if env_input_full.shape[1] < cond_horizon:
+            env_input = normalized_batch_inputs[OBS_ENV]
+            if env_input.shape[1] < cond_horizon:
                 raise ValueError(
-                    f"Full env input seq len {env_input_full.shape[1]} < cond_horizon {cond_horizon} for {OBS_ENV}")
-            batch_for_global_cond[OBS_ENV] = env_input_full[:,
-                                                            :cond_horizon, :]
+                    f"Environment input length {env_input.shape[1]} < cond_horizon {cond_horizon}")
+            result[OBS_ENV] = env_input[:, :cond_horizon, :]
 
-        return batch_for_global_cond
+        return result
 
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
-        # `normalize_inputs` operates on `batch` using `self.config.input_features`.
-        # `LeRobotDataset` loads data for each key in `input_features` according to `cfg.observation_delta_indices` (length `n_obs_steps`).
-        # And for keys in `output_features` according to `cfg.target_delta_indices` (length `horizon`).
-        # If a key is in both (e.g. "observation.state"), `delta_timestamps` makes it load the union.
-        # `normalize_inputs` will thus see "observation.state" with 18 steps.
-        normalized_batch_inputs = self.normalize_inputs(batch)
+        normalized_inputs = self.normalize_inputs(batch)
+        batch_for_cond = self._prepare_batch_for_cond_logic(normalized_inputs)
+        normalized_targets = self.normalize_targets(batch)
 
-        # This helper will slice inputs down to `config.n_obs_steps` for conditioning
-        batch_for_cond = self._prepare_batch_for_cond_logic(
-            normalized_batch_inputs)
-
-        # `normalize_targets` operates on `batch` using `self.config.output_features`.
-        # `batch[self.config.diffusion_target_key]` will have `horizon` steps.
-        normalized_targets_batch = self.normalize_targets(batch)
-
-        # `final_normalized_batch` is used for `batch_info_for_masking` and to get the diffusion target.
-        # It needs the *original target sequence length* for the diffusion_target_key.
-        # Start with correctly sliced conditioning data
-        final_normalized_batch = dict(batch_for_cond)
-        for key, val in normalized_targets_batch.items():  # Add normalized targets
+        # Prepare final batch with conditioning and targets
+        final_batch = dict(batch_for_cond)
+        for key, val in normalized_targets.items():
             if key in self.config.output_features:
-                final_normalized_batch[key] = val
+                final_batch[key] = val
 
-        global_cond_train = self.diffusion._prepare_global_conditioning(
+        global_cond = self.diffusion._prepare_global_conditioning(
             batch_for_cond)
 
-        diffusion_target_key = self.config.diffusion_target_key
-        if diffusion_target_key not in final_normalized_batch:
+        # Get and validate diffusion target
+        target_key = self.config.diffusion_target_key
+        if target_key not in final_batch:
             raise KeyError(
-                f"Diffusion target key '{diffusion_target_key}' not found in final_normalized_batch. Available keys: {list(final_normalized_batch.keys())}")
+                f"Target key '{target_key}' not found. Available: {list(final_batch.keys())}")
 
-        trajectory_to_diffuse = final_normalized_batch[diffusion_target_key]
-        if trajectory_to_diffuse.shape[1] != self.config.horizon:
-            # This check is important: ensures the target provided to diffusion model is of correct length
+        trajectory = final_batch[target_key]
+        if trajectory.shape[1] != self.config.horizon:
             raise ValueError(
-                f"Target trajectory for '{diffusion_target_key}' has length {trajectory_to_diffuse.shape[1]}, expected horizon {self.config.horizon}. Check LeRobotDataset loading for output_features.")
+                f"Target trajectory length {trajectory.shape[1]} != horizon {self.config.horizon}")
 
-        loss = self.diffusion.compute_loss(
-            trajectory_to_diffuse,
-            global_cond_train,
-            batch_info_for_masking=final_normalized_batch
+        return self.diffusion.compute_loss(
+            trajectory,
+            global_cond,
+            batch_info_for_masking=final_batch
         )
-        return loss
 
     def forward_async(self, batch: dict[str, Tensor]) -> Tensor:
         from model.diffusion.async_training import AsyncDiffusionTrainer
 
-        normalized_batch_inputs = self.normalize_inputs(batch)
-        batch_for_global_cond_async = self._prepare_batch_for_cond_logic(
-            normalized_batch_inputs)
+        normalized_inputs = self.normalize_inputs(batch)
+        batch_for_cond = self._prepare_batch_for_cond_logic(normalized_inputs)
+        normalized_targets = self.normalize_targets(batch)
 
-        normalized_targets_batch_async = self.normalize_targets(batch)
-        final_normalized_batch_async = dict(batch_for_global_cond_async)
-        for key, val in normalized_targets_batch_async.items():
+        # Prepare final batch with conditioning and targets
+        final_batch = dict(batch_for_cond)
+        for key, val in normalized_targets.items():
             if key in self.config.output_features:
-                final_normalized_batch_async[key] = val
+                final_batch[key] = val
 
-        global_cond_train_async = self.diffusion._prepare_global_conditioning(
-            batch_for_global_cond_async)
+        global_cond = self.diffusion._prepare_global_conditioning(
+            batch_for_cond)
 
-        diffusion_target_key = self.config.diffusion_target_key
-        if diffusion_target_key not in final_normalized_batch_async:
+        # Get and validate diffusion target
+        target_key = self.config.diffusion_target_key
+        if target_key not in final_batch:
             raise KeyError(
-                f"Diffusion target key '{diffusion_target_key}' not found in final_normalized_batch for async training.")
+                f"Target key '{target_key}' not found for async training")
 
-        # Should be [B, config.horizon, Dim]
-        target_full_sequence = final_normalized_batch_async[diffusion_target_key]
-
-        if target_full_sequence.shape[1] < self.config.horizon:
+        target_sequence = final_batch[target_key]
+        if target_sequence.shape[1] < self.config.horizon:
             raise ValueError(
-                f"Need at least {self.config.horizon} frames for async training target '{diffusion_target_key}', got {target_full_sequence.shape[1]}")
+                f"Need at least {self.config.horizon} frames for async training, got {target_sequence.shape[1]}")
 
-        clean_sequence = target_full_sequence[:, :self.config.horizon, :]
+        clean_sequence = target_sequence[:, :self.config.horizon, :]
 
+        # Initialize async trainer if needed
         if not hasattr(self, '_async_trainer'):
             self._async_trainer = AsyncDiffusionTrainer(
                 gap_timesteps=getattr(self.config, 'async_gap_timesteps', 20),
@@ -445,10 +361,9 @@ class CLDiffPhyConModel(PreTrainedPolicy):
                 horizon=self.config.horizon
             )
 
-        loss = self._async_trainer.compute_async_loss(
+        return self._async_trainer.compute_async_loss(
             clean_sequence=clean_sequence,
             denoising_model=self.diffusion.async_transformer,
             noise_scheduler=self.diffusion.noise_scheduler,
-            global_cond=global_cond_train_async
+            global_cond=global_cond
         )
-        return loss

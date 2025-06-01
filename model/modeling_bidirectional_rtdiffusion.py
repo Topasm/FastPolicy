@@ -7,7 +7,7 @@ from typing import Dict
 
 from lerobot.common.policies.utils import get_device_from_parameters, populate_queues
 from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE
+from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE, OBS_ENV
 from lerobot.configs.types import FeatureType
 from lerobot.common.datasets.utils import PolicyFeature
 
@@ -42,8 +42,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # CL-DiffPhyCon parameters
         self.use_cl_diffphycon = True
-        self.cl_diffphycon_state = None
-        self.cl_diffphycon_step_size = 10
+        # Store previous step's noisy latent sequence
+        self.cl_diffphycon_latent_z_prev = None
 
         # Process dataset stats for normalization
         processed_stats = self._process_dataset_stats(dataset_stats)
@@ -54,7 +54,25 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # Initialize queues
         self.n_obs_steps = n_obs_steps
+
+        # Initialize RGB encoder if images are used
+        if self.config.image_features:
+            from model.diffusion.diffusion_modules import DiffusionRgbEncoder
+            self.rgb_encoder = DiffusionRgbEncoder(self.config)
+            self.rgb_encoder.to(self.device)
+
         self.reset()
+        # Initialize queues
+        self._queues = {
+            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "action": deque(maxlen=self.config.n_action_steps),
+        }
+        if self.config.image_features:
+            self._queues["observation.image"] = deque(
+                maxlen=self.config.n_obs_steps)
+        if self.config.env_state_feature:
+            self._queues["observation.environment_state"] = deque(
+                maxlen=self.config.n_obs_steps)
 
     def _process_dataset_stats(self, dataset_stats):
         """Process raw dataset statistics into tensor format for normalizers."""
@@ -136,7 +154,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self._obs_image_queue = deque(maxlen=self.n_obs_steps)
         self._obs_state_queue = deque(maxlen=self.n_obs_steps)
         self._action_execution_queue = deque()
-        self.cl_diffphycon_state = None
+        self.cl_diffphycon_latent_z_prev = None
 
     @torch.no_grad()
     def select_action(self, current_raw_observation: Dict[str, Tensor]) -> Tensor:
@@ -149,26 +167,45 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         processed_obs = self._preprocess_observation(raw_obs)
         normalized_obs = self._normalize_observation(processed_obs)
 
-        # Extract state and image from normalized observation
-        norm_state, norm_img = self._extract_features(normalized_obs)
+        self._queues = populate_queues(
+            self._queues, normalized_obs)
+        # Generate new action plan only when the action queue is empty
+        if len(self._queues["action"]) == 0:
+            # Check if we have enough history to make a prediction
+            required_obs = self.config.n_obs_steps
+            if len(self._queues["observation.state"]) < required_obs:
+                print(
+                    f"Warning: Not enough history in queues. Have {len(self._queues['observation.state'])}, need {required_obs}")
+                # Return zero action if we don't have enough history yet
+                return torch.zeros((1, self.config.action_feature.shape[0]), device=self.device)
 
-        # Update observation queues
-        self._update_queues(norm_state, norm_img, normalized_obs)
+            # Prepare batch for the model by stacking history from queues (already normalized)
+            model_input_batch = {}
+            for key, queue in self._queues.items():
+                if key.startswith("observation"):
+                    # Ensure tensors are on the correct device before stacking if needed
+                    queue_list = [item.to(self.device) if isinstance(
+                        item, torch.Tensor) else item for item in queue]
+                    model_input_batch[key] = torch.stack(queue_list, dim=1)
 
         # If we already have actions queued, return the next one
         if self._action_execution_queue:
             return self._get_next_action()
 
-        # If we don't have enough history yet, return zero action
-        if len(self._obs_state_queue) < self.n_obs_steps:
-            return self._get_zero_action(norm_state.shape[0])
+        # # If we don't have enough history yet, return zero action
+        # if len(self._obs_state_queue) < self.n_obs_steps:
+        #     return self._get_zero_action(norm_state.shape[0])
 
-        # Prepare observations for model conditioning
-        observation_batch_for_cond = self._prepare_conditioning()
+        #        Args:
+        # model_input_batch: Dict with observation history
+        # batch_size: Batch size for diffusion model
+
+        # Extract current state from the model input batch for inverse dynamics
+        # Get the last state in the sequence
+        norm_state = model_input_batch["observation.state"][:, -1, :]
 
         # Generate refined state plan
-        refined_state_plan = self._generate_state_plan(
-            norm_state, norm_img, observation_batch_for_cond)
+        refined_state_plan = self._generate_state_plan(model_input_batch)
 
         # Generate actions using inverse dynamics
         actions = self._generate_actions_from_states(
@@ -176,7 +213,14 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # Queue up actions for execution
         for i in range(actions.shape[1]):
-            self._action_execution_queue.append(actions[:, i, :])
+            # Store each action as a tensor of shape [action_dim], not [batch_size, action_dim]
+            # This way the queue contains simple action vectors
+            self._action_execution_queue.append(
+                actions[0, i, :])  # Assuming batch_size=1
+
+        # Print queue size for debugging
+        print(
+            f"Queued {len(self._action_execution_queue)} actions for execution")
 
         # Return the first action
         if self._action_execution_queue:
@@ -210,70 +254,56 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             print(f"Error during normalization: {e}")
             return processed_obs  # Fallback to unnormalized
 
-    def _extract_features(self, normalized_obs):
-        """Extract state and image features from normalized observation."""
-        # Extract state
-        if OBS_ROBOT not in normalized_obs:
-            raise KeyError(
-                f"Normalized batch missing required state key: {OBS_ROBOT}")
-        norm_state = normalized_obs[OBS_ROBOT]
+    # def _update_queues(self, norm_state, norm_img, normalized_obs):
+    #     """Update observation history queues."""
+    #     # Add state to queue
+    #     self._obs_state_queue.append(norm_state.unsqueeze(1))
 
-        # Extract image if available
-        norm_img = None
-        image_keys = list(self.config.image_features.keys()
-                          ) if self.config.image_features else []
-        main_image_key = image_keys[0] if image_keys else None
+    #     # Add image to queue if available
+    #     if self.config.image_features and norm_img is not None:
+    #         # Stack multiple cameras if needed
+    #         image_tensors = []
+    #         for img_key in self.config.image_features:
+    #             if img_key in normalized_obs:
+    #                 img_tensor = normalized_obs[img_key]
+    #                 if img_tensor.ndim == 3:
+    #                     img_tensor = img_tensor.unsqueeze(0)
+    #                 image_tensors.append(img_tensor)
 
-        # Check if bidirectional transformer uses images
-        bidir_features = getattr(
-            self.bidirectional_transformer.config, 'input_features', {})
-        bidir_uses_image = any(k.startswith("observation.image")
-                               for k in bidir_features)
-
-        if bidir_uses_image:
-            if main_image_key and main_image_key in normalized_obs:
-                norm_img = normalized_obs[main_image_key]
-            elif "observation.image" in normalized_obs:
-                norm_img = normalized_obs["observation.image"]
-            else:
-                if bidir_uses_image:  # Only raise error if transformer actually needs an image
-                    raise KeyError(
-                        "Normalized batch missing required image for BidirectionalARTransformer")
-
-        # Ensure proper dimensions
-        if norm_state.ndim == 1:
-            norm_state = norm_state.unsqueeze(0)
-        if norm_img is not None and norm_img.ndim == 3:
-            norm_img = norm_img.unsqueeze(0)
-
-        return norm_state, norm_img
-
-    def _update_queues(self, norm_state, norm_img, normalized_obs):
-        """Update observation history queues."""
-        # Add state to queue
-        self._obs_state_queue.append(norm_state.unsqueeze(1))
-
-        # Add image to queue if available
-        if self.config.image_features and norm_img is not None:
-            # Stack multiple cameras if needed
-            image_tensors = []
-            for img_key in self.config.image_features:
-                if img_key in normalized_obs:
-                    img_tensor = normalized_obs[img_key]
-                    if img_tensor.ndim == 3:
-                        img_tensor = img_tensor.unsqueeze(0)
-                    image_tensors.append(img_tensor)
-
-            if image_tensors:
-                stacked_cameras = torch.stack(
-                    image_tensors, dim=1)  # [B, N_cam, C, H, W]
-                self._obs_image_queue.append(
-                    stacked_cameras.unsqueeze(1))  # [B, 1, N_cam, C, H, W]
+    #         if image_tensors:
+    #             stacked_cameras = torch.stack(
+    #                 image_tensors, dim=1)  # [B, N_cam, C, H, W]
+    #             self._obs_image_queue.append(
+    #                 stacked_cameras.unsqueeze(1))  # [B, 1, N_cam, C, H, W]
 
     def _get_next_action(self):
         """Get the next normalized action from the queue and unnormalize it."""
         next_action = self._action_execution_queue.popleft()
-        return self.unnormalize_action_output({"action": next_action})["action"]
+        print(f"Action shape before unsqueeze: {next_action.shape}")
+        # Handle different shapes - ensure it's a batch
+        if len(next_action.shape) == 1:
+            next_action = next_action.unsqueeze(0)
+        print(f"Action shape after unsqueeze: {next_action.shape}")
+
+        # Try to unnormalize the action
+        try:
+            # Make sure we're passing a properly formatted dictionary to unnormalize_action_output
+            action_dict = {"action": next_action}
+            unnorm_action = self.unnormalize_action_output(action_dict)
+
+            # Check if the result is a dictionary or tensor
+            if isinstance(unnorm_action, dict) and "action" in unnorm_action:
+                print(
+                    f"Unnormalized action successfully with keys: {unnorm_action.keys()}")
+                return unnorm_action["action"]
+            else:
+                print(
+                    f"Unnormalized action returned type: {type(unnorm_action)}")
+                return unnorm_action
+        except Exception as e:
+            print(f"Error unnormalizing action: {e}")
+            # Return the action as-is in case of error
+            return next_action
 
     def _get_zero_action(self, batch_size):
         """Get a zero action tensor with the correct dimensions."""
@@ -288,75 +318,138 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             action_dim = 2  # Default minimal value
 
         zero_action = torch.zeros((batch_size, action_dim), device=self.device)
-        return self.unnormalize_action_output({"action": zero_action})["action"]
+        try:
+            unnorm_result = self.unnormalize_action_output(
+                {"action": zero_action})
+            # Check if the result is a dictionary or tensor
+            if isinstance(unnorm_result, dict) and "action" in unnorm_result:
+                return unnorm_result["action"]
+            else:
+                return unnorm_result
+        except Exception as e:
+            print(f"Error in unnormalizing zero action: {e}")
+            return zero_action
 
-    def _prepare_conditioning(self):
-        """Prepare conditioning information for diffusion model."""
-        # Stack state history for conditioning
-        obs_history_state = torch.cat(list(self._obs_state_queue), dim=1)
+    def _generate_state_plan(self, model_input_batch):
+        """Generate refined state plan using bidirectional transformer and diffusion.
 
-        # Create conditioning dict with state
-        conditioning = {OBS_ROBOT: obs_history_state}
+        Args:
+            model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
+        """
+        # Extract current state and image
+        # Get the last state
+        norm_state_current = model_input_batch["observation.state"][:, -1, :]
+        norm_img_current = None
+        if "observation.image" in model_input_batch:
+            # Extract last image from the sequence
+            norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
 
-        # Add image if available
-        if self.config.image_features and self._obs_image_queue:
-            obs_history_img = torch.cat(list(self._obs_image_queue), dim=1)
-            conditioning[OBS_IMAGE] = obs_history_img
-
-        return conditioning
-
-    def _generate_state_plan(self, norm_state, norm_img, observation_batch_for_cond):
-        """Generate refined state plan using bidirectional transformer and diffusion."""
         if self.use_cl_diffphycon:
-            return self._generate_cl_diffphycon_plan(observation_batch_for_cond)
+            return self._generate_cl_diffphycon_plan(
+                norm_state_current,
+                norm_img_current,
+                model_input_batch
+            )
         else:
-            return self._generate_standard_plan(norm_state, norm_img, observation_batch_for_cond)
+            return self._generate_standard_plan(norm_state_current, norm_img_current, model_input_batch)
 
-    def _generate_cl_diffphycon_plan(self, observation_batch_for_cond):
-        """Generate state plan using CL-DiffPhyCon algorithm."""
+    def _generate_cl_diffphycon_plan(self, norm_state_current, norm_img_current, observation_batch_for_cond_history):
+        """Generate state plan using CL-DiffPhyCon algorithm.
+
+        Args:
+            norm_state_current: Current normalized state (u_env,τ-1) from select_action
+            norm_img_current: Current normalized image (for BidirectionalARTransformer) from select_action
+            observation_batch_for_cond_history: Dict of historical observations for conditioning diffusion
+        """
         print("Using CL-DiffPhyCon algorithm")
 
-        # Initialize CL-DiffPhyCon state if needed
-        if self.cl_diffphycon_state is None:
-            print("Initializing CL-DiffPhyCon state")
-            self.cl_diffphycon_state = self.state_diffusion_model.initialize_cl_diffphycon_state(
-                observation_batch_for_cond
+        # Initialize CL-DiffPhyCon latent state if needed (first call in an episode)
+        if self.cl_diffphycon_latent_z_prev is None:
+            print("Initializing CL-DiffPhyCon latent_z_prev")
+
+            # Step 1: Generate Initial Clean Plan ("Sync Path") using Bidirectional Transformer
+            # Prepare state for bidirectional transformer
+            bidir_state_dim = self.bidirectional_transformer.config.state_dim
+            current_state_for_bidir = norm_state_current
+            if norm_state_current.shape[-1] != bidir_state_dim:
+                current_state_for_bidir = norm_state_current[:,
+                                                             :bidir_state_dim]
+
+            # Generate initial plan with transformer using current observations
+            tf_predictions = self.bidirectional_transformer(
+                initial_images=norm_img_current,
+                initial_states=current_state_for_bidir,
+                training=False
             )
 
-        # Perform a CL-DiffPhyCon step
-        self.cl_diffphycon_state = self.state_diffusion_model.sample_cl_diffphycon_step(
-            self.cl_diffphycon_state,
-            step_size=self.cl_diffphycon_step_size
-        )
+            # Extract predicted states and create initial plan
+            norm_predicted_states = tf_predictions['predicted_forward_states']
+            initial_clean_plan = torch.cat(
+                [current_state_for_bidir.unsqueeze(1), norm_predicted_states], dim=1
+            )
 
-        # Get the current plan
-        state_plan = self.cl_diffphycon_state["x_t"]
-        print(
-            f"CL-DiffPhyCon timestep: {self.cl_diffphycon_state['timestep']}, finished: {self.cl_diffphycon_state['finished']}")
+            # Adjust plan length to match diffusion horizon
+            diffusion_horizon = self.state_diffusion_model.config.horizon
+            if initial_clean_plan.shape[1] > diffusion_horizon:
+                initial_clean_plan_for_diffusion = initial_clean_plan[:,
+                                                                      :diffusion_horizon, :]
+            elif initial_clean_plan.shape[1] < diffusion_horizon:
+                # Handle cases where the plan is shorter than diffusion horizon
+                padding_size = diffusion_horizon - initial_clean_plan.shape[1]
+                # Pad with the last state
+                last_state_in_plan = initial_clean_plan[:, -1:, :]
+                padding = last_state_in_plan.repeat(1, padding_size, 1)
+                initial_clean_plan_for_diffusion = torch.cat(
+                    [initial_clean_plan, padding], dim=1)
+            else:
+                initial_clean_plan_for_diffusion = initial_clean_plan
 
-        return state_plan
+            # Step 2: Initialize the Asynchronously Noised Latent State
+            self.cl_diffphycon_latent_z_prev = self.state_diffusion_model.initialize_cl_diffphycon_state(
+                initial_clean_plan_for_diffusion
+            )
 
-    def _generate_standard_plan(self, norm_state, norm_img, observation_batch_for_cond):
-        """Generate state plan using bidirectional transformer and diffusion refinement."""
+        # Step 3: Perform CL-DiffPhyCon Asynchronous Denoising Step
+        # observation_batch_for_cond_history is used by _prepare_global_conditioning inside sample_cl_diffphycon_step
+        current_step_predicted_state_at_t0, next_step_latent_z = \
+            self.state_diffusion_model.sample_cl_diffphycon_step(
+                self.cl_diffphycon_latent_z_prev,
+                observation_batch_for_cond_history
+            )
+
+        # Step 4: Update the stored noisy latent for the next environment step
+        self.cl_diffphycon_latent_z_prev = next_step_latent_z
+
+        # Step 5: Return the fully denoised state prediction for the current step
+        return current_step_predicted_state_at_t0
+
+    def _generate_standard_plan(self, norm_state_current, norm_img_current, observation_batch_for_cond_history):
+        """Generate state plan using bidirectional transformer and diffusion refinement.
+
+        Args:
+            norm_state_current: Current normalized state (latest state in the sequence) 
+            norm_img_current: Current normalized image (latest image in the sequence)
+            observation_batch_for_cond_history: Dict containing observation history
+        """
         print("Using original bidirectional + diffusion refinement")
 
         # Prepare state for bidirectional transformer
         bidir_state_dim = self.bidirectional_transformer.config.state_dim
-        if norm_state.shape[-1] != bidir_state_dim:
-            norm_state_for_bidir = norm_state[:, :bidir_state_dim]
+        if norm_state_current.shape[-1] != bidir_state_dim:
+            norm_state_for_bidir = norm_state_current[:, :bidir_state_dim]
         else:
-            norm_state_for_bidir = norm_state
+            norm_state_for_bidir = norm_state_current
 
         # Check if image is required but missing
         bidir_uses_image = any(k.startswith("observation.image")
                                for k in getattr(self.bidirectional_transformer.config, 'input_features', {}))
-        if bidir_uses_image and norm_img is None:
+        if bidir_uses_image and norm_img_current is None:
             raise ValueError(
                 "BidirectionalARTransformer requires an image but none is available")
 
         # Generate initial state plan with transformer
         transformer_predictions = self.bidirectional_transformer(
-            initial_images=norm_img,
+            initial_images=norm_img_current,
             initial_states=norm_state_for_bidir,
             training=False
         )
@@ -375,7 +468,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         try:
             refined_state_plan = self.state_diffusion_model.diffusion.refine_state_path(
                 initial_state_path=initial_state_plan,
-                observation_batch_for_cond=observation_batch_for_cond
+                observation_batch_for_cond=observation_batch_for_cond_history
             )
             print("✅ Diffusion refinement completed successfully!")
         except RuntimeError as e:
@@ -394,8 +487,19 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if current_state.shape[-1] != inv_dyn_state_dim:
             current_state = current_state[:, :inv_dyn_state_dim]
 
-        # Adjust state plan dimensions if needed
+        # Handle different shapes of state_plan
+        # For CL-DiffPhyCon, state_plan is typically [batch_size, state_dim]
+        # For standard diffusion, state_plan is typically [batch_size, seq_len, state_dim]
         plan_for_invdyn = state_plan
+
+        # Check if plan is a sequence or a single state
+        if len(plan_for_invdyn.shape) == 2:  # [batch_size, state_dim]
+            print(
+                f"Plan shape is 2D: {plan_for_invdyn.shape}, expanding to sequence with len=1")
+            # Make it a sequence of length 1: [batch_size, 1, state_dim]
+            plan_for_invdyn = plan_for_invdyn.unsqueeze(1)
+
+        # Adjust dimensions if needed
         if plan_for_invdyn.shape[-1] != inv_dyn_state_dim:
             if plan_for_invdyn.shape[-1] < inv_dyn_state_dim:
                 # Pad if too small
