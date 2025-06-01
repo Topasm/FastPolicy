@@ -53,10 +53,7 @@ def main():
         output_features=output_features,  # Output is now state
         horizon=horizon,
         n_obs_steps=n_obs_steps,
-        # n_action_steps is less relevant for diffusion target if not predicting actions,
-        # but config requires it. It defines how LeRobotDataset loads "action" if "action"
-        # were in output_features. Here, it's not the direct diffusion target.
-        # For consistency with original script structure, let's set it.
+
         n_action_steps=horizon,
         noise_scheduler_type="DDPM",
         num_train_timesteps=100,
@@ -75,26 +72,9 @@ def main():
     policy.train()
     policy.to(device)
 
-    # --- MODIFICATION: Setup delta timestamps for dataset ---
-    # `cfg.observation_delta_indices` (e.g., [-1,0]) for conditioning observations.
-    # `cfg.target_delta_indices` (e.g., [1,...,H] for states) for target sequence.
-    # `LeRobotDataset` uses these properties of `cfg` to determine which frames to load
-    # for keys present in `input_features` and `output_features`.
-
     # Indices for conditioning images
     # e.g., [-1, 0] for n_obs_steps=2
     image_indices_obs = list(range(1 - cfg.n_obs_steps, 1))
-
-    # For "observation.state", it's both an input (for conditioning) and an output (target).
-    # `LeRobotDataset` will load data for all unique indices required by its role as input and output.
-    # The actual indices used for input are cfg.observation_delta_indices.
-    # The actual indices used for output are cfg.target_delta_indices.
-    # We need to provide a `delta_timestamps["observation.state"]` that covers the union of these.
-
-    # Example: n_obs_steps=2, horizon=16
-    # cfg.observation_delta_indices = [-1, 0]
-    # cfg.target_delta_indices (for state prediction) = [1, 2, ..., 16]
-    # So, "observation.state" needs to be loaded for indices -1, 0, 1, ..., 16.
 
     all_state_indices_needed = sorted(
         list(set(cfg.observation_delta_indices + cfg.target_delta_indices)))
@@ -102,19 +82,7 @@ def main():
     delta_timestamps = {
         "observation.image": [i / dataset_metadata.fps for i in image_indices_obs],
         "observation.state": [i / dataset_metadata.fps for i in all_state_indices_needed],
-        # "action" is no longer a direct output of this diffusion model, so it's not strictly needed
-        # in delta_timestamps unless it's an input_feature or used by some other part of the config/dataset.
-        # If "action" is still needed for some global conditioning (not typical for this setup) or
-        # if LeRobotDataset structure breaks without it due to policy.action_feature access,
-        # it might need to be included. For now, let's assume it's not needed for state predictor training target.
-        # However, CLDiffPhyConModel's _queues still initializes an "action" queue.
-        # If other parts of your code (e.g. evaluation) still expect 'action' to be loadable via this config
-        # for the policy's final output (even if diffusion predicts states), keep it.
-        # For this training script, focusing on state prediction, we primarily care about state targets.
-        # Let's add a dummy action loading for now to avoid potential issues with dataset expecting it
-        # if the config.output_features (for the *policy overall*, not diffusion target) still lists action.
-        # The `cfg.output_features` passed to DiffusionConfig for *this training run* is `{"observation.state": ...}`.
-        # So LeRobotDataset will *not* look for "action" as an output.
+
     }
 
     dataset = LeRobotDataset(

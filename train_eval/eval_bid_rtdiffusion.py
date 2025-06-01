@@ -17,18 +17,12 @@ import imageio
 import numpy  # numpy was imported as numpy, not np
 import torch
 import json
-# from torch import nn # nn was not used directly
-# from torch.utils.data import DataLoader # DataLoader not used in eval
-# import os # os was not used directly
 
 
 def main():
     # --- Configuration ---
     bidirectional_output_dir = Path("outputs/train/bidirectional_transformer")
-    # This path should point to the *state prediction* diffusion model's output
-    # IMPORTANT: Ensure this model was trained for STATE PREDICTION.
-    # Its config.json should have "interpolate_state": true and target a state feature.
-    # MODIFIED: Example path for state predictor
+
     state_diffusion_output_dir = Path(
         "outputs/train/rtdiffusion_state_predictor")
     invdyn_output_dir = Path("outputs/train/invdyn_only")
@@ -67,9 +61,6 @@ def main():
         print(
             f"Loaded BidirectionalARTransformerConfig from {bidir_config_path}")
 
-        # COMPATIBILITY CHECK: The BidirectionalARTransformer has been modified to use query tokens
-        # for non-autoregressive generation. The config may not have these parameters if it was
-        # saved before the modification. This is fine because the parameters are initialized in __init__.
         print("Note: Using modified BidirectionalARTransformer with query-based inference. "
               "This version should be significantly faster during inference.")
     else:
@@ -96,17 +87,10 @@ def main():
         print(
             f"Using state_dim={bidir_cfg.state_dim}, image_channels={bidir_cfg.image_channels} for BidirectionalARTransformer.")
 
-    bidirectional_ckpt_path = None
-    possible_bidir_ckpt_names = ["model_final.pth",
-                                 "final_model.pt", "model_weights.pt"]
-    for name in possible_bidir_ckpt_names:
-        path = bidirectional_output_dir / name
-        if path.is_file():
-            bidirectional_ckpt_path = path
-            break
-    if bidirectional_ckpt_path is None:
+    bidirectional_ckpt_path = bidirectional_output_dir / "model_final.pth"
+    if not bidirectional_ckpt_path.is_file():
         raise OSError(
-            f"BidirectionalARTransformer checkpoint not found in {bidirectional_output_dir} with names: {possible_bidir_ckpt_names}")
+            f"BidirectionalARTransformer checkpoint not found at {bidirectional_ckpt_path}")
 
     transformer_model = BidirectionalARTransformer(bidir_cfg)
     print(
@@ -115,26 +99,7 @@ def main():
     model_state_dict_bidir = checkpoint_bidir.get(
         "model_state_dict", checkpoint_bidir)
 
-    # COMPATIBILITY: Handle potential missing keys in the checkpoint if loading a model
-    # that was saved before the query-based modifications
-    try:
-        # First attempt strict loading
-        transformer_model.load_state_dict(model_state_dict_bidir)
-        print("Successfully loaded transformer model weights with strict matching.")
-    except RuntimeError as e:
-        if "Missing key(s) in state_dict" in str(e):
-            # If we're missing the query tokens or prediction heads, load with strict=False
-            print("Warning: Missing keys when loading transformer model. "
-                  "This is expected if using a checkpoint saved before the non-autoregressive "
-                  "modification. Loading with strict=False...")
-            transformer_model.load_state_dict(
-                model_state_dict_bidir, strict=False)
-            print("Successfully loaded transformer model with non-strict matching. "
-                  "Some parameters were randomly initialized.")
-        else:
-            # If it's some other error, re-raise it
-            raise
-
+    transformer_model.load_state_dict(model_state_dict_bidir)
     transformer_model.eval()
     transformer_model.to(device)
 
@@ -154,38 +119,21 @@ def main():
               "has 'interpolate_state: False'. This model might be trained for ACTION prediction, "
               "not state prediction as required for this pipeline stage.")
 
-    # The DiffusionTransformer within this CLDiffPhyConModel instance should be
-    # configured to output states. This is typically handled if state_diff_cfg.interpolate_state is True,
-    # as DiffusionConfig.diffusion_target_key will point to a state.
-    # The output_dim of the internal DiffusionTransformer is set based on config.action_feature,
-    # but if interpolate_state=True, the "action_feature" effectively becomes the state feature.
-    # This is managed by how CLDiffPhyConModel uses the config.
-
     state_diffusion_model = CLDiffPhyConModel(
         config=state_diff_cfg,
         dataset_stats=metadata.stats
     )
 
-    possible_state_diff_ckpt_names = [
-        "model.pth", "model_weights.pt", "model_final.pth", "final_model.pt"]
-    state_diff_ckpt_path = None
-    for name in possible_state_diff_ckpt_names:
-        path = state_diffusion_output_dir / name
-        if path.is_file():
-            state_diff_ckpt_path = path
-            break
-    if state_diff_ckpt_path is None:
+    state_diff_ckpt_path = state_diffusion_output_dir / "model_final.pth"
+    if not state_diff_ckpt_path.is_file():
         raise OSError(
-            f"State Diffusion checkpoint not found in {state_diffusion_output_dir} with names: {possible_state_diff_ckpt_names}")
+            f"State Diffusion checkpoint not found at {state_diff_ckpt_path}")
 
     print(f"Loading State Diffusion model from: {state_diff_ckpt_path}")
     checkpoint_statediff = torch.load(state_diff_ckpt_path, map_location="cpu")
     model_state_dict_statediff = checkpoint_statediff.get(
         "model_state_dict", checkpoint_statediff)
 
-    # Handle potential key mismatches if the diffusion target was different during training
-    # (e.g. if DiffusionTransformer's output head was named based on 'action' but now predicts states)
-    # This might require careful loading if strict=False causes issues.
     state_diffusion_model.load_state_dict(
         model_state_dict_statediff, strict=False)
     state_diffusion_model.eval()
@@ -203,17 +151,13 @@ def main():
         a_dim=invdyn_a_dim,
         hidden_dim=invdyn_hidden_dim
     )
+    # Try primary checkpoint first, fall back to alternative
     invdyn_ckpt_path = invdyn_output_dir / "invdyn_final.pth"
     if not invdyn_ckpt_path.is_file():
-        possible_invdyn_ckpt_names = ["invdyn_model.pth", "invdyn_weights.pt"]
-        for name in possible_invdyn_ckpt_names:
-            path = invdyn_output_dir / name
-            if path.is_file():
-                invdyn_ckpt_path = path
-                break
-        if not invdyn_ckpt_path or not invdyn_ckpt_path.is_file():  # Check again after loop
+        invdyn_ckpt_path = invdyn_output_dir / "invdyn_model.pth"
+        if not invdyn_ckpt_path.is_file():
             raise OSError(
-                f"Inverse Dynamics checkpoint not found in {invdyn_output_dir} with common names.")
+                f"Inverse Dynamics checkpoint not found in {invdyn_output_dir}")
 
     print(f"Loading Inverse Dynamics model from: {invdyn_ckpt_path}")
     checkpoint_invdyn = torch.load(invdyn_ckpt_path, map_location="cpu")
@@ -223,10 +167,6 @@ def main():
     inv_dyn_model.eval()
     inv_dyn_model.to(device)
 
-    # --- Create Combined Policy ---
-    # The BidirectionalRTDiffusionPolicy itself doesn't need changes to work with the
-    # modified BidirectionalARTransformer because it just uses the transformer's API,
-    # which we've kept backward compatible
     combined_policy = BidirectionalRTDiffusionPolicy(
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,
