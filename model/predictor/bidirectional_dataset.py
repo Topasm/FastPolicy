@@ -188,38 +188,6 @@ class BidirectionalTrajectoryDataset(Dataset):
             'backward_states': torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in backward_states])
         }
 
-        # Apply normalization if provided
-        if self.normalizer is not None:
-            # Normalize images to [-1, 1] range
-            result['initial_images'] = result['initial_images'] / 127.5 - 1.0
-            result['goal_images'] = result['goal_images'] / 127.5 - 1.0
-
-            # Normalize states using the provided normalizer
-            if hasattr(self.normalizer, 'normalize'):
-                # Create temporary dict for normalization
-                temp_dict = {
-                    self.state_key: result['initial_states'].unsqueeze(0)
-                }
-                normalized = self.normalizer.normalize(temp_dict)
-                result['initial_states'] = normalized[self.state_key].squeeze(
-                    0)
-
-                # Normalize forward states
-                temp_dict = {
-                    self.state_key: result['forward_states'].unsqueeze(0)
-                }
-                normalized = self.normalizer.normalize(temp_dict)
-                result['forward_states'] = normalized[self.state_key].squeeze(
-                    0)
-
-                # Normalize backward states
-                temp_dict = {
-                    self.state_key: result['backward_states'].unsqueeze(0)
-                }
-                normalized = self.normalizer.normalize(temp_dict)
-                result['backward_states'] = normalized[self.state_key].squeeze(
-                    0)
-
         return result
 
     @staticmethod

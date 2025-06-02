@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Training script for the Bidirectional Autoregressive Transformer.
+Training script for the Bidirectional Autore    # Create a normalizer that only handles the "observation.state" key
+    # The bidirectional transformer model will internally map normalization
+    normalize_state = Normalize(
+        {"observation.state": features["observation.state"]}, 
+        cfg.normalization_mapping, 
+        dataset_metadata.stats)ransformer.
 """
 
 import torch
 from torch.utils.data import DataLoader
-import time
 from pathlib import Path
 import safetensors.torch
-from typing import Dict, Any
 import numpy as np  # Added for stats saving
 from tqdm import tqdm  # Added for progress bar
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.common.policies.normalize import Normalize
+from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
@@ -22,6 +25,8 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     compute_loss  # Import the consolidated loss function
 )
 from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
+from model.predictor.normalization_utils import KeyMappingNormalizer, KeyMappingUnnormalizer
+from model.diffusion.configuration_mymodel import DiffusionConfig
 
 
 def main():
@@ -47,6 +52,10 @@ def main():
     dataset_metadata = LeRobotDatasetMetadata(dataset_repo_id)
     features = dataset_to_policy_features(dataset_metadata.features)
 
+    cfg = DiffusionConfig(
+        input_features={"observation.state": features["observation.state"]},
+        output_features={"observation.image": features["observation.image"]}
+    )  # Dummy config to access properties
     input_features = {
         "observation.state": features["observation.state"],
         "observation.image": features["observation.image"],
@@ -64,18 +73,18 @@ def main():
     state_dim = features["observation.state"].shape[-1]
     print(f"State dimension: {state_dim}")
 
-    normalize_inputs = Normalize(input_features, {}, dataset_metadata.stats)
+    # We'll create normalizers later when setting up the model
     lerobot_dataset = LeRobotDataset(
         dataset_repo_id, delta_timestamps=None)  # Using base dataset
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
-        normalizer=normalize_inputs,
         forward_steps=16,
         backward_steps=16,
         min_episode_length=50,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
         state_key="observation.state"
+
     )
 
     dataloader = DataLoader(
@@ -90,6 +99,24 @@ def main():
 
     print(f"Dataset size: {len(dataset)}")
     print(f"Batches per iteration: {len(dataloader)}")
+
+    # --- Create normalizers ---
+    # Basic normalizer that works with "observation.state" key
+    normalize_state_base = Normalize(
+        {"observation.state": features["observation.state"]},
+        cfg.normalization_mapping,
+        dataset_metadata.stats)
+
+    # Create a key mapping normalizer that maps from batch keys to normalizer keys
+    key_mapping = {
+        "initial_states": "observation.state",
+        "forward_states": "observation.state",
+        "backward_states": "observation.state"
+    }
+
+    # Wrap the base normalizer with our key mapper
+    wrapped_normalizer = KeyMappingNormalizer(
+        normalize_state_base, key_mapping)
 
     # --- Model Configuration ---
     config = BidirectionalARTransformerConfig(
@@ -108,7 +135,12 @@ def main():
         output_features=output_features,  # Pass the actual FeatureSpec objects
     )
 
-    model = BidirectionalARTransformer(config)
+    # Create the model without internal normalizers (we'll use external normalization)
+    model = BidirectionalARTransformer(
+        config=config,
+        state_key="observation.state",  # Keep state key for reference
+        image_key="observation.image"   # Keep image key for reference
+    )
     model.to(device)
     model.train()  # Set model to training mode
 
@@ -140,6 +172,8 @@ def main():
     while not done:
         for batch in tqdm(dataloader, desc=f"Training Step: {step}/{training_steps}"):
             # Move batch to device
+            batch = wrapped_normalizer(batch)  # Normalize the batch
+
             batch_device = {}
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
@@ -151,6 +185,7 @@ def main():
             optimizer.zero_grad()
 
             # Forward pass
+            # We've already normalized the batch with wrapped_normalizer above
             predictions = model(
                 initial_images=batch_device['initial_images'],
                 initial_states=batch_device['initial_states'],
@@ -164,7 +199,7 @@ def main():
             )
 
             # Compute losses using the consolidated function
-            # Targets for loss are directly from the batch_device
+            # Targets for loss are directly from the batch_device (already normalized)
             losses = compute_loss(model, predictions, batch_device)
             total_loss = losses['total_loss']
 

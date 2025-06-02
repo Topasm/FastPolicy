@@ -34,7 +34,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         n_obs_steps: int
     ):
         super().__init__()
+        # Store the transformer - now there's only one version with integrated normalization
         self.bidirectional_transformer = bidirectional_transformer
+        self.base_transformer = bidirectional_transformer
+
         self.state_diffusion_model = state_diffusion_model
         self.inverse_dynamics_model = inverse_dynamics_model
         self.config = state_diffusion_model.config
@@ -192,11 +195,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if self._action_execution_queue:
             return self._get_next_action()
 
-        #        Args:
-        # model_input_batch: Dict with observation history
-        # batch_size: Batch size for diffusion model
-
-        # Extract current state from the model input batch for inverse dynamics
         # Get the last state in the sequence
         norm_state = model_input_batch["observation.state"][:, -1, :]
 
@@ -311,32 +309,28 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         Args:
             model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
         """
-        # Extract current state and image
-        # Get the last state
+        if self.use_cl_diffphycon:
+            # Pass the entire model_input_batch to the CL-DiffPhyCon plan generator
+            return self._generate_cl_diffphycon_plan(model_input_batch)
+        else:
+            # Pass the entire model_input_batch to the standard plan generator
+            return self._generate_standard_plan(model_input_batch)
+
+    def _generate_cl_diffphycon_plan(self, model_input_batch):
+        """Generate state plan using CL-DiffPhyCon algorithm.
+
+        Args:
+            model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
+                               This includes both current observation and history
+        """
+        print("Using CL-DiffPhyCon algorithm")
+
+        # Extract current state and image from model_input_batch
         norm_state_current = model_input_batch["observation.state"][:, -1, :]
         norm_img_current = None
         if "observation.image" in model_input_batch:
             # Extract last image from the sequence
             norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
-
-        if self.use_cl_diffphycon:
-            return self._generate_cl_diffphycon_plan(
-                norm_state_current,
-                norm_img_current,
-                model_input_batch
-            )
-        else:
-            return self._generate_standard_plan(norm_state_current, norm_img_current, model_input_batch)
-
-    def _generate_cl_diffphycon_plan(self, norm_state_current, norm_img_current, observation_batch_for_cond_history):
-        """Generate state plan using CL-DiffPhyCon algorithm.
-
-        Args:
-            norm_state_current: Current normalized state (u_env,τ-1) from select_action
-            norm_img_current: Current normalized image (for BidirectionalARTransformer) from select_action
-            observation_batch_for_cond_history: Dict of historical observations for conditioning diffusion
-        """
-        print("Using CL-DiffPhyCon algorithm")
 
         # Initialize CL-DiffPhyCon latent state if needed (first call in an episode)
         if self.cl_diffphycon_latent_z_prev is None:
@@ -344,7 +338,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
             # Step 1: Generate Initial Clean Plan ("Sync Path") using Bidirectional Transformer
             # Prepare state for bidirectional transformer
-            bidir_state_dim = self.bidirectional_transformer.config.state_dim
+            bidir_state_dim = self.base_transformer.config.state_dim
             current_state_for_bidir = norm_state_current
             if norm_state_current.shape[-1] != bidir_state_dim:
                 current_state_for_bidir = norm_state_current[:,
@@ -404,11 +398,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             self.cl_diffphycon_latent_z_prev = initial_clean_plan_for_diffusion
 
         # Step 3: Perform CL-DiffPhyCon Asynchronous Denoising Step
-        # observation_batch_for_cond_history is used by _prepare_global_conditioning inside sample_cl_diffphycon_step
+        # model_input_batch is used by _prepare_global_conditioning inside sample_cl_diffphycon_step
         current_step_predicted_state_at_t0, next_step_latent_z = \
             self.state_diffusion_model.sample_cl_diffphycon_step(
                 self.cl_diffphycon_latent_z_prev,
-                observation_batch_for_cond_history
+                model_input_batch
             )
 
         # Step 4: Update the stored noisy latent for the next environment step
@@ -417,18 +411,24 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Step 5: Return the fully denoised state prediction for the current step
         return current_step_predicted_state_at_t0
 
-    def _generate_standard_plan(self, norm_state_current, norm_img_current, observation_batch_for_cond_history):
+    def _generate_standard_plan(self, model_input_batch):
         """Generate state plan using bidirectional transformer and diffusion refinement.
 
         Args:
-            norm_state_current: Current normalized state (latest state in the sequence) 
-            norm_img_current: Current normalized image (latest image in the sequence)
-            observation_batch_for_cond_history: Dict containing observation history
+            model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
+                              This includes both current observation and history
         """
         print("Using original bidirectional + diffusion refinement")
 
+        # Extract current state and image from model_input_batch
+        norm_state_current = model_input_batch["observation.state"][:, -1, :]
+        norm_img_current = None
+        if "observation.image" in model_input_batch:
+            # Extract last image from the sequence
+            norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
+
         # Prepare state for bidirectional transformer
-        bidir_state_dim = self.bidirectional_transformer.config.state_dim
+        bidir_state_dim = self.base_transformer.config.state_dim
         if norm_state_current.shape[-1] != bidir_state_dim:
             norm_state_for_bidir = norm_state_current[:, :bidir_state_dim]
         else:
@@ -436,7 +436,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # Check if image is required but missing
         bidir_uses_image = any(k.startswith("observation.image")
-                               for k in getattr(self.bidirectional_transformer.config, 'input_features', {}))
+                               for k in getattr(self.base_transformer.config, 'input_features', {}))
         if bidir_uses_image and norm_img_current is None:
             raise ValueError(
                 "BidirectionalARTransformer requires an image but none is available")
@@ -462,7 +462,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         try:
             refined_state_plan = self.state_diffusion_model.diffusion.refine_state_path(
                 initial_state_path=initial_state_plan,
-                observation_batch_for_cond=observation_batch_for_cond_history
+                observation_batch_for_cond=model_input_batch
             )
             print("✅ Diffusion refinement completed successfully!")
         except RuntimeError as e:

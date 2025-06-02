@@ -16,8 +16,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json  # Added for config saving
 from dataclasses import dataclass, asdict, field  # Ensure dataclass is imported
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from pathlib import Path
+
+
+# Removed normalize imports as we handle normalization outside the model
 
 
 @dataclass
@@ -197,11 +200,26 @@ class BidirectionalARTransformer(nn.Module):
     3. Generate forward trajectory: st_0 → st_1 → ... → st_15 (autoregressive)
     4. Generate goal image i_n from final state st_15
     5. Generate backward trajectory: st_n → st_n-1 → ... → st_n-15 (autoregressive)
+
+    Note: This transformer expects all inputs to be pre-normalized by calling code.
+    Normalization should be handled externally before passing data to this model.
     """
 
-    def __init__(self, config: BidirectionalARTransformerConfig):
+    def __init__(self,
+                 config: BidirectionalARTransformerConfig,
+                 state_key: str = "observation.state",
+                 image_key: str = "observation.image"):
         super().__init__()
         self.config = config
+
+        # Keep track of state and image keys for reference
+        self.state_key = state_key
+        self.image_key = image_key
+
+        # Import here to avoid circular import
+        from lerobot.configs.types import FeatureType, NormalizationMode
+        self.feature_type = FeatureType
+        self.normalization_mode = NormalizationMode
 
         # Image encoder and decoder
         self.image_encoder = ImageEncoder(config)
@@ -598,6 +616,9 @@ class BidirectionalARTransformer(nn.Module):
 
         return results
 
+    # Methods _normalize_if_needed and _unnormalize_if_needed have been replaced with direct
+    # calls to normalizer and unnormalizer in the forward method for more reliable normalization
+
     def forward(
         self,
         initial_images: torch.Tensor,
@@ -610,18 +631,28 @@ class BidirectionalARTransformer(nn.Module):
         """
         Forward pass through the bidirectional autoregressive transformer.
 
+        Note: All inputs should already be normalized before being passed to this method.
+        Normalization is handled outside the model.
+
         Args:
             initial_images: [B, C, H, W] initial images
-            initial_states: [B, state_dim] initial states
-            forward_states: [B, forward_steps, state_dim] forward trajectory states (training only)
+            initial_states: [B, state_dim] initial states (normalized)
+            forward_states: [B, forward_steps, state_dim] forward trajectory states (normalized, training only)
             goal_images: [B, C, H, W] goal images (training only)
-            backward_states: [B, backward_steps, state_dim] backward trajectory states (training only)
+            backward_states: [B, backward_steps, state_dim] backward trajectory states (normalized, training only)
             training: Whether in training mode
 
         Returns:
-            Dictionary containing predicted states, images, and latents
+            Dictionary containing predicted states, images, and latents (all outputs are in normalized space)
         """
         device = initial_images.device
+
+        # Skip normalization since we're now doing it externally before passing to the model
+        normalized_initial_states = initial_states
+        normalized_forward_states = forward_states
+        normalized_backward_states = backward_states
+
+        # The normalizer is no longer needed here since we normalize the batch before model.forward()
 
         # Encode initial image
         initial_image_latents = self.image_encoder(
@@ -629,13 +660,77 @@ class BidirectionalARTransformer(nn.Module):
 
         if training:
             # Training mode: teacher forcing with full sequence
-            return self._forward_training(
-                initial_image_latents, initial_states, forward_states,
-                goal_images, backward_states, device
+            results = self._forward_training(
+                initial_image_latents, normalized_initial_states, normalized_forward_states,
+                goal_images, normalized_backward_states, device
             )
         else:
             # Inference mode: non-autoregressive generation with query tokens
-            return self._forward_inference(initial_image_latents, initial_states, device)
+            results = self._forward_inference(
+                initial_image_latents, normalized_initial_states, device)
+
+        # No normalization or unnormalization needed here
+        # All normalization happens outside the model
+
+        return results
+
+
+@classmethod
+def from_pretrained(cls, path, device=None, **kwargs):
+    """
+    Load a transformer from pretrained files.
+
+    Args:
+        path: Path to the directory containing model checkpoint and config
+        device: Device to load the model on
+        **kwargs: Additional arguments for model initialization
+
+    Returns:
+        Initialized BidirectionalARTransformer
+    """
+    from pathlib import Path
+    import torch
+
+    path = Path(path)
+
+    # Load config
+    try:
+        config_path = path / "config.json"
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+        config = BidirectionalARTransformerConfig(**config_dict)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        raise
+
+    # Create model
+    model = cls(config=config, **kwargs)
+
+    # Load weights
+    try:
+        model_path = path / "model_final.pth"
+        if not model_path.exists():
+            # Try alternative names
+            candidates = list(path.glob("*.pth"))
+            if candidates:
+                model_path = candidates[0]
+                print(f"Using model checkpoint: {model_path}")
+
+        if device is not None:
+            state_dict = torch.load(model_path, map_location=device)
+        else:
+            state_dict = torch.load(model_path)
+
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        print(f"Error loading model weights: {e}")
+        raise
+
+    # Move model to device if specified
+    if device is not None:
+        model = model.to(device)
+
+    return model
 
 
 def compute_loss(
@@ -648,8 +743,8 @@ def compute_loss(
 
     Args:
         model: The BidirectionalARTransformer model instance.
-        predictions: Model predictions.
-        targets: Ground truth targets.
+        predictions: Model predictions (already normalized).
+        targets: Ground truth targets (already normalized).
 
     Returns:
         Dictionary of losses.
@@ -658,10 +753,11 @@ def compute_loss(
 
     # State prediction losses (MSE) - for autoregressive outputs
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
+        # Use the ground truth states from second state onward
+        target_states = targets['forward_states'][:, 1:]
         losses['forward_state_loss'] = F.mse_loss(
             predictions['predicted_forward_states'],
-            # Ground truth for st_1 to st_{T-1}
-            targets['forward_states'][:, 1:]
+            target_states
         )
 
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
@@ -680,6 +776,7 @@ def compute_loss(
     # Latent consistency losses
     if 'predicted_goal_latents' in predictions and 'goal_images' in targets:
         with torch.no_grad():  # Ensure encoder is not trained on this reconstruction
+            # No need to normalize images as the image_encoder expects raw pixel values
             goal_image_latents = model.image_encoder(targets['goal_images'])
         losses['goal_latent_consistency_loss'] = F.mse_loss(
             predictions['predicted_goal_latents'],
@@ -688,9 +785,11 @@ def compute_loss(
 
     # Query-based prediction losses (to align with autoregressive outputs)
     if 'query_predicted_forward_states' in predictions and 'forward_states' in targets:
+        # All values are already properly normalized at this point
+        target_states = targets['forward_states'][:, 1:]
         losses['query_forward_state_loss'] = F.mse_loss(
             predictions['query_predicted_forward_states'],
-            targets['forward_states'][:, 1:]
+            target_states
         )
 
     if 'query_predicted_backward_states' in predictions and 'backward_states' in targets:
@@ -707,6 +806,7 @@ def compute_loss(
 
     if 'query_predicted_goal_latents' in predictions and 'goal_images' in targets:
         with torch.no_grad():
+            # No need to normalize images as the image_encoder expects raw pixel values
             goal_image_latents = model.image_encoder(targets['goal_images'])
         losses['query_goal_latent_consistency_loss'] = F.mse_loss(
             predictions['query_predicted_goal_latents'],

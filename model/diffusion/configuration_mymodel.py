@@ -86,7 +86,7 @@ class DiffusionConfig(PreTrainedConfig):
     """
     type: str = field(init=True, default="mydiffusion")
     # Interpolation mode - interpolate between given keyframe states
-    interpolate_state: bool = True
+    interpolate_state: bool = False
 
     # Inputs / output structure.
     n_obs_steps: int = 2  # Always use states at -1, 0
@@ -155,22 +155,6 @@ class DiffusionConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
         # Validation logic
-        if self.interpolate_state:
-            # Check if a state key exists for interpolation target
-            state_keys = [
-                k for k in self.output_features if k.endswith("state")]
-            if not state_keys:
-                raise ValueError(
-                    "When interpolate_state is True, output_features must contain at least one key ending with 'state' (e.g., 'observation.state') to be used as the interpolation target."
-                )
-            # Ensure action is still in output_features for the final policy output
-
-        else:
-            # Ensure action is the only output if not interpolating state
-            if "action" not in self.output_features:
-                raise ValueError(
-                    "When interpolate_state is False, 'action' must be included in output_features."
-                )
 
         # Validate horizon vs n_action_steps and n_obs_steps
         if self.transformer_dim % self.transformer_num_heads != 0:

@@ -6,6 +6,8 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )
+from lerobot.common.policies.normalize import Normalize
+from lerobot.common.datasets.utils import dataset_to_policy_features
 # Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
 from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
@@ -92,14 +94,57 @@ def main():
         raise OSError(
             f"BidirectionalARTransformer checkpoint not found at {bidirectional_ckpt_path}")
 
-    transformer_model = BidirectionalARTransformer(bidir_cfg)
-    print(
-        f"Loading BidirectionalARTransformer from: {bidirectional_ckpt_path}")
-    checkpoint_bidir = torch.load(bidirectional_ckpt_path, map_location="cpu")
-    model_state_dict_bidir = checkpoint_bidir.get(
-        "model_state_dict", checkpoint_bidir)
+    # Create normalized transformer if possible
+    print(f"Loading transformer model from: {bidirectional_ckpt_path}")
 
-    transformer_model.load_state_dict(model_state_dict_bidir)
+    # Get features for normalization
+    # Convert raw feature dictionaries to PolicyFeature objects
+    policy_features = dataset_to_policy_features(metadata.features)
+
+    input_features = {
+        "observation.state": policy_features["observation.state"],
+        "observation.image": next(iter([policy_features[k] for k in metadata.camera_keys]), None),
+    }
+    output_features = {
+        "predicted_forward_states": policy_features["observation.state"],
+        "predicted_backward_states": policy_features["observation.state"],
+    }
+
+    # Load transformer model with integrated normalization
+    normalizer = Normalize(input_features, {}, metadata.stats)
+    unnormalizer = Normalize(output_features, {}, metadata.stats)
+
+    try:
+        # Use the from_pretrained class method which supports normalization
+        transformer_model = BidirectionalARTransformer.from_pretrained(
+            bidirectional_ckpt_path,
+            config=bidir_cfg,
+            device="cpu",  # We'll move to the right device later
+            normalizer=normalizer,
+            unnormalizer=unnormalizer,
+            state_key="observation.state",
+            image_key="observation.image" if metadata.camera_keys else None
+        )
+        print("Successfully loaded transformer with integrated normalization")
+    except Exception as e:
+        print(f"Error loading transformer with from_pretrained: {e}")
+        print("Falling back to manual loading")
+
+        # Fall back to manual loading
+        transformer_model = BidirectionalARTransformer(
+            config=bidir_cfg,
+            normalizer=normalizer,
+            unnormalizer=unnormalizer,
+            state_key="observation.state",
+            image_key="observation.image" if metadata.camera_keys else None
+        )
+
+        checkpoint_bidir = torch.load(
+            bidirectional_ckpt_path, map_location="cpu")
+        model_state_dict_bidir = checkpoint_bidir.get(
+            "model_state_dict", checkpoint_bidir)
+        transformer_model.load_state_dict(model_state_dict_bidir)
+
     transformer_model.eval()
     transformer_model.to(device)
 
