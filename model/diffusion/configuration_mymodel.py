@@ -20,7 +20,6 @@ from typing import Optional
 from lerobot.common.optim.optimizers import AdamConfig
 from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
 
 
 @PreTrainedConfig.register_subclass("mydiffusion")
@@ -98,14 +97,6 @@ class DiffusionConfig(PreTrainedConfig):
     keyframe_indices: list[int] = field(default_factory=lambda: [8, 16, 32])
     interpolation_mode: str = "dense"  # "dense", "skip_even", "sparse"
     interpolation_method: str = "auto"  # "linear", "cubic", "adaptive", "auto"
-
-    normalization_mapping: dict[str, NormalizationMode] = field(
-        default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MIN_MAX,
-            "ACTION": NormalizationMode.MIN_MAX
-        }
-    )
 
     drop_n_last_frames: int = 7
 

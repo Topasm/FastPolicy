@@ -18,7 +18,7 @@ import json  # Added for config saving
 from dataclasses import dataclass, asdict, field  # Ensure dataclass is imported
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
-
+from lerobot.configs.types import NormalizationMode
 
 # Removed normalize imports as we handle normalization outside the model
 
@@ -72,6 +72,14 @@ class BidirectionalARTransformerConfig:
         # Deserialization of FeatureSpec might be needed here if they are complex
         # For now, assume they are simple dicts or basic types after to_dict
         return cls(**config_dict)
+
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX
+        }
+    )
 
 
 class ImageEncoder(nn.Module):

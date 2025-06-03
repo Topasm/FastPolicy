@@ -6,7 +6,7 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )
-from lerobot.common.policies.normalize import Normalize
+from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.datasets.utils import dataset_to_policy_features
 # Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
@@ -101,14 +101,16 @@ def main():
     # Convert raw feature dictionaries to PolicyFeature objects
     policy_features = dataset_to_policy_features(metadata.features)
 
-    input_features = {
-        "observation.state": policy_features["observation.state"],
-        "observation.image": next(iter([policy_features[k] for k in metadata.camera_keys]), None),
-    }
     output_features = {
-        "predicted_forward_states": policy_features["observation.state"],
-        "predicted_backward_states": policy_features["observation.state"],
+        "action": policy_features["action"]
     }
+
+    unnormalize_action_output = Unnormalize(
+        # Use all features for unnormalization
+        output_features,
+        bidir_cfg.normalization_mapping,
+        processed_dataset_stats
+    )
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
@@ -245,8 +247,14 @@ def main():
             # The select_action method already returns unnormalized actions from _get_next_action
             action = combined_policy.select_action(observation_for_policy)
 
+        act = {}
+        act['action'] = action[0]  # Action is already unnormalized
+        action = unnormalize_action_output(act)
+
+        unnorm_action = action["action"]
+
         # Make sure action is on CPU before converting to numpy
-        numpy_action = action.squeeze(0).cpu().numpy()
+        numpy_action = unnorm_action.squeeze(0).cpu().numpy()
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 
