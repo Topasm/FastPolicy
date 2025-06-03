@@ -6,9 +6,8 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )
-from lerobot.common.policies.normalize import Normalize, Unnormalize
+from lerobot.common.policies.normalize import Normalize
 from lerobot.common.datasets.utils import dataset_to_policy_features
-from lerobot.configs.types import NormalizationMode  # Import NormalizationMode enum
 # Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
 from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
@@ -82,7 +81,7 @@ def main():
             state_dim=state_dim_from_meta,
             image_size=96,  # This should match training
             image_channels=image_channels_from_meta,  # This should match training
-            forward_steps=20,  # This should match training
+            forward_steps=16,  # This should match training
             backward_steps=16,
             input_features=metadata.features,  # Pass features for potential use in config
             output_features={},  # Bidir model defines its own outputs conceptually
@@ -104,28 +103,12 @@ def main():
 
     input_features = {
         "observation.state": policy_features["observation.state"],
-        "observation.image": policy_features["observation.image"]
+        "observation.image": next(iter([policy_features[k] for k in metadata.camera_keys]), None),
     }
-
     output_features = {
-        "action": policy_features["action"]
+        "predicted_forward_states": policy_features["observation.state"],
+        "predicted_backward_states": policy_features["observation.state"],
     }
-
-    # Convert string normalization mapping to NormalizationMode enum objects
-    norm_mapping = {}
-    for key, value in bidir_cfg.normalization_mapping.items():
-        # Convert string values to NormalizationMode enum
-        if isinstance(value, str):
-            norm_mapping[key] = NormalizationMode(value)
-        else:
-            norm_mapping[key] = value
-
-    unnormalize_action_output = Unnormalize(
-        # Use all features for unnormalization
-        output_features,
-        norm_mapping,
-        processed_dataset_stats
-    )
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
@@ -212,12 +195,9 @@ def main():
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,
         inverse_dynamics_model=inv_dyn_model,
+        dataset_stats=metadata.stats,  # Pass raw metadata.stats
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
-        n_obs_steps=state_diff_cfg.n_obs_steps,
-        input_features=input_features,
-        # Use the converted norm_mapping from NormalizationMode enums
-        norm_mapping=norm_mapping,
-        dataset_stats=processed_dataset_stats,
+        n_obs_steps=state_diff_cfg.n_obs_steps
     )
 
     # --- Environment Setup ---
@@ -265,14 +245,8 @@ def main():
             # The select_action method already returns unnormalized actions from _get_next_action
             action = combined_policy.select_action(observation_for_policy)
 
-        act = {}
-        act['action'] = action[0]  # Action is already unnormalized
-        action = unnormalize_action_output(act)
-
-        unnorm_action = action["action"]
-
         # Make sure action is on CPU before converting to numpy
-        numpy_action = unnorm_action.squeeze(0).cpu().numpy()
+        numpy_action = action.squeeze(0).cpu().numpy()
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 
