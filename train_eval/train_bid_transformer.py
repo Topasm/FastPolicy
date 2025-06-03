@@ -79,7 +79,7 @@ def main():
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
-        forward_steps=16,
+        forward_steps=20,
         backward_steps=16,
         min_episode_length=50,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
@@ -129,7 +129,7 @@ def main():
         image_channels=3,
         image_size=96,
         image_latent_dim=256,
-        forward_steps=16,
+        forward_steps=20,
         backward_steps=16,
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features,  # Pass the actual FeatureSpec objects

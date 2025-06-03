@@ -206,22 +206,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             print("Integrating new transformer plan into policy")
 
             # Re-initialize the diffusion latent state with the new plan
-            # Ensure the plan's length matches diffusion_horizon
+            # Use the dedicated helper method to adjust the plan to match diffusion horizon
             diffusion_horizon = self.state_diffusion_model.config.horizon
-            if new_transformer_segment_plan.shape[1] > diffusion_horizon:
-                self.cl_diffphycon_latent_z_prev = new_transformer_segment_plan[
-                    :, :diffusion_horizon, :]
-            elif new_transformer_segment_plan.shape[1] < diffusion_horizon:
-                # Pad with the last state if needed
-                padding_size = diffusion_horizon - \
-                    new_transformer_segment_plan.shape[1]
-                last_state = new_transformer_segment_plan[:, -1:, :]
-                padding = last_state.repeat(1, padding_size, 1)
-                self.cl_diffphycon_latent_z_prev = torch.cat(
-                    [new_transformer_segment_plan, padding], dim=1)
-            else:
-                # Perfect length, use as-is
-                self.cl_diffphycon_latent_z_prev = new_transformer_segment_plan
+            self.cl_diffphycon_latent_z_prev = self._adjust_plan_to_horizon(
+                new_transformer_segment_plan, diffusion_horizon)
 
             # Option B: Add noise for principled start if configured
             if self.use_noisy_transformer_plans:
@@ -239,20 +227,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                         timeout=0.1)
                     print("First transformer plan received")
 
-                    # Initialize with the received plan
+                    # Initialize with the received plan using the helper method
                     diffusion_horizon = self.state_diffusion_model.config.horizon
-                    if new_transformer_segment_plan.shape[1] > diffusion_horizon:
-                        self.cl_diffphycon_latent_z_prev = new_transformer_segment_plan[
-                            :, :diffusion_horizon, :]
-                    elif new_transformer_segment_plan.shape[1] < diffusion_horizon:
-                        padding_size = diffusion_horizon - \
-                            new_transformer_segment_plan.shape[1]
-                        last_state = new_transformer_segment_plan[:, -1:, :]
-                        padding = last_state.repeat(1, padding_size, 1)
-                        self.cl_diffphycon_latent_z_prev = torch.cat(
-                            [new_transformer_segment_plan, padding], dim=1)
-                    else:
-                        self.cl_diffphycon_latent_z_prev = new_transformer_segment_plan
+                    self.cl_diffphycon_latent_z_prev = self._adjust_plan_to_horizon(
+                        new_transformer_segment_plan, diffusion_horizon)
 
                     # Option B: Add noise for principled start if configured
                     if self.use_noisy_transformer_plans:
@@ -407,22 +385,18 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Return the fully denoised state prediction for the current step
         return current_step_predicted_state_at_t0
 
-    def _adjust_plan_to_horizon(self, plan, target_horizon):
-        """Helper method to adjust a plan to match the target horizon.
-
-        Args:
-            plan: Tensor plan to adjust [batch, seq_len, dim]
-            target_horizon: Target sequence length
-
-        Returns:
-            Adjusted plan with correct horizon length
-        """
+    def _adjust_plan_to_horizon(self, plan, target_horizon, use_last_n_if_longer: bool = False):  # Add a flag
         if plan.shape[1] > target_horizon:
-            # Truncate if too long
-            return plan[:, :target_horizon, :]
+            if use_last_n_if_longer:
+                # Takes the LAST target_horizon steps
+                return plan[:, -target_horizon:, :]
+            else:
+                # Takes the FIRST target_horizon steps
+                return plan[:, :target_horizon:, :]
         elif plan.shape[1] < target_horizon:
             # Pad with the last state if too short
             padding_size = target_horizon - plan.shape[1]
+            # Slicing with -1: ensures it's still [B, 1, D]
             last_state = plan[:, -1:, :]
             padding = last_state.repeat(1, padding_size, 1)
             return torch.cat([plan, padding], dim=1)
@@ -554,18 +528,9 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
                 # Adjust plan length to match diffusion horizon
                 diffusion_horizon = self.state_diffusion_model.config.horizon
-                if new_segment_plan.shape[1] > diffusion_horizon:
-                    new_segment_plan = new_segment_plan[:,
-                                                        :diffusion_horizon, :]
-                elif new_segment_plan.shape[1] < diffusion_horizon:
-                    # Handle cases where the plan is shorter than diffusion horizon
-                    padding_size = diffusion_horizon - \
-                        new_segment_plan.shape[1]
-                    # Pad with the last state
-                    last_state_in_plan = new_segment_plan[:, -1, :]
-                    padding = last_state_in_plan.repeat(1, padding_size, 1)
-                    new_segment_plan = torch.cat(
-                        [new_segment_plan, padding], dim=1)
+                # Use the dedicated helper method for consistent handling
+                new_segment_plan = self._adjust_plan_to_horizon(
+                    new_segment_plan, diffusion_horizon)
 
                 # Clear the queue to ensure we only have the latest plan
                 while not self.transformer_plan_queue.empty():

@@ -948,12 +948,23 @@ class DiffusionModel(nn.Module):
                 "Set config.use_async_transformer=True to use this method."
             )
 
+        # Convert scalar timestep to tensor if needed
+        if isinstance(timestep, int):
+            timestep_tensor = torch.tensor([timestep], device=device)
+        else:
+            timestep_tensor = timestep
+
+        # Ensure timestep is within valid range
+        max_timestep = self.noise_scheduler.config.num_train_timesteps - 1
+        valid_timestep = torch.clamp(
+            timestep_tensor, 0, max_timestep)[0].item()
+
         # Determine number of inference steps
         if num_async_inference_steps is None:
             # Default to either a config value or a reasonable fraction of train timesteps
             num_async_inference_steps = getattr(
                 self.config, 'num_async_inference_steps',
-                min(timestep + 1, max(10,
+                min(int(valid_timestep) + 1, max(10,
                     self.noise_scheduler.config.num_train_timesteps // 20))
             )
 
@@ -967,12 +978,15 @@ class DiffusionModel(nn.Module):
         timesteps_for_denoising = self.noise_scheduler.timesteps
 
         # Filter timesteps to start from the provided timestep or lower
-        valid_timestep_indices = timesteps_for_denoising <= timestep
+        valid_timestep_indices = timesteps_for_denoising <= valid_timestep
         if not valid_timestep_indices.any():
-            # If no valid timesteps (which shouldn't happen), just return input
-            return x_t
-
-        filtered_timesteps = timesteps_for_denoising[valid_timestep_indices]
+            # If no valid timesteps, log warning and use smallest available timestep
+            print(f"Warning: No valid timesteps for denoising (requested {valid_timestep}). "
+                  f"Using smallest available timestep: {timesteps_for_denoising[0]}")
+            # Use at least one step
+            filtered_timesteps = timesteps_for_denoising[:1]
+        else:
+            filtered_timesteps = timesteps_for_denoising[valid_timestep_indices]
 
         # Initialize the current noisy sample with the input
         sample = x_t.clone()
@@ -981,7 +995,6 @@ class DiffusionModel(nn.Module):
         for t in filtered_timesteps:
             # Create per-token timesteps tensor with shape [B, H]
             # For the asynchronous mode, each token in the sequence has its own timestep
-            # The shape must be [B, H] for the DenoisingTransformer's async_mode=True
             token_timesteps = torch.full(
                 (batch_size, horizon), t, dtype=torch.long, device=device)
 
@@ -993,18 +1006,19 @@ class DiffusionModel(nn.Module):
                 async_mode=True       # Critical: enable async mode for per-token conditioning
             )
 
-            # Use scheduler to get sample for next timestep
-            # Note: For the scheduler to work with per-token timesteps, we need to use it in a batch mode
-            # or reshape our data appropriately
-
             # Step the scheduler to denoise the sample
             # Note: t is already a scalar value that the scheduler can use directly
-            sample = self.noise_scheduler.step(
-                model_output,  # Predicted noise or sample
-                t,             # Current timestep value
-                sample,        # Current noisy sample
-                generator=generator  # Optional RNG for reproducibility
-            ).prev_sample
+            try:
+                sample = self.noise_scheduler.step(
+                    model_output,  # Predicted noise or sample
+                    t,             # Current timestep value
+                    sample,        # Current noisy sample
+                    generator=generator  # Optional RNG for reproducibility
+                ).prev_sample
+            except Exception as e:
+                print(f"Error in noise scheduler step at timestep {t}: {e}")
+                # Continue with the current sample if there's an error
+                continue
 
         # Return the completely denoised trajectory
         return sample

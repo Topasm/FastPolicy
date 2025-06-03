@@ -36,7 +36,7 @@ class BidirectionalARTransformerConfig:
     image_channels: int = 3           # Number of image channels (RGB)
     image_size: int = 96              # Size of the input/output images
     image_latent_dim: int = 256       # Dimension of image latent representation
-    forward_steps: int = 16
+    forward_steps: int = 20
     backward_steps: int = 16
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
