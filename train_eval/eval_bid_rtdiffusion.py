@@ -8,6 +8,7 @@ from model.predictor.bidirectional_autoregressive_transformer import (
 )
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.datasets.utils import dataset_to_policy_features
+from lerobot.configs.types import NormalizationMode  # Import NormalizationMode enum
 # Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
 from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
@@ -81,7 +82,7 @@ def main():
             state_dim=state_dim_from_meta,
             image_size=96,  # This should match training
             image_channels=image_channels_from_meta,  # This should match training
-            forward_steps=16,  # This should match training
+            forward_steps=20,  # This should match training
             backward_steps=16,
             input_features=metadata.features,  # Pass features for potential use in config
             output_features={},  # Bidir model defines its own outputs conceptually
@@ -110,10 +111,19 @@ def main():
         "action": policy_features["action"]
     }
 
+    # Convert string normalization mapping to NormalizationMode enum objects
+    norm_mapping = {}
+    for key, value in bidir_cfg.normalization_mapping.items():
+        # Convert string values to NormalizationMode enum
+        if isinstance(value, str):
+            norm_mapping[key] = NormalizationMode(value)
+        else:
+            norm_mapping[key] = value
+
     unnormalize_action_output = Unnormalize(
         # Use all features for unnormalization
         output_features,
-        bidir_cfg.normalization_mapping,
+        norm_mapping,
         processed_dataset_stats
     )
 
@@ -205,7 +215,8 @@ def main():
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
         n_obs_steps=state_diff_cfg.n_obs_steps,
         input_features=input_features,
-        norm_mapping=bidir_cfg.normalization_mapping,
+        # Use the converted norm_mapping from NormalizationMode enums
+        norm_mapping=norm_mapping,
         dataset_stats=processed_dataset_stats,
     )
 

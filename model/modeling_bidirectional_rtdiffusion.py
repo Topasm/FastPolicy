@@ -389,7 +389,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if plan.shape[1] > target_horizon:
             if use_last_n_if_longer:
                 # Takes the LAST target_horizon steps
-                return plan[:, -target_horizon:, :]
+                return plan[:, 1:1+target_horizon, :]
             else:
                 # Takes the FIRST target_horizon steps
                 return plan[:, :target_horizon:, :]
