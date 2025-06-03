@@ -110,40 +110,19 @@ def main():
         "predicted_backward_states": policy_features["observation.state"],
     }
 
-    # Load transformer model with integrated normalization
-    normalizer = Normalize(input_features, {}, metadata.stats)
-    unnormalizer = Normalize(output_features, {}, metadata.stats)
+    # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
+    print("Loading transformer model manually")
+    transformer_model = BidirectionalARTransformer(
+        config=bidir_cfg,
+        state_key="observation.state",
+        image_key="observation.image" if metadata.camera_keys else None
+    )
 
-    try:
-        # Use the from_pretrained class method which supports normalization
-        transformer_model = BidirectionalARTransformer.from_pretrained(
-            bidirectional_ckpt_path,
-            config=bidir_cfg,
-            device="cpu",  # We'll move to the right device later
-            normalizer=normalizer,
-            unnormalizer=unnormalizer,
-            state_key="observation.state",
-            image_key="observation.image" if metadata.camera_keys else None
-        )
-        print("Successfully loaded transformer with integrated normalization")
-    except Exception as e:
-        print(f"Error loading transformer with from_pretrained: {e}")
-        print("Falling back to manual loading")
-
-        # Fall back to manual loading
-        transformer_model = BidirectionalARTransformer(
-            config=bidir_cfg,
-            normalizer=normalizer,
-            unnormalizer=unnormalizer,
-            state_key="observation.state",
-            image_key="observation.image" if metadata.camera_keys else None
-        )
-
-        checkpoint_bidir = torch.load(
-            bidirectional_ckpt_path, map_location="cpu")
-        model_state_dict_bidir = checkpoint_bidir.get(
-            "model_state_dict", checkpoint_bidir)
-        transformer_model.load_state_dict(model_state_dict_bidir)
+    checkpoint_bidir = torch.load(
+        bidirectional_ckpt_path, map_location="cpu")
+    model_state_dict_bidir = checkpoint_bidir.get(
+        "model_state_dict", checkpoint_bidir)
+    transformer_model.load_state_dict(model_state_dict_bidir)
 
     transformer_model.eval()
     transformer_model.to(device)
@@ -263,8 +242,10 @@ def main():
             combined_policy.reset()
 
         with torch.inference_mode():
+            # The select_action method already returns unnormalized actions from _get_next_action
             action = combined_policy.select_action(observation_for_policy)
 
+        # Make sure action is on CPU before converting to numpy
         numpy_action = action.squeeze(0).cpu().numpy()
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)

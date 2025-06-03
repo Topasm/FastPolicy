@@ -109,6 +109,9 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             print("Warning: Missing required config attributes for normalization.")
             return normalize_fn, unnormalize_fn
 
+        # Store processed stats for later use (adding this for manual unnormalization)
+        self.config.dataset_stats = processed_stats
+
         # Create normalizer for inputs
         try:
             # Prepare input features for normalizer
@@ -135,19 +138,59 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Create unnormalizer for actions
         try:
             action_feature_data = all_features.get("action")
+
+            # Debug info about action feature and stats
+            if "action" in processed_stats:
+                print(
+                    f"Action stats available - mean shape: {processed_stats['action'].get('mean').shape if 'mean' in processed_stats['action'] else 'N/A'}")
+                print(
+                    f"Action stats available - std shape: {processed_stats['action'].get('std').shape if 'std' in processed_stats['action'] else 'N/A'}")
+                print(f"Action mean: {processed_stats['action'].get('mean')}")
+                print(f"Action std: {processed_stats['action'].get('std')}")
+            else:
+                print("WARNING: No 'action' key in processed_stats!")
+
             if action_feature_data:
                 if isinstance(action_feature_data, dict) and 'type' in action_feature_data and 'shape' in action_feature_data:
+                    # Create a PolicyFeature object from the action feature data
                     action_feature = PolicyFeature(
                         type=FeatureType(action_feature_data['type']),
                         shape=tuple(action_feature_data['shape'])
                     )
+                    # Create the unnormalizer specifically for the action
                     unnormalize_fn = Unnormalize(
                         {"action": action_feature},
                         self.config.normalization_mapping,
                         processed_stats
                     )
+                    print(
+                        f"Successfully created action unnormalizer with shape {action_feature_data['shape']}")
+
+                    # Test unnormalization with a dummy input to verify it's working
+                    dummy_action = torch.tensor(
+                        [[0.0, 0.0]], device=self.device)
+                    try:
+                        dummy_result = unnormalize_fn({"action": dummy_action})
+                        if isinstance(dummy_result, dict) and torch.allclose(dummy_result["action"], dummy_action):
+                            print(
+                                "WARNING: Test unnormalization didn't change values!")
+                        else:
+                            print("Test unnormalization successful!")
+                    except Exception as test_e:
+                        print(
+                            f"Warning: Test unnormalization failed: {test_e}")
+
+                elif hasattr(self.config, 'action_feature'):
+                    # Alternatively use action_feature from the config if available
+                    unnormalize_fn = Unnormalize(
+                        {"action": self.config.action_feature},
+                        self.config.normalization_mapping,
+                        processed_stats
+                    )
+                    print("Created action unnormalizer from config.action_feature")
         except Exception as e:
             print(f"Error creating action unnormalizer: {e}")
+            print("Using identity function for action unnormalization")
 
         return normalize_fn, unnormalize_fn
 
@@ -233,8 +276,14 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             if k == "observation.image" and v is not None:
                 # Handle image format conversions
                 if v.ndim == 4:  # [B, H, W, C]
+                    # Convert uint8 to float32 and normalize to [0,1] range first
+                    if v.dtype == torch.uint8:
+                        v = v.float() / 255.0
                     processed_obs[k] = v.permute(0, 3, 1, 2)  # -> [B, C, H, W]
                 elif v.ndim == 3:  # [H, W, C]
+                    # Convert uint8 to float32 and normalize to [0,1] range first
+                    if v.dtype == torch.uint8:
+                        v = v.float() / 255.0
                     processed_obs[k] = v.permute(
                         2, 0, 1).unsqueeze(0)  # -> [1, C, H, W]
                 else:
@@ -278,12 +327,17 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         """Get the next normalized action from the queue and unnormalize it."""
         next_action = self._action_execution_queue.popleft()
         print(f"Action shape before unsqueeze: {next_action.shape}")
+
         # Handle different shapes - ensure it's a batch
         if len(next_action.shape) == 1:
             next_action = next_action.unsqueeze(0)
         print(f"Action shape after unsqueeze: {next_action.shape}")
 
-        # Try to unnormalize the action
+        # Store original action for comparison
+        orig_action = next_action.clone()
+        print(f"Original action values: {orig_action}")
+
+        # Try to unnormalize the action with the standard unnormalizer
         try:
             # Make sure we're passing a properly formatted dictionary to unnormalize_action_output
             action_dict = {"action": next_action}
@@ -291,17 +345,87 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
             # Check if the result is a dictionary or tensor
             if isinstance(unnorm_action, dict) and "action" in unnorm_action:
+                unnorm_action_tensor = unnorm_action["action"]
                 print(
-                    f"Unnormalized action successfully with keys: {unnorm_action.keys()}")
-                return unnorm_action["action"]
+                    f"Unnormalized action from standard unnormalizer: {unnorm_action_tensor}")
+            else:
+                unnorm_action_tensor = unnorm_action
+                print(f"Unnormalizer returned type: {type(unnorm_action)}")
+
+            # Check if unnormalization actually changed the values
+            if torch.allclose(orig_action, unnorm_action_tensor):
+                print(
+                    "WARNING: Standard unnormalization didn't change values! Using custom unnormalizer...")
+                # Use our custom unnormalizer implementation
+                unnorm_action_tensor = self.custom_action_unnormalize(
+                    next_action)
+
+                # If that also didn't work, log a critical error
+                if torch.allclose(orig_action, unnorm_action_tensor):
+                    print(
+                        "CRITICAL ERROR: Both standard and custom unnormalizers failed to change values!")
+                else:
+                    print("Custom unnormalizer successfully applied!")
+
+            # Return the unnormalized action
+            print(f"Final unnormalized action: {unnorm_action_tensor}")
+            return unnorm_action_tensor
+
+        except Exception as e:
+            print(f"Error using standard unnormalizer: {e}")
+            print("Attempting custom unnormalizer as fallback...")
+
+            # Try our custom unnormalizer as fallback
+            custom_unnorm_action = self.custom_action_unnormalize(next_action)
+
+            # If custom unnormalizer changed the values, use that
+            if not torch.allclose(orig_action, custom_unnorm_action):
+                print("Custom unnormalizer worked as a fallback!")
+                return custom_unnorm_action
             else:
                 print(
-                    f"Unnormalized action returned type: {type(unnorm_action)}")
-                return unnorm_action
+                    "CRITICAL ERROR: Both unnormalizers failed. Actions will not be properly unnormalized!")
+                return next_action
+
+    def custom_action_unnormalize(self, normalized_action):
+        """Custom method to unnormalize actions when the standard unnormalizer fails.
+
+        Args:
+            normalized_action: Tensor of shape [B, action_dim] containing normalized actions
+
+        Returns:
+            Unnormalized action tensor of the same shape
+        """
+        try:
+            # Try to get stats directly from the processed stats we saved
+            if hasattr(self.config, 'dataset_stats') and 'action' in self.config.dataset_stats:
+                action_stats = self.config.dataset_stats['action']
+
+                if 'mean' in action_stats and 'std' in action_stats:
+                    # Get the mean and std
+                    mean = action_stats['mean'].to(normalized_action.device)
+                    std = action_stats['std'].to(normalized_action.device)
+
+                    # Standard unnormalization formula: unnormalized = normalized * std + mean
+                    unnormalized_action = normalized_action * std + mean
+
+                    print("Custom unnormalization applied:")
+                    print(f"  - Input shape: {normalized_action.shape}")
+                    print(f"  - Mean shape: {mean.shape}, values: {mean}")
+                    print(f"  - Std shape: {std.shape}, values: {std}")
+                    print(f"  - Before unnorm: {normalized_action}")
+                    print(f"  - After unnorm: {unnormalized_action}")
+
+                    return unnormalized_action
+                else:
+                    print("Custom unnormalizer: Mean or std not found in action stats")
+            else:
+                print("Custom unnormalizer: No dataset stats available for action")
         except Exception as e:
-            print(f"Error unnormalizing action: {e}")
-            # Return the action as-is in case of error
-            return next_action
+            print(f"Error in custom unnormalizer: {e}")
+
+        # Return original action if unnormalization fails
+        return normalized_action
 
     def _generate_state_plan(self, model_input_batch):
         """Generate refined state plan using bidirectional transformer and diffusion.
@@ -372,28 +496,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                     [initial_clean_plan, padding], dim=1)
             else:
                 initial_clean_plan_for_diffusion = initial_clean_plan
-
-            # Normalize the plan before passing to diffusion model
-            # The bidirectional transformer outputs may not be properly normalized for the diffusion model
-            if hasattr(self.state_diffusion_model, 'normalize_targets'):
-                # First reshape to match expected input format for normalizer
-                batch_size, seq_len, state_dim = initial_clean_plan_for_diffusion.shape
-                reshaped_plan = initial_clean_plan_for_diffusion.view(
-                    -1, state_dim)
-
-                # Create a batch dictionary with the proper target key
-                target_key = self.state_diffusion_model.config.diffusion_target_key
-                plan_batch = {target_key: reshaped_plan}
-
-                # Normalize
-                normalized_batch = self.state_diffusion_model.normalize_targets(
-                    plan_batch)
-
-                # Reshape back to original dimensions
-                initial_clean_plan_for_diffusion = normalized_batch[target_key].view(
-                    batch_size, seq_len, state_dim)
-                print(f"Normalized initial plan. Original range: [{initial_clean_plan.min():.4f}, {initial_clean_plan.max():.4f}], "
-                      f"Normalized range: [{initial_clean_plan_for_diffusion.min():.4f}, {initial_clean_plan_for_diffusion.max():.4f}]")
 
             self.cl_diffphycon_latent_z_prev = initial_clean_plan_for_diffusion
 
