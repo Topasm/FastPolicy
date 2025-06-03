@@ -29,9 +29,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         bidirectional_transformer: BidirectionalARTransformer,
         state_diffusion_model: CLDiffPhyConModel,
         inverse_dynamics_model: MlpInvDynamic,
-        dataset_stats: dict,
         all_dataset_features: Dict[str, any],
-        n_obs_steps: int
+        n_obs_steps: int,
+        input_features: Dict[str, FeatureType] = None,
+        norm_mapping: Dict[str, NormalizationMode] = None,
+        dataset_stats: Dict[str, any] = None,
     ):
         super().__init__()
         # Store the transformer - now there's only one version with integrated normalization
@@ -48,12 +50,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Store previous step's noisy latent sequence
         self.cl_diffphycon_latent_z_prev = None
 
-        # Process dataset stats for normalization
-        processed_stats = self._process_dataset_stats(dataset_stats)
-
-        # Create normalizers
-        self.normalize_inputs, self.unnormalize_action_output = self._create_normalizers(
-            all_dataset_features, processed_stats)
+        self.normalize_inputs = Normalize(
+            input_features, norm_mapping, dataset_stats)
 
         # Initialize queues
         self.n_obs_steps = n_obs_steps
@@ -98,163 +96,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         return processed_stats
 
-    def _create_normalizers(self, all_features, processed_stats):
-        """Create input normalizer and action unnormalizer."""
-        # Default no-op normalizers
-        def normalize_fn(x): return x
-        def unnormalize_fn(x): return x.get(
-            "action", x) if isinstance(x, dict) else x
-
-        if not hasattr(self.config, 'input_features') or not hasattr(self.config, 'normalization_mapping'):
-            print("Warning: Missing required config attributes for normalization.")
-            return normalize_fn, unnormalize_fn
-
-        # Create normalizer for inputs
-        try:
-            # Prepare input features for normalizer
-            valid_input_features = {}
-            for k, v_feat in self.config.input_features.items():
-                if isinstance(v_feat, dict) and 'type' in v_feat and 'shape' in v_feat:
-                    try:
-                        valid_input_features[k] = PolicyFeature(
-                            type=FeatureType(v_feat['type']),
-                            shape=tuple(v_feat['shape']))
-                    except Exception as e:
-                        print(f"Warning: Could not convert feature {k}: {e}")
-                elif hasattr(v_feat, 'type') and hasattr(v_feat, 'shape'):
-                    valid_input_features[k] = v_feat
-
-            normalize_fn = Normalize(
-                valid_input_features,
-                self.config.normalization_mapping,
-                processed_stats
-            )
-        except Exception as e:
-            print(f"Error creating input normalizer: {e}")
-
-        # Create unnormalizer for actions
-        try:
-            action_feature_data = all_features.get("action")
-
-            # Check that we have the expected normalization mode for actions (should be MIN_MAX)
-            if hasattr(self.config, 'normalization_mapping') and 'ACTION' in self.config.normalization_mapping:
-                action_norm_mode = self.config.normalization_mapping['ACTION']
-                print(f"Using {action_norm_mode} normalization for actions")
-                # For MIN_MAX normalization we need min/max in stats
-                if action_norm_mode == NormalizationMode.MIN_MAX and "action" in processed_stats:
-                    has_min = "min" in processed_stats["action"]
-                    has_max = "max" in processed_stats["action"]
-                    print(f"Action stats has min: {has_min}, max: {has_max}")
-
-                    if has_min and has_max:
-                        min_val = processed_stats["action"]["min"]
-                        max_val = processed_stats["action"]["max"]
-                        print(f"Action min value: {min_val}")
-                        print(f"Action max value: {max_val}")
-
-                        # Store stats for later use
-                        self.stats = processed_stats
-
-                        # Log the available action normalization stats
-                        if "action" in processed_stats:
-                            print("Action normalization stats available:")
-                            for stat_key in processed_stats['action'].keys():
-                                print(f"  - {stat_key}")
-                        else:
-                            print("WARNING: No 'action' key in processed_stats!")
-
-            # If action_feature_data is None, try to create it from stats or config
-            if action_feature_data is None:
-                print(
-                    "WARNING: No action feature data provided, attempting to create from stats")
-
-                action_shape = None
-                # First try to get action shape from stats
-                if "action" in processed_stats and "min" in processed_stats["action"]:
-                    action_shape = tuple(
-                        processed_stats["action"]["min"].shape)
-                    print(f"Inferring action shape from stats: {action_shape}")
-                # Next try to get from config
-                elif hasattr(self.config, "action_feature") and hasattr(self.config.action_feature, "shape"):
-                    action_shape = self.config.action_feature.shape
-                    print(
-                        f"Using action shape from config.action_feature: {action_shape}")
-
-                if action_shape:
-                    # Create action feature data from the shape
-                    action_feature_data = {
-                        'type': FeatureType.ACTION.value,
-                        'shape': list(action_shape)
-                    }
-                    print(
-                        f"Created action_feature_data with shape {action_shape}")
-
-            if action_feature_data:
-                if isinstance(action_feature_data, dict) and 'type' in action_feature_data and 'shape' in action_feature_data:
-                    # Create a PolicyFeature object from the action feature data
-                    action_feature = PolicyFeature(
-                        type=FeatureType(action_feature_data['type']),
-                        shape=tuple(action_feature_data['shape'])
-                    )
-                    # Create the unnormalizer specifically for the action
-                    # Make sure we're using the correct action feature type to match normalization_mapping
-                    unnormalize_fn = Unnormalize(
-                        {"action": action_feature},
-                        self.config.normalization_mapping,
-                        processed_stats
-                    )
-                    print(
-                        f"Successfully created action unnormalizer with shape {action_feature_data['shape']}")
-
-                    # Validate the unnormalizer with a simple test
-                    try:
-                        test_action = torch.zeros(
-                            (1, *action_feature.shape), device=self.device)
-                        test_result = unnormalize_fn({"action": test_action})
-                        if "action" in test_result:
-                            test_output = test_result["action"]
-                            print(
-                                f"Unnormalizer test - input: {test_action[0]}, output: {test_output[0]}")
-                            if torch.allclose(test_action, test_output):
-                                print(
-                                    "WARNING: Test unnormalization didn't change values!")
-                            else:
-                                print("Unnormalizer is working correctly in test.")
-                    except Exception as test_err:
-                        print(f"Error testing unnormalizer: {test_err}")
-
-                elif hasattr(self.config, 'action_feature'):
-                    # Alternatively use action_feature from the config if available
-                    action_feature = self.config.action_feature
-                    unnormalize_fn = Unnormalize(
-                        {"action": action_feature},
-                        self.config.normalization_mapping,
-                        processed_stats
-                    )
-                    print("Created action unnormalizer from config.action_feature")
-
-                    # Validate the unnormalizer with a simple test
-                    try:
-                        test_action = torch.zeros(
-                            (1, *action_feature.shape), device=self.device)
-                        test_result = unnormalize_fn({"action": test_action})
-                        if "action" in test_result:
-                            test_output = test_result["action"]
-                            print(
-                                f"Unnormalizer test - input: {test_action[0]}, output: {test_output[0]}")
-                            if torch.allclose(test_action, test_output):
-                                print(
-                                    "WARNING: Test unnormalization didn't change values!")
-                            else:
-                                print("Unnormalizer is working correctly in test.")
-                    except Exception as test_err:
-                        print(f"Error testing unnormalizer: {test_err}")
-        except Exception as e:
-            print(f"Error creating action unnormalizer: {e}")
-            print("Using identity function for action unnormalization")
-
-        return normalize_fn, unnormalize_fn
-
     def reset(self):
         """Reset observation history queues. Should be called on env.reset()"""
         print("Resetting BidirectionalRTDiffusionPolicy queues")
@@ -272,7 +113,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # Process and normalize observation
         processed_obs = self._preprocess_observation(raw_obs)
-        normalized_obs = self._normalize_observation(processed_obs)
+        normalized_obs = self.normalize_inputs(processed_obs)
 
         self._queues = populate_queues(
             self._queues, normalized_obs)
@@ -365,12 +206,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
     def _get_next_action(self):
         """Get the next normalized action from the queue and unnormalize it."""
         next_action = self._action_execution_queue.popleft()
-        print(f"Action shape before unsqueeze: {next_action.shape}")
 
         # Handle different shapes - ensure it's a batch
         if len(next_action.shape) == 1:
             next_action = next_action.unsqueeze(0)
-        print(f"Action shape after unsqueeze: {next_action.shape}")
 
         # Log the normalized action values
         print(f"Normalized action values: {next_action}")

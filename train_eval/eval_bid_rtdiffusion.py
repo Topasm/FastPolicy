@@ -101,6 +101,11 @@ def main():
     # Convert raw feature dictionaries to PolicyFeature objects
     policy_features = dataset_to_policy_features(metadata.features)
 
+    input_features = {
+        "observation.state": policy_features["observation.state"],
+        "observation.image": policy_features["observation.image"]
+    }
+
     output_features = {
         "action": policy_features["action"]
     }
@@ -197,9 +202,11 @@ def main():
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,
         inverse_dynamics_model=inv_dyn_model,
-        dataset_stats=metadata.stats,  # Pass raw metadata.stats
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
-        n_obs_steps=state_diff_cfg.n_obs_steps
+        n_obs_steps=state_diff_cfg.n_obs_steps,
+        input_features=input_features,
+        norm_mapping=bidir_cfg.normalization_mapping,
+        dataset_stats=processed_dataset_stats,
     )
 
     # --- Environment Setup ---
