@@ -42,7 +42,7 @@ def main():
 
     # Training hyperparameters
     training_steps = 20000  # Reduced for testing WandB integration
-    batch_size = 32
+    batch_size = 128
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
     save_freq = 500  # More frequent saving for testing
