@@ -41,7 +41,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 20000  # Reduced for testing WandB integration
+    training_steps = 10000  # Reduced for testing WandB integration
     batch_size = 128
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
@@ -101,7 +101,7 @@ def main():
         lerobot_dataset=lerobot_dataset,
         forward_steps=16,
         backward_steps=16,
-        min_episode_length=50,  # Ensure episodes are long enough for sampling
+        min_episode_length=16,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
         state_key="observation.state"
 
@@ -132,6 +132,14 @@ def main():
         backward_steps=16,
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features,  # Pass the actual FeatureSpec objects
+        # Enable diffusion encoder
+        use_diffusion_encoder=True,
+        vision_backbone="resnet18",
+        pretrained_backbone_weights="IMAGENET1K_V1",
+        spatial_softmax_num_keypoints=32,
+        use_group_norm=False,
+        crop_shape=None,
+        crop_is_random=False,
     )
     print(f"Dataset size: {len(dataset)}")
     print(f"Batches per iteration: {len(dataloader)}")

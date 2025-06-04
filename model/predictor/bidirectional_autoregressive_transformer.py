@@ -20,6 +20,10 @@ from typing import Optional, Dict, Any, Union
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
 
+# Import diffusion modules for the RGB encoder
+from model.diffusion.diffusion_modules import DiffusionRgbEncoder, SpatialSoftmax
+from model.diffusion.configuration_mymodel import DiffusionConfig
+
 # Removed normalize imports as we handle normalization outside the model
 
 
@@ -40,6 +44,16 @@ class BidirectionalARTransformerConfig:
     backward_steps: int = 16
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
+
+    # Diffusion RGB encoder configuration
+    use_diffusion_encoder: bool = True  # Whether to use DiffusionRgbEncoder
+    vision_backbone: str = "resnet18"   # Vision backbone for DiffusionRgbEncoder
+    pretrained_backbone_weights: str = "IMAGENET1K_V1"  # Pretrained weights
+    # Number of keypoints for spatial softmax
+    spatial_softmax_num_keypoints: int = 32
+    use_group_norm: bool = False        # Whether to use group norm in backbone
+    crop_shape: Optional[tuple] = None  # Optional crop shape
+    crop_is_random: bool = False        # Whether to use random crop
 
     def to_dict(self):
         def feature_to_dict(feat):
@@ -80,6 +94,57 @@ class BidirectionalARTransformerConfig:
             "ACTION": NormalizationMode.MIN_MAX
         }
     )
+
+
+class DiffusionImageEncoder(nn.Module):
+    """Adapter for DiffusionRgbEncoder to work with BidirectionalARTransformer."""
+
+    def __init__(self, config: BidirectionalARTransformerConfig):
+        super().__init__()
+        self.config = config
+
+        # Create a DiffusionConfig with all required parameters
+        # We'll use a minimal config that only contains what DiffusionRgbEncoder needs
+        diffusion_config = DiffusionConfig(
+            input_features=config.input_features,
+            output_features=config.output_features,
+            vision_backbone=config.vision_backbone,
+            pretrained_backbone_weights=config.pretrained_backbone_weights,
+            spatial_softmax_num_keypoints=config.spatial_softmax_num_keypoints,
+            use_group_norm=config.use_group_norm,
+            crop_shape=config.crop_shape,
+            crop_is_random=config.crop_is_random,
+            transformer_dim=config.hidden_dim,  # Use hidden_dim as transformer_dim
+        )
+
+        # Create the DiffusionRgbEncoder
+        self.diffusion_encoder = DiffusionRgbEncoder(diffusion_config)
+
+        # Add a projection layer to map from transformer_dim to image_latent_dim
+        self.projection = nn.Linear(config.hidden_dim, config.image_latent_dim)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Encode images to latent representations.
+
+        Args:
+            images: [B, C, H, W] images (expected to be in [0, 1] range)
+
+        Returns:
+            latents: [B, image_latent_dim] latent representations
+        """
+        # DiffusionRgbEncoder expects images in [0, 1] range
+        # If images are in [-1, 1] range, convert them
+        if images.min() < 0:
+            images = (images + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
+
+        # Get features from DiffusionRgbEncoder (output is [B, transformer_dim])
+        features = self.diffusion_encoder(images)
+
+        # Project to image_latent_dim
+        latents = self.projection(features)
+
+        return latents
 
 
 class ImageEncoder(nn.Module):
@@ -230,7 +295,10 @@ class BidirectionalARTransformer(nn.Module):
         self.normalization_mode = NormalizationMode
 
         # Image encoder and decoder
-        self.image_encoder = ImageEncoder(config)
+        if config.use_diffusion_encoder:
+            self.image_encoder = DiffusionImageEncoder(config)
+        else:
+            self.image_encoder = ImageEncoder(config)
         self.image_decoder = ImageDecoder(config)
 
         # State and image latent projections to hidden dimension

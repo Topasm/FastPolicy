@@ -310,28 +310,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             print(f"Error during normalization: {e}")
             return processed_obs  # Fallback to unnormalized
 
-    # def _update_queues(self, norm_state, norm_img, normalized_obs):
-    #     """Update observation history queues."""
-    #     # Add state to queue
-    #     self._obs_state_queue.append(norm_state.unsqueeze(1))
-
-    #     # Add image to queue if available
-    #     if self.config.image_features and norm_img is not None:
-    #         # Stack multiple cameras if needed
-    #         image_tensors = []
-    #         for img_key in self.config.image_features:
-    #             if img_key in normalized_obs:
-    #                 img_tensor = normalized_obs[img_key]
-    #                 if img_tensor.ndim == 3:
-    #                     img_tensor = img_tensor.unsqueeze(0)
-    #                 image_tensors.append(img_tensor)
-
-    #         if image_tensors:
-    #             stacked_cameras = torch.stack(
-    #                 image_tensors, dim=1)  # [B, N_cam, C, H, W]
-    #             self._obs_image_queue.append(
-    #                 stacked_cameras.unsqueeze(1))  # [B, 1, N_cam, C, H, W]
-
     def _get_next_action(self):
         """Get the next normalized action from the queue and unnormalize it."""
         next_action = self._action_execution_queue.popleft()
