@@ -84,10 +84,59 @@ class BidirectionalARTransformerConfig:
 
     @classmethod
     def from_pretrained(cls, output_dir: Path):
-        with open(Path(output_dir) / "config.json", "r") as f:
-            config_dict = json.load(f)
-        return cls(**config_dict)
+        from lerobot.common.datasets.utils import PolicyFeature  # PolicyFeature 클래스 임포트
+        from lerobot.configs.types import FeatureType           # FeatureType enum 임포트
 
+        config_path = Path(output_dir) / "config.json"
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+
+        # input_features를 PolicyFeature 객체로 복원
+        if "input_features" in config_dict and isinstance(config_dict["input_features"], dict):
+            reconstructed_input_features = {}
+            for k, v_dict in config_dict["input_features"].items():
+                if isinstance(v_dict, dict) and "shape" in v_dict and "type" in v_dict:
+                    try:
+                        feature_type_str = v_dict["type"]
+                        actual_type_name = feature_type_str.split(
+                            '.')[-1] if '.' in feature_type_str else feature_type_str
+                        feature_type_val = FeatureType[actual_type_name]
+
+                        reconstructed_input_features[k] = PolicyFeature(
+                            shape=tuple(v_dict["shape"]),
+                            type=feature_type_val
+                        )
+                    except Exception as e:
+                        print(
+                            f"Warning: Could not reconstruct PolicyFeature for input_features key {k} from dict {v_dict}: {e}. Keeping as dict.")
+                        reconstructed_input_features[k] = v_dict
+                else:
+                    reconstructed_input_features[k] = v_dict
+            config_dict["input_features"] = reconstructed_input_features
+
+        # output_features도 필요한 경우 동일한 방식으로 복원
+        if "output_features" in config_dict and isinstance(config_dict["output_features"], dict):
+            reconstructed_output_features = {}
+            for k, v_dict in config_dict["output_features"].items():
+                if isinstance(v_dict, dict) and "shape" in v_dict and "type" in v_dict:
+                    try:
+                        feature_type_str = v_dict["type"]
+                        actual_type_name = feature_type_str.split(
+                            '.')[-1] if '.' in feature_type_str else feature_type_str
+                        feature_type_val = FeatureType[actual_type_name]
+                        reconstructed_output_features[k] = PolicyFeature(
+                            shape=tuple(v_dict["shape"]),
+                            type=feature_type_val
+                        )
+                    except Exception as e:
+                        print(
+                            f"Warning: Could not reconstruct PolicyFeature for output_features key {k} from dict {v_dict}: {e}. Keeping as dict.")
+                        reconstructed_output_features[k] = v_dict
+                else:
+                    reconstructed_output_features[k] = v_dict
+            config_dict["output_features"] = reconstructed_output_features
+
+        return cls(**config_dict)
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -207,10 +256,28 @@ class BidirectionalARTransformer(nn.Module):
         from lerobot.configs.types import FeatureType
         self.feature_type = FeatureType  # For potential use, not directly used now
 
+        # config.use_diffusion_encoder 값에 따라 image_encoder 결정
         if config.use_diffusion_encoder:
-            self.image_encoder = DiffusionImageEncoder(config)
+            try:
+                print("Attempting to initialize DiffusionImageEncoder...")
+                self.image_encoder = DiffusionImageEncoder(config)
+                if not getattr(self.image_encoder, 'use_valid_encoder', False):
+                    print(
+                        "Warning: DiffusionImageEncoder indicated it's not valid. Forcing fallback to simple ImageEncoder in BDAT __init__.")
+                    raise ValueError(
+                        "DiffusionImageEncoder internal fallback or failure during its __init__.")
+                print(
+                    "Successfully initialized DiffusionImageEncoder in BidirectionalARTransformer.")
+            except Exception as e:
+                print(
+                    f"Failed to initialize DiffusionImageEncoder in BidirectionalARTransformer __init__: {e}")
+                print(
+                    "Falling back to simple ImageEncoder in BidirectionalARTransformer __init__.")
+                self.image_encoder = ImageEncoder(config)
         else:
+            print("config.use_diffusion_encoder is False. Using simple ImageEncoder in BidirectionalARTransformer.")
             self.image_encoder = ImageEncoder(config)
+
         self.image_decoder = ImageDecoder(config)
 
         self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)

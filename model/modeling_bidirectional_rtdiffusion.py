@@ -201,10 +201,26 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
     def reset(self):
         """Reset observation history queues. Should be called on env.reset()"""
         print("Resetting BidirectionalRTDiffusionPolicy queues")
-        self._obs_image_queue = deque(maxlen=self.n_obs_steps)
-        self._obs_state_queue = deque(maxlen=self.n_obs_steps)
-        self._action_execution_queue = deque()
-        self.cl_diffphycon_latent_z_prev = None
+
+        # __init__에서 사용하는 self.n_obs_steps와 self.config를 일관되게 사용
+        # self.n_obs_steps는 __init__에서 인자로 받아 설정됨
+        # self.config는 state_diffusion_model.config에서 옴
+        obs_queue_len = self.n_obs_steps
+        action_queue_len = self.config.n_action_steps  # DiffusionConfig의 n_action_steps
+
+        self._queues = {
+            "observation.state": deque(maxlen=obs_queue_len),
+            "action": deque(maxlen=action_queue_len),  # 이 큐의 역할 재고 필요 (아래 참조)
+        }
+        # self.config는 DiffusionConfig이므로 image_features 존재 여부 확인 방식 변경 가능
+        if hasattr(self.config, 'image_features') and self.config.image_features:
+            self._queues["observation.image"] = deque(maxlen=obs_queue_len)
+        if hasattr(self.config, 'env_state_feature') and self.config.env_state_feature:
+            self._queues["observation.environment_state"] = deque(
+                maxlen=obs_queue_len)
+
+        self._action_execution_queue = deque()  # 이것은 액션 실행용 큐
+        self.cl_diffphycon_latent_z_prev = None  # 관련 있다면 리셋
 
     @torch.no_grad()
     def select_action(self, current_raw_observation: Dict[str, Tensor]) -> Tensor:

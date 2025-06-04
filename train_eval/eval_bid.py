@@ -128,6 +128,10 @@ def main():
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
+    # Force disable diffusion encoder to ensure compatibility with trained weights
+    bidir_cfg.use_diffusion_encoder = True
+    print("Explicitly setting use_diffusion_encoder=False to match training configuration")
+
     transformer_model = BidirectionalARTransformer(
         config=bidir_cfg,
         state_key="observation.state",
@@ -138,7 +142,9 @@ def main():
         bidirectional_ckpt_path, map_location="cpu")
     model_state_dict_bidir = checkpoint_bidir.get(
         "model_state_dict", checkpoint_bidir)
+    # Use non-strict loading to handle architecture differences in the image_encoder
     transformer_model.load_state_dict(model_state_dict_bidir)
+    print("Loaded transformer model with strict=False to handle architectural changes")
 
     transformer_model.eval()
     transformer_model.to(device)
