@@ -41,11 +41,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 10000  # Reduced for testing WandB integration
+    training_steps = 1000  # Reduced for testing WandB integration
     batch_size = 128
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
     save_freq = 500  # More frequent saving for testing
+    n_obs_steps = 3  # Number of observation steps for temporal encoding
 
     # Initialize Weights & Biases
     run_name = f"bidirectional_transformer_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -59,6 +60,7 @@ def main():
             "learning_rate": learning_rate,
             "forward_steps": 16,
             "backward_steps": 16,
+            "n_obs_steps": n_obs_steps,
         }
     )
 
@@ -103,8 +105,8 @@ def main():
         backward_steps=16,
         min_episode_length=16,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
-        state_key="observation.state"
-
+        state_key="observation.state",
+        n_obs_steps=n_obs_steps  # Enable temporal encoding
     )
 
     dataloader = DataLoader(
@@ -130,6 +132,7 @@ def main():
         image_latent_dim=256,
         forward_steps=16,
         backward_steps=16,
+        n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features,  # Pass the actual FeatureSpec objects
         # Enable diffusion encoder

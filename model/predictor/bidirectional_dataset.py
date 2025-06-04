@@ -10,8 +10,7 @@ This dataset prepares training data in the format required by the bidirectional 
 """
 
 import torch
-import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict
 from torch.utils.data import Dataset
 
 
@@ -26,6 +25,7 @@ class BidirectionalTrajectoryDataset(Dataset):
         normalizer=None,  # Kept for interface, but normalization handled externally
         forward_steps: int = 16,
         backward_steps: int = 16,
+        n_obs_steps: int = 1,  # Number of observation steps for temporal history
         min_episode_length: int = 50,
         image_key: str = "observation.image",
         state_key: str = "observation.state"
@@ -38,6 +38,7 @@ class BidirectionalTrajectoryDataset(Dataset):
             normalizer: Optional normalizer (not used internally by this class anymore)
             forward_steps: Number of forward trajectory steps for the forward segment
             backward_steps: Number of backward trajectory steps from the episode's true end
+            n_obs_steps: Number of observation steps for temporal history (1 = single step, >1 = temporal sequence)
             min_episode_length: Minimum episode length to consider
             image_key: Key for image observations
             state_key: Key for state observations
@@ -46,6 +47,7 @@ class BidirectionalTrajectoryDataset(Dataset):
         self.normalizer = normalizer  # Not used internally for transformation
         self.forward_steps = forward_steps
         self.backward_steps = backward_steps
+        self.n_obs_steps = n_obs_steps
         self.min_episode_length = min_episode_length
         self.image_key = image_key
         self.state_key = state_key
@@ -74,18 +76,22 @@ class BidirectionalTrajectoryDataset(Dataset):
                     continue
 
                 # Max start index for the forward segment ensures the forward segment fits within the episode
+                # For temporal support: we need n_obs_steps observations before the forward segment start
+                # So the earliest valid start is at offset (n_obs_steps - 1) from episode start
                 # A forward segment of length `forward_steps` requires indices from `start` to `start + forward_steps - 1`.
                 # So, `start + forward_steps - 1` must be <= `to_idx`.
                 # `start` must be <= `to_idx - forward_steps + 1`.
-                # `start_offset` is relative to `from_idx`. So, `from_idx + start_offset <= to_idx - forward_steps + 1`.
-                # `start_offset <= to_idx - from_idx - forward_steps + 1` which is `episode_length - forward_steps`.
+                # Additionally, for temporal history: `start - (n_obs_steps - 1)` must be >= `from_idx`
+                # So `start` must be >= `from_idx + (n_obs_steps - 1)`
+                # Minimum offset to ensure temporal history
+                min_start_offset = self.n_obs_steps - 1
                 max_start_offset = episode_length - self.forward_steps
-                if max_start_offset < 0:  # Should not happen if min_episode_length >= forward_steps
+                if max_start_offset < min_start_offset:  # Episode too short for temporal + forward
                     continue
 
-                # Overlap samples for the forward part
+                # Overlap samples for the forward part, considering temporal history
                 # The step for start_offset can be adjusted, e.g., self.forward_steps // 2 for 50% overlap
-                for start_offset in range(0, max_start_offset + 1, self.forward_steps // 2 if self.forward_steps > 1 else 1):
+                for start_offset in range(min_start_offset, max_start_offset + 1, self.forward_steps // 2 if self.forward_steps > 1 else 1):
                     current_start_idx = from_idx + start_offset
                     # forward_segment_end_idx is not strictly needed in sample_info anymore
                     # as forward_states are just taken for self.forward_steps from current_start_idx
@@ -126,11 +132,12 @@ class BidirectionalTrajectoryDataset(Dataset):
                 if episode_length < self.min_episode_length:
                     continue
 
+                min_start_offset = self.n_obs_steps - 1  # Minimum offset for temporal history
                 max_start_offset = episode_length - self.forward_steps
-                if max_start_offset < 0:
+                if max_start_offset < min_start_offset:
                     continue
 
-                for start_offset in range(0, max_start_offset + 1, self.forward_steps // 2 if self.forward_steps > 1 else 1):
+                for start_offset in range(min_start_offset, max_start_offset + 1, self.forward_steps // 2 if self.forward_steps > 1 else 1):
                     current_start_idx = from_idx + start_offset
                     sample = {
                         'episode_idx': ep_idx,  # Using the grouped episode index
@@ -148,11 +155,40 @@ class BidirectionalTrajectoryDataset(Dataset):
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         sample_info = self.samples[idx]
 
-        # --- Initial image and state (start of the forward segment) ---
-        initial_data_idx = sample_info['start_idx_forward_segment']
-        initial_data = self.lerobot_dataset[initial_data_idx]
-        initial_image = initial_data[self.image_key]
-        initial_state = initial_data[self.state_key]
+        # --- Initial image(s) and state(s) (temporal sequence ending at start of forward segment) ---
+        if self.n_obs_steps > 1:
+            # Temporal sequence: collect n_obs_steps observations ending at start_idx_forward_segment
+            initial_images = []
+            initial_states = []
+
+            for i in range(self.n_obs_steps):
+                # Work backwards from start_idx_forward_segment
+                obs_idx = sample_info['start_idx_forward_segment'] - \
+                    (self.n_obs_steps - 1 - i)
+
+                # Bounds check - if we go before the episode start, repeat the first valid observation
+                if obs_idx < 0:
+                    obs_idx = 0
+                elif obs_idx >= len(self.lerobot_dataset):
+                    obs_idx = len(self.lerobot_dataset) - 1
+
+                obs_data = self.lerobot_dataset[obs_idx]
+                initial_images.append(obs_data[self.image_key])
+                initial_states.append(obs_data[self.state_key])
+
+            # Convert to tensors: [n_obs_steps, C, H, W] for images, [n_obs_steps, state_dim] for states
+            initial_images_tensor = torch.stack(
+                [torch.as_tensor(img, dtype=torch.float32) for img in initial_images])
+            initial_states_tensor = torch.stack(
+                [torch.as_tensor(state, dtype=torch.float32) for state in initial_states])
+        else:
+            # Single observation: backwards compatibility
+            initial_data_idx = sample_info['start_idx_forward_segment']
+            initial_data = self.lerobot_dataset[initial_data_idx]
+            initial_images_tensor = torch.as_tensor(
+                initial_data[self.image_key], dtype=torch.float32)
+            initial_states_tensor = torch.as_tensor(
+                initial_data[self.state_key], dtype=torch.float32)
 
         # --- Forward trajectory states (from start_idx_forward_segment for forward_steps) ---
         forward_states = []
@@ -163,7 +199,7 @@ class BidirectionalTrajectoryDataset(Dataset):
                 # This should not happen if _create_samples is correct, but safety check
                 print(
                     f"Warning: Forward step index {step_idx} is out of bounds. Using last valid state.")
-                state = forward_states[-1] if forward_states else initial_state
+                state = forward_states[-1] if forward_states else initial_states_tensor[-1] if self.n_obs_steps > 1 else initial_states_tensor
             else:
                 step_data = self.lerobot_dataset[step_idx]
                 state = step_data[self.state_key]
@@ -221,8 +257,8 @@ class BidirectionalTrajectoryDataset(Dataset):
 
         # Convert to tensors
         result = {
-            'initial_images': torch.as_tensor(initial_image, dtype=torch.float32),
-            'initial_states': torch.as_tensor(initial_state, dtype=torch.float32),
+            'initial_images': initial_images_tensor,
+            'initial_states': initial_states_tensor,
             'forward_states': torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in forward_states]),
             'goal_images': torch.as_tensor(goal_image, dtype=torch.float32),
             'backward_states': torch.stack([torch.as_tensor(s, dtype=torch.float32) for s in backward_states])

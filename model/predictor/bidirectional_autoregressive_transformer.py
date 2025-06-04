@@ -2,11 +2,14 @@
 """
 Bidirectional Autoregressive Transformer for image-conditioned trajectory generation.
 
-This model implements the following pipeline:
+This model implements the following pipeline with SOFT GOAL CONDITIONING:
 1. Input: initial image i_0 and state st_0
-2. Generate forward states: st_0 → st_1 → ... → st_15
-3. Generate goal image: i_n from st_15
-4. Generate backward states: st_n → st_n-1 → ... → st_n-15
+2. Generate goal image: i_n (first prediction - establishes goal)
+3. Generate backward states: st_n → st_n-1 → ... → st_n-15 (conditioned on goal)
+4. Generate forward states: st_0 → st_1 → ... → st_15 (conditioned on goal + backward path)
+
+The new prediction order (goal → backward → forward) enables soft conditioning on goal paths,
+where later predictions can attend to earlier ones in the sequence.
 
 The model is trained autoregressively with proper causal masking.
 """
@@ -16,12 +19,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json  # Added for config saving
 from dataclasses import dataclass, asdict, field  # Ensure dataclass is imported
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
 
 # Import diffusion modules for the RGB encoder
-from model.diffusion.diffusion_modules import DiffusionRgbEncoder, SpatialSoftmax
+from model.diffusion.diffusion_modules import DiffusionRgbEncoder
 from model.diffusion.configuration_mymodel import DiffusionConfig
 
 # Removed normalize imports as we handle normalization outside the model
@@ -42,6 +45,8 @@ class BidirectionalARTransformerConfig:
     image_latent_dim: int = 256       # Dimension of image latent representation
     forward_steps: int = 20
     backward_steps: int = 16
+    # Number of observation steps (history + current)
+    n_obs_steps: int = 2
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
 
@@ -263,16 +268,140 @@ class ImageDecoder(nn.Module):
         return self.decoder(x)
 
 
+class TemporalImageEncoder(nn.Module):
+    """Encodes temporal sequences of images into a single latent representation."""
+
+    def __init__(self, config: BidirectionalARTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.n_obs_steps = config.n_obs_steps
+
+        # Base image encoder (either DiffusionImageEncoder or ImageEncoder)
+        if config.use_diffusion_encoder:
+            self.base_image_encoder = DiffusionImageEncoder(config)
+        else:
+            self.base_image_encoder = ImageEncoder(config)
+
+        # Temporal fusion: combine multiple image latents into one
+        # Use a small transformer to fuse temporal information
+        self.temporal_fusion = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=config.image_latent_dim,
+                nhead=4,
+                dim_feedforward=config.image_latent_dim * 2,
+                dropout=config.dropout,
+                batch_first=True
+            ),
+            num_layers=2
+        )
+
+        # Position embeddings for temporal sequence
+        self.temporal_pos_embedding = nn.Embedding(
+            config.n_obs_steps, config.image_latent_dim)
+
+        # Final projection to ensure consistent output dimension
+        self.output_projection = nn.Linear(
+            config.image_latent_dim, config.image_latent_dim)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Encode temporal sequence of images.
+
+        Args:
+            images: [B, n_obs_steps, C, H, W] sequence of images
+
+        Returns:
+            latents: [B, image_latent_dim] fused temporal representation
+        """
+        batch_size, n_obs_steps, C, H, W = images.shape
+
+        # Encode each image individually
+        # Reshape to [B*n_obs_steps, C, H, W] for batch processing
+        images_flat = images.view(batch_size * n_obs_steps, C, H, W)
+        latents_flat = self.base_image_encoder(
+            images_flat)  # [B*n_obs_steps, image_latent_dim]
+
+        # Reshape back to [B, n_obs_steps, image_latent_dim]
+        latents = latents_flat.view(batch_size, n_obs_steps, -1)
+
+        # Add temporal position embeddings
+        positions = torch.arange(n_obs_steps, device=images.device)
+        pos_embeddings = self.temporal_pos_embedding(
+            positions)  # [n_obs_steps, image_latent_dim]
+        # Broadcast across batch
+        latents = latents + pos_embeddings.unsqueeze(0)
+
+        # Apply temporal transformer
+        # [B, n_obs_steps, image_latent_dim]
+        fused_latents = self.temporal_fusion(latents)
+
+        # Use the latest (most recent) representation as the output
+        output_latent = fused_latents[:, -1]  # [B, image_latent_dim]
+
+        # Apply final projection
+        return self.output_projection(output_latent)
+
+
+class TemporalStateEncoder(nn.Module):
+    """Encodes temporal sequences of states into a single representation."""
+
+    def __init__(self, config: BidirectionalARTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.n_obs_steps = config.n_obs_steps
+
+        # Temporal fusion for states
+        self.temporal_fusion = nn.LSTM(
+            input_size=config.state_dim,
+            hidden_size=config.state_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=config.dropout if config.n_obs_steps > 1 else 0
+        )
+
+        # Final projection to hidden dimension
+        self.output_projection = nn.Linear(config.state_dim, config.state_dim)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Encode temporal sequence of states.
+
+        Args:
+            states: [B, n_obs_steps, state_dim] sequence of states
+
+        Returns:
+            encoded_state: [B, state_dim] fused temporal representation
+        """
+        # Apply LSTM to capture temporal dependencies
+        lstm_out, (hidden, _) = self.temporal_fusion(
+            states)  # lstm_out: [B, n_obs_steps, state_dim]
+
+        # Use the final hidden state as the representation
+        final_state = lstm_out[:, -1]  # [B, state_dim] - take the last output
+
+        # Apply final projection
+        return self.output_projection(final_state)
+
+
 class BidirectionalARTransformer(nn.Module):
     """
-    Bidirectional Autoregressive Transformer for image-conditioned trajectory generation.
+    Bidirectional Autoregressive Transformer for image-conditioned trajectory generation with temporal history support.
 
-    Pipeline:
-    1. Encode initial image i_0 to latent representation
-    2. Combine with initial state st_0
-    3. Generate forward trajectory: st_0 → st_1 → ... → st_15 (autoregressive)
-    4. Generate goal image i_n from final state st_15
-    5. Generate backward trajectory: st_n → st_n-1 → ... → st_n-15 (autoregressive)
+    Pipeline with SOFT GOAL CONDITIONING:
+    1. Encode initial images i_{t-n+1:t} and states st_{t-n+1:t} (temporal history of n_obs_steps)
+    2. Fuse temporal information into single representations
+    3. Generate goal image i_n (first prediction - establishes goal)
+    4. Generate backward trajectory: st_n → st_n-1 → ... → st_n-15 (conditioned on goal)
+    5. Generate forward trajectory: st_0 → st_1 → ... → st_15 (conditioned on goal + backward path)
+
+    The new prediction order enables cascading soft conditioning where:
+    - Goal prediction is conditioned on temporal history of initial state/image
+    - Backward prediction is conditioned on temporal history + goal
+    - Forward prediction is conditioned on temporal history + goal + backward path
+
+    Temporal Support:
+    - When n_obs_steps > 1: Uses TemporalImageEncoder and TemporalStateEncoder to process sequences
+    - When n_obs_steps = 1: Falls back to single-step encoders for backwards compatibility
 
     Note: This transformer expects all inputs to be pre-normalized by calling code.
     Normalization should be handled externally before passing data to this model.
@@ -294,11 +423,18 @@ class BidirectionalARTransformer(nn.Module):
         self.feature_type = FeatureType
         self.normalization_mode = NormalizationMode
 
-        # Image encoder and decoder
-        if config.use_diffusion_encoder:
-            self.image_encoder = DiffusionImageEncoder(config)
+        # Image encoder and decoder with temporal support
+        if config.n_obs_steps > 1:
+            # Use temporal encoders when n_obs_steps > 1
+            self.image_encoder = TemporalImageEncoder(config)
+            self.state_encoder = TemporalStateEncoder(config)
         else:
-            self.image_encoder = ImageEncoder(config)
+            # Use single-step encoders when n_obs_steps = 1
+            if config.use_diffusion_encoder:
+                self.image_encoder = DiffusionImageEncoder(config)
+            else:
+                self.image_encoder = ImageEncoder(config)
+            self.state_encoder = None  # No separate state encoder for single step
         self.image_decoder = ImageDecoder(config)
 
         # State and image latent projections to hidden dimension
@@ -382,10 +518,14 @@ class BidirectionalARTransformer(nn.Module):
 
     def _create_query_based_mask(self, seq_len: int, device: torch.device, num_condition_tokens: int = 2) -> torch.Tensor:
         """
-        Create attention mask for query-based non-autoregressive generation.
+        Create attention mask for query-based non-autoregressive generation with soft conditioning.
 
-        In this mask, the query tokens can attend to the conditioning tokens (initial image and state)
-        but not to each other, creating a parallelizable inference pattern.
+        For the new prediction order (goal → backward → forward), we want:
+        - Goal query can attend to: conditioning tokens (initial image + state)
+        - Backward query can attend to: conditioning tokens + goal query
+        - Forward query can attend to: conditioning tokens + goal query + backward query
+
+        This creates a cascading soft conditioning effect.
 
         Args:
             seq_len: Total sequence length including condition and query tokens
@@ -395,7 +535,7 @@ class BidirectionalARTransformer(nn.Module):
         Returns:
             Attention mask of shape [seq_len, seq_len]
         """
-        # Start with a fully masked tensor
+        # Start with a fully masked tensor (True means masked/not allowed)
         mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
 
         # Allow all tokens to attend to the conditioning tokens (initial image, initial state)
@@ -404,6 +544,18 @@ class BidirectionalARTransformer(nn.Module):
         # Allow regular attention pattern for conditioning tokens (can attend to previous tokens)
         for i in range(num_condition_tokens):
             mask[i, i+1:] = True  # Can't attend to future tokens
+
+        # For the new query sequence: [cond0, cond1, goal_query, backward_query, forward_query]
+        if seq_len == 5:  # Standard case with 2 condition tokens + 3 query tokens
+            # Goal query (position 2) can attend to: conditioning tokens (positions 0, 1)
+            # Already handled above
+
+            # Backward query (position 3) can attend to: conditioning tokens + goal query
+            mask[3, 2] = False  # Can attend to goal query
+
+            # Forward query (position 4) can attend to: conditioning tokens + goal query + backward query
+            mask[4, 2] = False  # Can attend to goal query
+            mask[4, 3] = False  # Can attend to backward query
 
         return mask
 
@@ -420,37 +572,51 @@ class BidirectionalARTransformer(nn.Module):
         batch_size = initial_image_latents.shape[0]
 
         # Encode goal images
-        goal_image_latents = self.image_encoder(
-            goal_images)  # [B, image_latent_dim]
+        # Goal images are single target images, not temporal sequences
+        # Use the base encoder directly for single images
+        if self.config.n_obs_steps > 1:
+            # For temporal models, goal images are still single target images
+            # Use the base image encoder directly
+            if hasattr(self.image_encoder, 'base_image_encoder'):
+                goal_image_latents = self.image_encoder.base_image_encoder(
+                    goal_images)
+            else:
+                # Fallback for non-temporal encoder
+                goal_image_latents = self.image_encoder(goal_images)
+        else:
+            # For non-temporal models, use the encoder directly
+            goal_image_latents = self.image_encoder(
+                goal_images)  # [B, image_latent_dim]
 
         # === Autoregressive part (for better sequence learning) ===
-        # Prepare sequence tokens for autoregressive learning
+        # NEW PREDICTION ORDER: goal_latent → backward states → forward states
+        # This makes the model softly conditioned on goal paths
         ar_tokens = []
         ar_token_types = []
 
-        # 1. Initial image latent
+        # 1. Initial image latent (conditioning)
         ar_tokens.append(self.image_latent_projection(initial_image_latents))
         ar_token_types.append(0)  # image token
 
-        # 2. Initial state (st_0)
+        # 2. Initial state (st_0) (conditioning)
         ar_tokens.append(self.state_projection(initial_states))
         ar_token_types.append(1)  # state token
 
-        # 3. Forward trajectory states (st_1 to st_{F-1})
+        # 3. Goal image latent (first prediction - soft conditioning)
+        ar_tokens.append(self.image_latent_projection(goal_image_latents))
+        ar_token_types.append(2)  # goal image token
+
+        # 4. Backward trajectory states (second prediction - conditioned on goal)
+        for i in range(self.config.backward_steps):
+            ar_tokens.append(self.state_projection(backward_states[:, i]))
+            ar_token_types.append(1)  # state token
+
+        # 5. Forward trajectory states (third prediction - conditioned on goal + backward)
         future_forward_states_for_input = forward_states[:,
                                                          1:self.config.forward_steps]
         for i in range(self.config.forward_steps - 1):
             ar_tokens.append(self.state_projection(
                 future_forward_states_for_input[:, i]))
-            ar_token_types.append(1)  # state token
-
-        # 4. Goal image latent
-        ar_tokens.append(self.image_latent_projection(goal_image_latents))
-        ar_token_types.append(2)  # goal image token
-
-        # 5. Backward trajectory states
-        for i in range(self.config.backward_steps):
-            ar_tokens.append(self.state_projection(backward_states[:, i]))
             ar_token_types.append(1)  # state token
 
         # Stack tokens
@@ -479,27 +645,28 @@ class BidirectionalARTransformer(nn.Module):
         )
 
         # Extract predictions for different parts of the sequence (autoregressive)
+        # NEW ORDER: conditioning tokens → goal → backward → forward
         ar_results = {}
-        F = self.config.forward_steps
         B = self.config.backward_steps
+        F = self.config.forward_steps
 
-        # Forward states predictions (st_1 to st_{F-1})
-        forward_hidden = ar_hidden_states[:, 1:F]
-        ar_results['predicted_forward_states'] = self.state_output_head(
-            forward_hidden)
-
-        # Goal image prediction
-        goal_image_predictor_hidden = ar_hidden_states[:, F]
+        # Goal image prediction (position 2 in new sequence)
+        goal_image_predictor_hidden = ar_hidden_states[:, 2]
         predicted_goal_latents = self.image_latent_output_head(
             goal_image_predictor_hidden)
         ar_results['predicted_goal_images'] = self.image_decoder(
             predicted_goal_latents)
         ar_results['predicted_goal_latents'] = predicted_goal_latents
 
-        # Backward states predictions
-        backward_hidden = ar_hidden_states[:, F + 1: F + 1 + B]
+        # Backward states predictions (positions 3 to 3+B-1)
+        backward_hidden = ar_hidden_states[:, 3:3 + B]
         ar_results['predicted_backward_states'] = self.state_output_head(
             backward_hidden)
+
+        # Forward states predictions (positions 3+B to 3+B+(F-1)-1)
+        forward_hidden = ar_hidden_states[:, 3 + B:3 + B + (F - 1)]
+        ar_results['predicted_forward_states'] = self.state_output_head(
+            forward_hidden)
 
         # === Query-based part (matching inference approach) ===
         # Project initial image latents and state to hidden dimension
@@ -512,25 +679,26 @@ class BidirectionalARTransformer(nn.Module):
         projected_initial_state = projected_initial_state.unsqueeze(1)
 
         # Expand query tokens for the batch
-        batch_forward_query = self.forward_seq_query_token.expand(
-            batch_size, -1, -1)
         batch_goal_query = self.goal_image_query_token.expand(
             batch_size, -1, -1)
         batch_backward_query = self.backward_seq_query_token.expand(
             batch_size, -1, -1)
+        batch_forward_query = self.forward_seq_query_token.expand(
+            batch_size, -1, -1)
 
-        # Construct the input sequence: [initial_image, initial_state, forward_query, goal_query, backward_query]
+        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, goal_query, backward_query, forward_query]
+        # This reflects the prediction sequence: goal → backward → forward
         query_sequence = torch.cat([
             projected_initial_image,
             projected_initial_state,
-            batch_forward_query,
             batch_goal_query,
-            batch_backward_query
+            batch_backward_query,
+            batch_forward_query
         ], dim=1)  # [B, 5, D]
 
-        # Define token types: 0=image, 1=state, 3=forward_query, 4=goal_query, 5=backward_query
+        # Define token types: 0=image, 1=state, 4=goal_query, 5=backward_query, 3=forward_query
         query_token_types_tensor = torch.tensor(
-            [0, 1, 3, 4, 5], device=device).unsqueeze(0).expand(batch_size, -1)
+            [0, 1, 4, 5, 3], device=device).unsqueeze(0).expand(batch_size, -1)
 
         # Add token type embeddings
         query_type_embeddings = self.token_type_embedding(
@@ -554,12 +722,27 @@ class BidirectionalARTransformer(nn.Module):
             mask=query_attn_mask
         )
 
-        # Extract hidden states for the query tokens
-        forward_query_hidden = query_hidden_states[:, 2]  # [B, D]
-        goal_query_hidden = query_hidden_states[:, 3]     # [B, D]
-        backward_query_hidden = query_hidden_states[:, 4]  # [B, D]
+        # Extract hidden states for the query tokens (NEW ORDER)
+        # [B, D] - goal prediction
+        goal_query_hidden = query_hidden_states[:, 2]
+        # [B, D] - backward prediction
+        backward_query_hidden = query_hidden_states[:, 3]
+        # [B, D] - forward prediction
+        forward_query_hidden = query_hidden_states[:, 4]
 
-        # Predict forward states sequence (F-1 states, as the initial state is given)
+        # Predict goal image latent (first in sequence)
+        query_predicted_goal_latents = self.goal_image_latent_head(
+            goal_query_hidden)
+        query_goal_images = self.image_decoder(query_predicted_goal_latents)
+
+        # Predict backward states sequence (second in sequence, conditioned on goal)
+        query_predicted_bwd_states_flat = self.backward_state_head(
+            backward_query_hidden)
+        query_bwd_states = query_predicted_bwd_states_flat.view(
+            batch_size, self.config.backward_steps, self.config.state_dim
+        )
+
+        # Predict forward states sequence (third in sequence, conditioned on goal + backward)
         query_predicted_fwd_states_flat = self.forward_state_head(
             forward_query_hidden)
 
@@ -567,18 +750,6 @@ class BidirectionalARTransformer(nn.Module):
         # We're predicting (F-1) states, each of state_dim dimensions
         query_fwd_states = query_predicted_fwd_states_flat.view(
             batch_size, self.config.forward_steps-1, self.config.state_dim
-        )
-
-        # Predict goal image latent
-        query_predicted_goal_latents = self.goal_image_latent_head(
-            goal_query_hidden)
-        query_goal_images = self.image_decoder(query_predicted_goal_latents)
-
-        # Predict backward states sequence
-        query_predicted_bwd_states_flat = self.backward_state_head(
-            backward_query_hidden)
-        query_bwd_states = query_predicted_bwd_states_flat.view(
-            batch_size, self.config.backward_steps, self.config.state_dim
         )
 
         # Combine results from both approaches
@@ -621,25 +792,26 @@ class BidirectionalARTransformer(nn.Module):
             1)  # [B, 1, D]
 
         # Expand query tokens for the batch
-        batch_forward_query = self.forward_seq_query_token.expand(
-            batch_size, -1, -1)  # [B, 1, D]
         batch_goal_query = self.goal_image_query_token.expand(
             batch_size, -1, -1)  # [B, 1, D]
         batch_backward_query = self.backward_seq_query_token.expand(
             batch_size, -1, -1)  # [B, 1, D]
+        batch_forward_query = self.forward_seq_query_token.expand(
+            batch_size, -1, -1)  # [B, 1, D]
 
-        # Construct the input sequence: [initial_image, initial_state, forward_query, goal_query, backward_query]
+        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, goal_query, backward_query, forward_query]
+        # This reflects the prediction sequence: goal → backward → forward
         sequence = torch.cat([
             projected_initial_image,       # [B, 1, D]
             projected_initial_state,       # [B, 1, D]
-            batch_forward_query,           # [B, 1, D]
-            batch_goal_query,              # [B, 1, D]
-            batch_backward_query           # [B, 1, D]
+            batch_goal_query,              # [B, 1, D] - goal prediction
+            batch_backward_query,          # [B, 1, D] - backward prediction
+            batch_forward_query            # [B, 1, D] - forward prediction
         ], dim=1)  # [B, 5, D]
 
-        # Define token types: 0=image, 1=state, 3=forward_query, 4=goal_query, 5=backward_query
+        # Define token types: 0=image, 1=state, 4=goal_query, 5=backward_query, 3=forward_query
         token_types_tensor = torch.tensor(
-            [0, 1, 3, 4, 5], device=device
+            [0, 1, 4, 5, 3], device=device
         ).unsqueeze(0).expand(batch_size, -1)  # [B, 5]
 
         # Add token type embeddings
@@ -663,31 +835,33 @@ class BidirectionalARTransformer(nn.Module):
             mask=attn_mask
         )
 
-        # Extract hidden states for the query tokens
-        forward_query_hidden = hidden_states[:, 2]  # [B, D]
-        goal_query_hidden = hidden_states[:, 3]     # [B, D]
-        backward_query_hidden = hidden_states[:, 4]  # [B, D]
+        # Extract hidden states for the query tokens (NEW ORDER)
+        goal_query_hidden = hidden_states[:, 2]     # [B, D] - goal prediction
+        # [B, D] - backward prediction
+        backward_query_hidden = hidden_states[:, 3]
+        # [B, D] - forward prediction
+        forward_query_hidden = hidden_states[:, 4]
 
-        # Predict forward states sequence
+        # Predict goal image latent (first in sequence)
+        predicted_goal_latents = self.goal_image_latent_head(goal_query_hidden)
+        results['predicted_goal_latents'] = predicted_goal_latents
+        results['predicted_goal_images'] = self.image_decoder(
+            predicted_goal_latents)
+
+        # Predict backward states sequence (second in sequence, conditioned on goal)
+        predicted_bwd_states_flat = self.backward_state_head(
+            backward_query_hidden)
+        results['predicted_backward_states'] = predicted_bwd_states_flat.view(
+            batch_size, self.config.backward_steps, self.config.state_dim
+        )
+
+        # Predict forward states sequence (third in sequence, conditioned on goal + backward)
         predicted_fwd_states_flat = self.forward_state_head(
             forward_query_hidden)
 
         # Fix: Ensure the reshaping is consistent with the linear layer output
         results['predicted_forward_states'] = predicted_fwd_states_flat.view(
             batch_size, self.config.forward_steps-1, self.config.state_dim
-        )
-
-        # Predict goal image latent
-        predicted_goal_latents = self.goal_image_latent_head(goal_query_hidden)
-        results['predicted_goal_latents'] = predicted_goal_latents
-        results['predicted_goal_images'] = self.image_decoder(
-            predicted_goal_latents)
-
-        # Predict backward states sequence
-        predicted_bwd_states_flat = self.backward_state_head(
-            backward_query_hidden)
-        results['predicted_backward_states'] = predicted_bwd_states_flat.view(
-            batch_size, self.config.backward_steps, self.config.state_dim
         )
 
         return results
@@ -711,8 +885,12 @@ class BidirectionalARTransformer(nn.Module):
         Normalization is handled outside the model.
 
         Args:
-            initial_images: [B, C, H, W] initial images
-            initial_states: [B, state_dim] initial states (normalized)
+            initial_images: 
+                - If n_obs_steps > 1: [B, n_obs_steps, C, H, W] temporal sequence of images
+                - If n_obs_steps = 1: [B, C, H, W] single image
+            initial_states: 
+                - If n_obs_steps > 1: [B, n_obs_steps, state_dim] temporal sequence of states
+                - If n_obs_steps = 1: [B, state_dim] single state (normalized)
             forward_states: [B, forward_steps, state_dim] forward trajectory states (normalized, training only)
             goal_images: [B, C, H, W] goal images (training only)
             backward_states: [B, backward_steps, state_dim] backward trajectory states (normalized, training only)
@@ -730,9 +908,25 @@ class BidirectionalARTransformer(nn.Module):
 
         # The normalizer is no longer needed here since we normalize the batch before model.forward()
 
-        # Encode initial image
-        initial_image_latents = self.image_encoder(
-            initial_images)  # [B, image_latent_dim]
+        # Encode initial image(s) and state(s)
+        if self.config.n_obs_steps > 1:
+            # Temporal encoding: process sequences of observations
+            # [B, n_obs_steps, C, H, W] -> [B, image_latent_dim]
+            initial_image_latents = self.image_encoder(initial_images)
+            # For states, use temporal encoder if available, otherwise use the most recent state
+            if self.state_encoder is not None:
+                # [B, n_obs_steps, state_dim] -> [B, state_dim]
+                normalized_initial_states = self.state_encoder(
+                    normalized_initial_states)
+            else:
+                # Fallback: use most recent state
+                # [B, state_dim]
+                normalized_initial_states = normalized_initial_states[:, -1]
+        else:
+            # Single-step encoding: process single observations
+            initial_image_latents = self.image_encoder(
+                initial_images)  # [B, C, H, W] -> [B, image_latent_dim]
+            # normalized_initial_states already has the correct shape [B, state_dim]
 
         if training:
             # Training mode: teacher forcing with full sequence
@@ -852,8 +1046,22 @@ def compute_loss(
     # Latent consistency losses
     if 'predicted_goal_latents' in predictions and 'goal_images' in targets:
         with torch.no_grad():  # Ensure encoder is not trained on this reconstruction
-            # No need to normalize images as the image_encoder expects raw pixel values
-            goal_image_latents = model.image_encoder(targets['goal_images'])
+            # Goal images are single target images, not temporal sequences
+            # Use the same logic as in _forward_training
+            if model.config.n_obs_steps > 1:
+                # For temporal models, goal images are still single target images
+                # Use the base image encoder directly
+                if hasattr(model.image_encoder, 'base_image_encoder'):
+                    goal_image_latents = model.image_encoder.base_image_encoder(
+                        targets['goal_images'])
+                else:
+                    # Fallback for non-temporal encoder
+                    goal_image_latents = model.image_encoder(
+                        targets['goal_images'])
+            else:
+                # For non-temporal models, use the encoder directly
+                goal_image_latents = model.image_encoder(
+                    targets['goal_images'])
         losses['goal_latent_consistency_loss'] = F.mse_loss(
             predictions['predicted_goal_latents'],
             goal_image_latents
@@ -882,8 +1090,22 @@ def compute_loss(
 
     if 'query_predicted_goal_latents' in predictions and 'goal_images' in targets:
         with torch.no_grad():
-            # No need to normalize images as the image_encoder expects raw pixel values
-            goal_image_latents = model.image_encoder(targets['goal_images'])
+            # Handle goal images correctly for temporal models
+            # Goal images are single target images, not temporal sequences
+            if model.config.n_obs_steps > 1:
+                # For temporal models, goal images are still single target images
+                # Use the base image encoder directly
+                if hasattr(model.image_encoder, 'base_image_encoder'):
+                    goal_image_latents = model.image_encoder.base_image_encoder(
+                        targets['goal_images'])
+                else:
+                    # Fallback for non-temporal encoder
+                    goal_image_latents = model.image_encoder(
+                        targets['goal_images'])
+            else:
+                # For non-temporal models, use the encoder directly
+                goal_image_latents = model.image_encoder(
+                    targets['goal_images'])
         losses['query_goal_latent_consistency_loss'] = F.mse_loss(
             predictions['query_predicted_goal_latents'],
             goal_image_latents
