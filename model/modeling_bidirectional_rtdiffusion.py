@@ -350,35 +350,85 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         Args:
             model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
         """
-        # 1. Extract current observations and prepare for Bidirectional Transformer
+        # 1. Extract observations and prepare for Bidirectional Transformer
         # model_input_batch already contains normalized, batched, and device-mapped history
-        # Current state s_0
-        norm_state_current = model_input_batch["observation.state"][:, -1, :]
-        norm_img_current = None
-        if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
-            # Extract last image from the sequence
-            # Current image i_0
-            norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
 
-        # Prepare state for bidirectional transformer
-        bidir_state_dim = self.base_transformer.config.state_dim
-        current_state_for_bidir_transformer = norm_state_current
-        if norm_state_current.shape[-1] != bidir_state_dim:
-            current_state_for_bidir_transformer = norm_state_current[:,
-                                                                     :bidir_state_dim]
+        # Check if transformer uses temporal encoding
+        n_obs_steps = getattr(self.base_transformer.config, 'n_obs_steps', 1)
+
+        if n_obs_steps > 1:
+            # Use full temporal sequences for temporal transformer
+            # [B, n_obs_steps, state_dim]
+            norm_state_sequence = model_input_batch["observation.state"]
+            norm_img_sequence = None
+            if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
+                # [B, n_obs_steps, C, H, W]
+                norm_img_sequence = model_input_batch["observation.image"]
+
+            # Ensure we have the right number of temporal steps
+            if norm_state_sequence.shape[1] != n_obs_steps:
+                # If we have more history than needed, take the last n_obs_steps
+                if norm_state_sequence.shape[1] > n_obs_steps:
+                    norm_state_sequence = norm_state_sequence[:, -
+                                                              n_obs_steps:, :]
+                    if norm_img_sequence is not None:
+                        norm_img_sequence = norm_img_sequence[:, -
+                                                              n_obs_steps:, :, :, :]
+                else:
+                    # If we have less history, pad with the first observation
+                    # This should not happen in normal operation, but handle it gracefully
+                    print(
+                        f"Warning: Expected {n_obs_steps} temporal steps, got {norm_state_sequence.shape[1]}")
+                    while norm_state_sequence.shape[1] < n_obs_steps:
+                        norm_state_sequence = torch.cat(
+                            [norm_state_sequence[:, :1, :], norm_state_sequence], dim=1)
+                        if norm_img_sequence is not None:
+                            norm_img_sequence = torch.cat(
+                                [norm_img_sequence[:, :1, :, :, :], norm_img_sequence], dim=1)
+
+            # Prepare state for bidirectional transformer
+            bidir_state_dim = self.base_transformer.config.state_dim
+            current_state_for_bidir_transformer = norm_state_sequence
+            if norm_state_sequence.shape[-1] != bidir_state_dim:
+                current_state_for_bidir_transformer = norm_state_sequence[:,
+                                                                          :, :bidir_state_dim]
+
+            # Use temporal sequences
+            initial_images_input = norm_img_sequence
+            initial_states_input = current_state_for_bidir_transformer
+        else:
+            # Use single-step observations for non-temporal transformer
+            # Current state s_0
+            norm_state_current = model_input_batch["observation.state"][:, -1, :]
+            norm_img_current = None
+            if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
+                # Extract last image from the sequence
+                # Current image i_0
+                norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
+
+            # Prepare state for bidirectional transformer
+            bidir_state_dim = self.base_transformer.config.state_dim
+            current_state_for_bidir_transformer = norm_state_current
+            if norm_state_current.shape[-1] != bidir_state_dim:
+                current_state_for_bidir_transformer = norm_state_current[:,
+                                                                         :bidir_state_dim]
+
+            # Use single observations
+            initial_images_input = norm_img_current
+            initial_states_input = current_state_for_bidir_transformer
 
         # Check if image is required but missing
         bidir_uses_image = any(k.startswith("observation.image")
                                for k in getattr(self.base_transformer.config, 'input_features', {}))
-        if bidir_uses_image and norm_img_current is None:
+        if bidir_uses_image and initial_images_input is None:
             raise ValueError(
                 "BidirectionalARTransformer requires an image but none is available")
 
         # 2. Get state plan directly from Bidirectional Transformer
         print("Generating state plan directly from Bidirectional Transformer (diffusion bypassed)")
         transformer_predictions = self.base_transformer(
-            initial_images=norm_img_current,  # This is current image i_0
-            initial_states=current_state_for_bidir_transformer,  # This is current state s_0
+            initial_images=initial_images_input,  # Temporal sequence or single image
+            initial_states=initial_states_input,  # Temporal sequence or single state
             training=False
         )
 

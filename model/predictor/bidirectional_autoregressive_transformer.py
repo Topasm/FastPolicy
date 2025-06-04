@@ -108,25 +108,140 @@ class DiffusionImageEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        # Create a DiffusionConfig with all required parameters
-        # We'll use a minimal config that only contains what DiffusionRgbEncoder needs
-        diffusion_config = DiffusionConfig(
-            input_features=config.input_features,
-            output_features=config.output_features,
-            vision_backbone=config.vision_backbone,
-            pretrained_backbone_weights=config.pretrained_backbone_weights,
-            spatial_softmax_num_keypoints=config.spatial_softmax_num_keypoints,
-            use_group_norm=config.use_group_norm,
-            crop_shape=config.crop_shape,
-            crop_is_random=config.crop_is_random,
-            transformer_dim=config.hidden_dim,  # Use hidden_dim as transformer_dim
-        )
+        # Check if we have proper FeatureSpec objects or serialized dictionaries
+        has_proper_features = False
+        if config.input_features:
+            # Check if any value has a 'type' attribute (indicating it's a proper FeatureSpec)
+            sample_feature = next(iter(config.input_features.values()), None)
+            has_proper_features = hasattr(sample_feature, 'type')
 
-        # Create the DiffusionRgbEncoder
-        self.diffusion_encoder = DiffusionRgbEncoder(diffusion_config)
+        # Use diffusion encoder if:
+        # 1. We have proper FeatureSpec objects, OR
+        # 2. The config explicitly says to use it (for compatibility with saved models)
+        use_diffusion = has_proper_features or (
+            hasattr(config, 'use_diffusion_encoder') and config.use_diffusion_encoder)
 
-        # Add a projection layer to map from transformer_dim to image_latent_dim
-        self.projection = nn.Linear(config.hidden_dim, config.image_latent_dim)
+        if use_diffusion and has_proper_features:
+            # Create a DiffusionConfig with all required parameters
+            diffusion_config = DiffusionConfig(
+                input_features=config.input_features,
+                output_features=config.output_features,
+                vision_backbone=config.vision_backbone,
+                pretrained_backbone_weights=config.pretrained_backbone_weights,
+                spatial_softmax_num_keypoints=config.spatial_softmax_num_keypoints,
+                use_group_norm=config.use_group_norm,
+                crop_shape=config.crop_shape,
+                crop_is_random=config.crop_is_random,
+                transformer_dim=config.hidden_dim,
+            )
+
+            # Create the DiffusionRgbEncoder
+            self.diffusion_encoder = DiffusionRgbEncoder(diffusion_config)
+            self.use_diffusion_encoder = True
+        elif use_diffusion and not has_proper_features:
+            # For evaluation: we want to use diffusion encoder but don't have proper FeatureSpec objects
+            # Create a mock DiffusionConfig for compatibility
+            print("Warning: Creating DiffusionRgbEncoder without proper FeatureSpec objects - using mock config for evaluation compatibility")
+
+            try:
+                # Create minimal mock features for DiffusionRgbEncoder
+                from dataclasses import dataclass
+                from lerobot.configs.types import FeatureType
+
+                @dataclass
+                class MockFeatureSpec:
+                    def __init__(self, shape, feature_type):
+                        self.shape = shape
+                        self.type = feature_type
+
+                # Create mock FeatureSpec objects
+                mock_input_features = {}
+                mock_output_features = {}
+
+                if "observation.image" in config.input_features:
+                    mock_input_features["observation.image"] = MockFeatureSpec(
+                        shape=config.input_features["observation.image"]["shape"],
+                        feature_type=FeatureType.VISUAL
+                    )
+
+                if "observation.state" in config.input_features:
+                    mock_input_features["observation.state"] = MockFeatureSpec(
+                        shape=config.input_features["observation.state"]["shape"],
+                        feature_type=FeatureType.STATE
+                    )
+
+                # Create DiffusionConfig with mock features
+                diffusion_config = DiffusionConfig(
+                    input_features=mock_input_features,
+                    output_features=mock_output_features,
+                    vision_backbone=getattr(
+                        config, 'vision_backbone', 'resnet18'),
+                    pretrained_backbone_weights=getattr(
+                        config, 'pretrained_backbone_weights', 'IMAGENET1K_V1'),
+                    spatial_softmax_num_keypoints=getattr(
+                        config, 'spatial_softmax_num_keypoints', 32),
+                    use_group_norm=getattr(config, 'use_group_norm', False),
+                    crop_shape=getattr(config, 'crop_shape', None),
+                    crop_is_random=getattr(config, 'crop_is_random', False),
+                    transformer_dim=config.hidden_dim,
+                )
+
+                # Create the DiffusionRgbEncoder
+                self.diffusion_encoder = DiffusionRgbEncoder(diffusion_config)
+                self.use_diffusion_encoder = True
+            except Exception as e:
+                print(
+                    f"Warning: Failed to create DiffusionRgbEncoder with mock config: {e}")
+                print("Falling back to simple CNN encoder")
+                self.use_diffusion_encoder = False
+        else:
+            # Fallback to simple CNN encoder when diffusion encoder is not requested
+            print(
+                "Warning: FeatureSpec objects not available, falling back to simple CNN encoder")
+            self.use_diffusion_encoder = False
+
+        # Create simple encoder if not using diffusion encoder
+        if not self.use_diffusion_encoder:
+            self.simple_encoder = nn.Sequential(
+                # 96x96x3 -> 48x48x64
+                nn.Conv2d(config.image_channels, 64,
+                          kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+
+                # 48x48x64 -> 24x24x128
+                nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+
+                # 24x24x128 -> 12x12x256
+                nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+
+                # 12x12x256 -> 6x6x512
+                nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+
+                # 6x6x512 -> 3x3x512
+                nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+
+                # Global average pooling: 3x3x512 -> 512
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+
+                # Direct projection to image_latent_dim
+                nn.Linear(512, config.image_latent_dim),
+                nn.ReLU()
+            )
+
+        # Add a projection layer to map from transformer_dim to image_latent_dim (only needed for diffusion encoder)
+        if self.use_diffusion_encoder:
+            self.projection = nn.Linear(
+                config.hidden_dim, config.image_latent_dim)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -138,16 +253,20 @@ class DiffusionImageEncoder(nn.Module):
         Returns:
             latents: [B, image_latent_dim] latent representations
         """
-        # DiffusionRgbEncoder expects images in [0, 1] range
-        # If images are in [-1, 1] range, convert them
-        if images.min() < 0:
-            images = (images + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
+        if self.use_diffusion_encoder:
+            # DiffusionRgbEncoder expects images in [0, 1] range
+            # If images are in [-1, 1] range, convert them
+            if images.min() < 0:
+                images = (images + 1.0) / 2.0  # Convert from [-1, 1] to [0, 1]
 
-        # Get features from DiffusionRgbEncoder (output is [B, transformer_dim])
-        features = self.diffusion_encoder(images)
+            # Get features from DiffusionRgbEncoder (output is [B, transformer_dim])
+            features = self.diffusion_encoder(images)
 
-        # Project to image_latent_dim
-        latents = self.projection(features)
+            # Project to image_latent_dim
+            latents = self.projection(features)
+        else:
+            # Use simple CNN encoder
+            latents = self.simple_encoder(images)
 
         return latents
 
