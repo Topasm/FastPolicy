@@ -14,6 +14,10 @@ from pathlib import Path
 import safetensors.torch
 import numpy as np  # Added for stats saving
 from tqdm import tqdm  # Added for progress bar
+import wandb  # Added for visualization
+import torchvision.transforms as T  # Added for image processing
+import matplotlib.pyplot as plt  # Added for plotting
+from datetime import datetime  # Added for unique run names
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.datasets.utils import dataset_to_policy_features
@@ -37,15 +41,31 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 50000  # Changed from num_epochs to training_steps
-    batch_size = 16
+    training_steps = 20000  # Reduced for testing WandB integration
+    batch_size = 32
     learning_rate = 1e-4
-    log_freq = 100  # Adjusted log frequency
-    save_freq = 1000  # Adjusted save frequency
+    log_freq = 100  # More frequent logging for testing
+    save_freq = 500  # More frequent saving for testing
+
+    # Initialize Weights & Biases
+    run_name = f"bidirectional_transformer_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    wandb.init(
+        project="fastpolicy",
+        name=run_name,
+        config={
+            "architecture": "BidirectionalARTransformer",
+            "training_steps": training_steps,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "forward_steps": 16,
+            "backward_steps": 16,
+        }
+    )
 
     print("=== Bidirectional Autoregressive Transformer Training ===")
     print(f"Device: {device}")
     print(f"Output directory: {output_directory}")
+    print(f"WandB run: {run_name}")
 
     # --- Dataset Setup ---
     dataset_repo_id = "lerobot/pusht"
@@ -79,7 +99,7 @@ def main():
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
-        forward_steps=20,
+        forward_steps=16,
         backward_steps=16,
         min_episode_length=50,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
@@ -97,6 +117,22 @@ def main():
         collate_fn=BidirectionalTrajectoryDataset.collate_fn
     )
 
+    # --- Model Configuration ---
+    config = BidirectionalARTransformerConfig(
+        state_dim=state_dim,
+        hidden_dim=512,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        max_position_value=64,  # Max sequence length for pos encoding
+        image_channels=3,
+        image_size=96,
+        image_latent_dim=256,
+        forward_steps=16,
+        backward_steps=16,
+        input_features=input_features,  # Pass the actual FeatureSpec objects
+        output_features=output_features,  # Pass the actual FeatureSpec objects
+    )
     print(f"Dataset size: {len(dataset)}")
     print(f"Batches per iteration: {len(dataloader)}")
 
@@ -104,7 +140,7 @@ def main():
     # Basic normalizer that works with "observation.state" key
     normalize_state_base = Normalize(
         {"observation.state": features["observation.state"]},
-        cfg.normalization_mapping,
+        config.normalization_mapping,
         dataset_metadata.stats)
 
     # Create a key mapping normalizer that maps from batch keys to normalizer keys
@@ -117,23 +153,6 @@ def main():
     # Wrap the base normalizer with our key mapper
     wrapped_normalizer = KeyMappingNormalizer(
         normalize_state_base, key_mapping)
-
-    # --- Model Configuration ---
-    config = BidirectionalARTransformerConfig(
-        state_dim=state_dim,
-        hidden_dim=512,
-        num_layers=6,
-        num_heads=8,
-        dropout=0.1,
-        max_position_value=64,  # Max sequence length for pos encoding
-        image_channels=3,
-        image_size=96,
-        image_latent_dim=256,
-        forward_steps=20,
-        backward_steps=16,
-        input_features=input_features,  # Pass the actual FeatureSpec objects
-        output_features=output_features,  # Pass the actual FeatureSpec objects
-    )
 
     # Create the model without internal normalizers (we'll use external normalization)
     model = BidirectionalARTransformer(
@@ -175,12 +194,18 @@ def main():
             batch = wrapped_normalizer(batch)  # Normalize the batch
 
             batch_device = {}
+
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor):
                     batch_device[key] = value.to(device)
                 else:
                     # Handle cases where batch items might not be tensors (e.g., metadata)
                     batch_device[key] = value
+            if 'initial_images' in batch_device:
+                batch_device['initial_images'] = batch_device['initial_images'] * 2.0 - 1.0
+
+            if 'goal_images' in batch_device:  # compute_loss에 전달되는 target 이미지에 중요
+                batch_device['goal_images'] = batch_device['goal_images'] * 2.0 - 1.0
 
             optimizer.zero_grad()
 
@@ -211,17 +236,55 @@ def main():
             # Logging
             if step % log_freq == 0:
                 log_str = f"Step: {step}/{training_steps} | Total Loss: {total_loss.item():.4f}"
+
+                # Create a dictionary for WandB logging
+                wandb_log = {
+                    'train/total_loss': total_loss.item(),
+                    'train/learning_rate': optimizer.param_groups[0]['lr']
+                }
+
+                # Log individual losses
                 for loss_name, loss_val in losses.items():
                     if loss_name != 'total_loss':
                         log_str += f" | {loss_name}: {loss_val.item():.4f}"
+                        wandb_log[f'train/{loss_name}'] = loss_val.item()
+
                 print(log_str)
                 print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6e}")
+
+                # Log image reconstructions if they exist in predictions
+                if 'predicted_goal_images' in predictions and batch_device['goal_images'] is not None:
+                    # Get a sample of ground truth and predicted images
+                    # Take first 4 images
+                    gt_images = batch_device['goal_images'][:4].detach().cpu()
+                    pred_images = predictions['predicted_goal_images'][:4].detach(
+                    ).cpu()
+
+                    # Process ground truth and predicted images
+                    for i in range(min(4, gt_images.shape[0])):
+                        # Normalize images to [0, 1] for visualization
+                        gt_img = (gt_images[i].clamp(-1, 1) + 1) / 2.0
+                        pred_img = (pred_images[i].clamp(-1, 1) + 1) / 2.0
+
+                        # Add images to wandb log
+                        wandb_log[f'images/sample_{i}_gt'] = wandb.Image(
+                            gt_img.permute(1, 2, 0).numpy())
+                        wandb_log[f'images/sample_{i}_pred'] = wandb.Image(
+                            pred_img.permute(1, 2, 0).numpy())
+
+                # Log to WandB
+                wandb.log(wandb_log, step=step)
 
             # Checkpointing (similar to rtdiffusion)
             if step % save_freq == 0 and step > 0:
                 ckpt_path = output_directory / f"model_step_{step}.pth"
                 torch.save(model.state_dict(), ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}")
+
+                # Also save the model to WandB
+                artifact = wandb.Artifact(f"model-step-{step}", type="model")
+                artifact.add_file(str(ckpt_path))
+                wandb.log_artifact(artifact)
 
             step += 1
             if step >= training_steps:
@@ -236,6 +299,14 @@ def main():
     # Save configuration in lerobot style
     config.save_pretrained(output_directory)
     print(f"Configuration saved to: {output_directory / 'config.json'}")
+
+    # Log the final model to WandB
+    artifact = wandb.Artifact(f"model-final", type="model")
+    artifact.add_file(str(final_path))
+    wandb.log_artifact(artifact)
+
+    # Close wandb run
+    wandb.finish()
 
     # Save dataset statistics (similar to rtdiffusion)
     stats_to_save = {}

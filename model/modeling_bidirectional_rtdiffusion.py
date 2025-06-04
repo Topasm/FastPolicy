@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import einops
+import time
 from typing import Dict
 
 from lerobot.common.policies.utils import get_device_from_parameters, populate_queues
@@ -19,9 +20,11 @@ from model.invdyn.invdyn import MlpInvDynamic
 class BidirectionalRTDiffusionPolicy(nn.Module):
     """
     Combined policy class that integrates:
-    1. Bidirectional Transformer for initial plan generation
-    2. Diffusion model for plan refinement
-    3. Inverse dynamics model for action prediction from states
+    1. Bidirectional Transformer for state plan generation
+    2. Inverse dynamics model for action prediction from states
+
+    Note: The diffusion model is no longer used in the action generation pipeline.
+    It is still passed in the constructor for compatibility with existing code.
     """
 
     def __init__(
@@ -43,9 +46,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self.config = state_diffusion_model.config
         self.device = get_device_from_parameters(bidirectional_transformer)
 
-        # CL-DiffPhyCon parameters
-        self.use_cl_diffphycon = True
-        # Store previous step's noisy latent sequence
+        # These diffusion-related parameters are kept for compatibility
+        # but are not used in the modified _generate_state_plan method
+        # Set to False since we're bypassing diffusion completely
+        self.use_cl_diffphycon = False
         self.cl_diffphycon_latent_z_prev = None
 
         # Process dataset stats for normalization
@@ -241,12 +245,17 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Get the last state in the sequence
         norm_state = model_input_batch["observation.state"][:, -1, :]
 
-        # Generate refined state plan
-        refined_state_plan = self._generate_state_plan(model_input_batch)
+        # Generate state plan using only the transformer (diffusion bypassed)
+        transformer_state_plan = self._generate_state_plan(model_input_batch)
 
-        # Generate actions using inverse dynamics
+        # Log state plan details for debugging
+        print(f"Transformer state plan: min={transformer_state_plan.min().item():.4f}, "
+              f"max={transformer_state_plan.max().item():.4f}, "
+              f"mean={transformer_state_plan.mean().item():.4f}")
+
+        # Generate actions using inverse dynamics directly from transformer predictions
         actions = self._generate_actions_from_states(
-            norm_state, refined_state_plan)
+            norm_state, transformer_state_plan)
 
         # Queue up actions for execution
         for i in range(actions.shape[1]):
@@ -333,11 +342,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             next_action = next_action.unsqueeze(0)
         print(f"Action shape after unsqueeze: {next_action.shape}")
 
-        # Store original action for comparison
-        orig_action = next_action.clone()
-        print(f"Original action values: {orig_action}")
-
-        # Try to unnormalize the action with the standard unnormalizer
+        # Use the standard unnormalizer
         try:
             # Make sure we're passing a properly formatted dictionary to unnormalize_action_output
             action_dict = {"action": next_action}
@@ -346,195 +351,43 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             # Check if the result is a dictionary or tensor
             if isinstance(unnorm_action, dict) and "action" in unnorm_action:
                 unnorm_action_tensor = unnorm_action["action"]
-                print(
-                    f"Unnormalized action from standard unnormalizer: {unnorm_action_tensor}")
+                print(f"Unnormalized action: {unnorm_action_tensor}")
             else:
                 unnorm_action_tensor = unnorm_action
                 print(f"Unnormalizer returned type: {type(unnorm_action)}")
 
-            # Check if unnormalization actually changed the values
-            if torch.allclose(orig_action, unnorm_action_tensor):
-                print(
-                    "WARNING: Standard unnormalization didn't change values! Using custom unnormalizer...")
-                # Use our custom unnormalizer implementation
-                unnorm_action_tensor = self.custom_action_unnormalize(
-                    next_action)
-
-                # If that also didn't work, log a critical error
-                if torch.allclose(orig_action, unnorm_action_tensor):
-                    print(
-                        "CRITICAL ERROR: Both standard and custom unnormalizers failed to change values!")
-                else:
-                    print("Custom unnormalizer successfully applied!")
-
-            # Return the unnormalized action
-            print(f"Final unnormalized action: {unnorm_action_tensor}")
             return unnorm_action_tensor
 
         except Exception as e:
-            print(f"Error using standard unnormalizer: {e}")
-            print("Attempting custom unnormalizer as fallback...")
-
-            # Try our custom unnormalizer as fallback
-            custom_unnorm_action = self.custom_action_unnormalize(next_action)
-
-            # If custom unnormalizer changed the values, use that
-            if not torch.allclose(orig_action, custom_unnorm_action):
-                print("Custom unnormalizer worked as a fallback!")
-                return custom_unnorm_action
-            else:
-                print(
-                    "CRITICAL ERROR: Both unnormalizers failed. Actions will not be properly unnormalized!")
-                return next_action
-
-    def custom_action_unnormalize(self, normalized_action):
-        """Custom method to unnormalize actions when the standard unnormalizer fails.
-
-        Args:
-            normalized_action: Tensor of shape [B, action_dim] containing normalized actions
-
-        Returns:
-            Unnormalized action tensor of the same shape
-        """
-        try:
-            # Try to get stats directly from the processed stats we saved
-            if hasattr(self.config, 'dataset_stats') and 'action' in self.config.dataset_stats:
-                action_stats = self.config.dataset_stats['action']
-
-                if 'mean' in action_stats and 'std' in action_stats:
-                    # Get the mean and std
-                    mean = action_stats['mean'].to(normalized_action.device)
-                    std = action_stats['std'].to(normalized_action.device)
-
-                    # Standard unnormalization formula: unnormalized = normalized * std + mean
-                    unnormalized_action = normalized_action * std + mean
-
-                    print("Custom unnormalization applied:")
-                    print(f"  - Input shape: {normalized_action.shape}")
-                    print(f"  - Mean shape: {mean.shape}, values: {mean}")
-                    print(f"  - Std shape: {std.shape}, values: {std}")
-                    print(f"  - Before unnorm: {normalized_action}")
-                    print(f"  - After unnorm: {unnormalized_action}")
-
-                    return unnormalized_action
-                else:
-                    print("Custom unnormalizer: Mean or std not found in action stats")
-            else:
-                print("Custom unnormalizer: No dataset stats available for action")
-        except Exception as e:
-            print(f"Error in custom unnormalizer: {e}")
-
-        # Return original action if unnormalization fails
-        return normalized_action
+            print(f"Error using unnormalizer: {e}")
+            print("Returning original action as fallback")
+            return next_action
 
     def _generate_state_plan(self, model_input_batch):
-        """Generate refined state plan using bidirectional transformer and diffusion.
+        """
+        Generates a state plan directly from the bidirectional transformer,
+        bypassing any diffusion model refinement.
+        The returned plan represents predicted future states (e.g., s_1, s_2, ..., s_K).
 
         Args:
             model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
         """
-        if self.use_cl_diffphycon:
-            # Pass the entire model_input_batch to the CL-DiffPhyCon plan generator
-            return self._generate_cl_diffphycon_plan(model_input_batch)
-        else:
-            # Pass the entire model_input_batch to the standard plan generator
-            return self._generate_standard_plan(model_input_batch)
-
-    def _generate_cl_diffphycon_plan(self, model_input_batch):
-        """Generate state plan using CL-DiffPhyCon algorithm.
-
-        Args:
-            model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
-                               This includes both current observation and history
-        """
-        print("Using CL-DiffPhyCon algorithm")
-
-        # Extract current state and image from model_input_batch
+        # 1. Extract current observations and prepare for Bidirectional Transformer
+        # model_input_batch already contains normalized, batched, and device-mapped history
+        # Current state s_0
         norm_state_current = model_input_batch["observation.state"][:, -1, :]
         norm_img_current = None
-        if "observation.image" in model_input_batch:
+        if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
             # Extract last image from the sequence
-            norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
-
-        # Initialize CL-DiffPhyCon latent state if needed (first call in an episode)
-        if self.cl_diffphycon_latent_z_prev is None:
-            print("Initializing CL-DiffPhyCon latent_z_prev")
-
-            # Step 1: Generate Initial Clean Plan ("Sync Path") using Bidirectional Transformer
-            # Prepare state for bidirectional transformer
-            bidir_state_dim = self.base_transformer.config.state_dim
-            current_state_for_bidir = norm_state_current
-            if norm_state_current.shape[-1] != bidir_state_dim:
-                current_state_for_bidir = norm_state_current[:,
-                                                             :bidir_state_dim]
-
-            # Generate initial plan with transformer using current observations
-            tf_predictions = self.bidirectional_transformer(
-                initial_images=norm_img_current,
-                initial_states=current_state_for_bidir,
-                training=False
-            )
-
-            # Extract predicted states and create initial plan
-            norm_predicted_states = tf_predictions['predicted_forward_states']
-            initial_clean_plan = torch.cat(
-                [current_state_for_bidir.unsqueeze(1), norm_predicted_states], dim=1
-            )
-
-            # Adjust plan length to match diffusion horizon
-            diffusion_horizon = self.state_diffusion_model.config.horizon
-            if initial_clean_plan.shape[1] > diffusion_horizon:
-                initial_clean_plan_for_diffusion = initial_clean_plan[:,
-                                                                      :diffusion_horizon, :]
-            elif initial_clean_plan.shape[1] < diffusion_horizon:
-                # Handle cases where the plan is shorter than diffusion horizon
-                padding_size = diffusion_horizon - initial_clean_plan.shape[1]
-                # Pad with the last state
-                last_state_in_plan = initial_clean_plan[:, -1:, :]
-                padding = last_state_in_plan.repeat(1, padding_size, 1)
-                initial_clean_plan_for_diffusion = torch.cat(
-                    [initial_clean_plan, padding], dim=1)
-            else:
-                initial_clean_plan_for_diffusion = initial_clean_plan
-
-            self.cl_diffphycon_latent_z_prev = initial_clean_plan_for_diffusion
-
-        # Step 3: Perform CL-DiffPhyCon Asynchronous Denoising Step
-        # model_input_batch is used by _prepare_global_conditioning inside sample_cl_diffphycon_step
-        current_step_predicted_state_at_t0, next_step_latent_z = \
-            self.state_diffusion_model.sample_cl_diffphycon_step(
-                self.cl_diffphycon_latent_z_prev,
-                model_input_batch
-            )
-
-        # Step 4: Update the stored noisy latent for the next environment step
-        self.cl_diffphycon_latent_z_prev = next_step_latent_z
-
-        # Step 5: Return the fully denoised state prediction for the current step
-        return current_step_predicted_state_at_t0
-
-    def _generate_standard_plan(self, model_input_batch):
-        """Generate state plan using bidirectional transformer and diffusion refinement.
-
-        Args:
-            model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
-                              This includes both current observation and history
-        """
-        print("Using original bidirectional + diffusion refinement")
-
-        # Extract current state and image from model_input_batch
-        norm_state_current = model_input_batch["observation.state"][:, -1, :]
-        norm_img_current = None
-        if "observation.image" in model_input_batch:
-            # Extract last image from the sequence
+            # Current image i_0
             norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
 
         # Prepare state for bidirectional transformer
         bidir_state_dim = self.base_transformer.config.state_dim
+        current_state_for_bidir_transformer = norm_state_current
         if norm_state_current.shape[-1] != bidir_state_dim:
-            norm_state_for_bidir = norm_state_current[:, :bidir_state_dim]
-        else:
-            norm_state_for_bidir = norm_state_current
+            current_state_for_bidir_transformer = norm_state_current[:,
+                                                                     :bidir_state_dim]
 
         # Check if image is required but missing
         bidir_uses_image = any(k.startswith("observation.image")
@@ -543,38 +396,99 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             raise ValueError(
                 "BidirectionalARTransformer requires an image but none is available")
 
-        # Generate initial state plan with transformer
-        transformer_predictions = self.bidirectional_transformer(
-            initial_images=norm_img_current,
-            initial_states=norm_state_for_bidir,
+        # 2. Get state plan directly from Bidirectional Transformer
+        print("Generating state plan directly from Bidirectional Transformer (diffusion bypassed)")
+        transformer_predictions = self.base_transformer(
+            initial_images=norm_img_current,  # This is current image i_0
+            initial_states=current_state_for_bidir_transformer,  # This is current state s_0
             training=False
         )
 
-        # Extract predicted states and create initial plan
-        norm_predicted_states = transformer_predictions['predicted_forward_states']
-        initial_state_plan = torch.cat(
-            [norm_state_for_bidir.unsqueeze(1), norm_predicted_states], dim=1
-        )
+        # 'predicted_forward_states' from transformer is [s_1_pred, s_2_pred, ..., s_{F-1}_pred]
+        # This is the plan of future states that _generate_actions_from_states expects.
+        transformer_predicted_future_states = transformer_predictions['predicted_forward_states']
 
-        # Truncate to diffusion horizon if needed
-        diffusion_horizon = self.state_diffusion_model.config.horizon
-        initial_state_plan = initial_state_plan[:, :diffusion_horizon, :]
+        print(
+            f"Generated state plan of shape {transformer_predicted_future_states.shape}")
 
-        # Refine plan with diffusion model
-        try:
-            refined_state_plan = self.state_diffusion_model.diffusion.refine_state_path(
-                initial_state_path=initial_state_plan,
-                observation_batch_for_cond=model_input_batch
+        # Visualize the transformer predictions (only occasionally to avoid cluttering the output directory)
+        if torch.rand(1).item() < 0.1:  # 10% chance to visualize
+            self.visualize_transformer_predictions(
+                transformer_predicted_future_states,
+                current_state_for_bidir_transformer
             )
-            print("✅ Diffusion refinement completed successfully!")
-        except RuntimeError as e:
-            print(f"Error during diffusion refinement: {e}")
-            refined_state_plan = initial_state_plan
 
-        return refined_state_plan
+        return transformer_predicted_future_states
+
+    def visualize_transformer_predictions(self, state_plan, current_state=None):
+        """
+        Visualize the transformer state predictions for debugging purposes.
+
+        Args:
+            state_plan: The state plan from transformer [batch_size, seq_len, state_dim]
+            current_state: Optional current state for reference [batch_size, state_dim]
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from pathlib import Path
+
+            # Create output directory if needed
+            output_dir = Path("outputs/viz")
+            output_dir.mkdir(exist_ok=True, parents=True)
+
+            # Convert tensors to numpy arrays
+            plan_np = state_plan.detach().cpu().numpy()
+
+            # Flatten batch dimension if it's 1
+            if plan_np.shape[0] == 1:
+                plan_np = plan_np.squeeze(0)  # [seq_len, state_dim]
+
+            # Plot state dimensions over time
+            plt.figure(figsize=(10, 5))
+
+            # Get number of state dimensions to plot (limit to first 2-4 for clarity)
+            state_dim = min(4, plan_np.shape[1])
+
+            # Plot each state dimension over time
+            for i in range(state_dim):
+                plt.plot(plan_np[:, i], label=f'State dim {i}')
+
+            if current_state is not None:
+                current_np = current_state.detach().cpu().numpy()
+                if current_np.shape[0] == 1:
+                    current_np = current_np.squeeze(0)
+                # Add points for current state
+                for i in range(state_dim):
+                    plt.scatter(0, current_np[i], marker='o', color=f'C{i}')
+
+            plt.title('Transformer State Predictions')
+            plt.xlabel('Time step')
+            plt.ylabel('State value')
+            plt.legend()
+            plt.grid(True)
+
+            # Save the plot
+            timestamp = int(time.time())
+            plt.savefig(output_dir / f'transformer_plan_{timestamp}.png')
+            print(
+                f"Saved state plan visualization to outputs/viz/transformer_plan_{timestamp}.png")
+            plt.close()
+
+        except Exception as e:
+            print(f"Failed to visualize transformer predictions: {e}")
 
     def _generate_actions_from_states(self, norm_state, state_plan):
-        """Generate actions from state plan using inverse dynamics."""
+        """
+        Generate actions from state plan using inverse dynamics.
+
+        Args:
+            norm_state: Current normalized state [batch_size, state_dim]
+            state_plan: Future state predictions from transformer [batch_size, seq_len, state_dim]
+
+        Returns:
+            Tensor of shape [batch_size, seq_len-1, action_dim] with actions to transition between states
+        """
         # Prepare state dimensions for inverse dynamics
         inv_dyn_state_dim = self.inverse_dynamics_model.o_dim
 
@@ -583,15 +497,14 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         if current_state.shape[-1] != inv_dyn_state_dim:
             current_state = current_state[:, :inv_dyn_state_dim]
 
-        # Handle different shapes of state_plan
-        # For CL-DiffPhyCon, state_plan is typically [batch_size, state_dim]
-        # For standard diffusion, state_plan is typically [batch_size, seq_len, state_dim]
+        # Handle transformer output (should already be [batch_size, seq_len, state_dim])
         plan_for_invdyn = state_plan
+        print(f"State plan shape: {plan_for_invdyn.shape}")
 
-        # Check if plan is a sequence or a single state
+        # Check if plan is just a single state rather than a sequence
         if len(plan_for_invdyn.shape) == 2:  # [batch_size, state_dim]
             print(
-                f"Plan shape is 2D: {plan_for_invdyn.shape}, expanding to sequence with len=1")
+                f"Plan is single state shape {plan_for_invdyn.shape}, expanding to sequence with len=1")
             # Make it a sequence of length 1: [batch_size, 1, state_dim]
             plan_for_invdyn = plan_for_invdyn.unsqueeze(1)
 
@@ -630,6 +543,10 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # Stack actions into sequence
         if actions_list:
-            return torch.stack(actions_list, dim=1)
+            actions = torch.stack(actions_list, dim=1)
+            print(f"Generated actions shape: {actions.shape}")
+            return actions
         else:
             return torch.zeros((norm_state.shape[0], 0, self.inverse_dynamics_model.a_dim), device=self.device)
+
+    # Other helper methods and implementations...

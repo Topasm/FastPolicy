@@ -6,7 +6,8 @@ from model.predictor.bidirectional_autoregressive_transformer import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )
-from lerobot.common.policies.normalize import Normalize
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+from lerobot.configs.types import NormalizationMode
 from lerobot.common.datasets.utils import dataset_to_policy_features
 # Import the modified BidirectionalRTDiffusionPolicy
 from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
@@ -103,12 +104,27 @@ def main():
 
     input_features = {
         "observation.state": policy_features["observation.state"],
-        "observation.image": next(iter([policy_features[k] for k in metadata.camera_keys]), None),
+        "observation.image": policy_features["observation.image"]
     }
+
     output_features = {
-        "predicted_forward_states": policy_features["observation.state"],
-        "predicted_backward_states": policy_features["observation.state"],
+        "action": policy_features["action"]
     }
+
+    norm_mapping = {}
+    for key, value in bidir_cfg.normalization_mapping.items():
+        # Convert string values to NormalizationMode enum
+        if isinstance(value, str):
+            norm_mapping[key] = NormalizationMode(value)
+        else:
+            norm_mapping[key] = value
+
+    unnormalize_action_output = Unnormalize(
+        # Use all features for unnormalization
+        output_features,
+        norm_mapping,
+        processed_dataset_stats
+    )
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
@@ -195,9 +211,10 @@ def main():
         bidirectional_transformer=transformer_model,
         state_diffusion_model=state_diffusion_model,
         inverse_dynamics_model=inv_dyn_model,
-        dataset_stats=metadata.stats,  # Pass raw metadata.stats
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
-        n_obs_steps=state_diff_cfg.n_obs_steps
+        n_obs_steps=state_diff_cfg.n_obs_steps,
+
+        dataset_stats=processed_dataset_stats,
     )
 
     # --- Environment Setup ---
@@ -245,8 +262,14 @@ def main():
             # The select_action method already returns unnormalized actions from _get_next_action
             action = combined_policy.select_action(observation_for_policy)
 
+        act = {}
+        act['action'] = action[0]  # Action is already unnormalized
+        action = unnormalize_action_output(act)
+
+        unnorm_action = action["action"]
+
         # Make sure action is on CPU before converting to numpy
-        numpy_action = action.squeeze(0).cpu().numpy()
+        numpy_action = unnorm_action.squeeze(0).cpu().numpy()
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 
