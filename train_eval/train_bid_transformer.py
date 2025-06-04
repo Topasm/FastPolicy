@@ -41,8 +41,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 1000  # Reduced for testing WandB integration
-    batch_size = 128
+    training_steps = 5000  # Reduced for testing WandB integration
+    batch_size = 512
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
     save_freq = 500  # More frequent saving for testing
