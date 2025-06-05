@@ -23,9 +23,6 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
 
-from model.diffusion.diffusion_modules import DiffusionRgbEncoder
-from model.diffusion.configuration_mymodel import DiffusionConfig
-
 
 @dataclass
 class BidirectionalARTransformerConfig:
@@ -46,7 +43,6 @@ class BidirectionalARTransformerConfig:
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
 
-    use_diffusion_encoder: bool = True
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str = "IMAGENET1K_V1"
     spatial_softmax_num_keypoints: int = 32
@@ -54,12 +50,10 @@ class BidirectionalARTransformerConfig:
     crop_shape: Optional[tuple] = None
     crop_is_random: bool = False
 
-    # Define number of query tokens for sequence structure
-    # global_history_token (1) + goal_q (1) + bwd_q (1) + fwd_q (1) = 4
-    query_seq_len: int = 4
+    # Number of pure query tokens (goal, backward, forward)
+    num_query_tokens: int = 3
 
-    # For query-based path only (no autoregressive path)
-    # HIST_COND, QUERY_GOAL, QUERY_BWD, QUERY_FWD
+    # Token types: HistStep, QueryGoal, QueryBwd, QueryFwd
     token_type_count: int = 4
 
     def to_dict(self):
@@ -146,58 +140,6 @@ class BidirectionalARTransformerConfig:
     )
 
 
-class DiffusionImageEncoder(nn.Module):
-    """Adapter for DiffusionRgbEncoder."""
-
-    def __init__(self, config: BidirectionalARTransformerConfig):
-        super().__init__()
-        self.config = config
-        diffusion_config_params = {
-            "input_features": config.input_features,
-            "output_features": config.output_features,
-            "vision_backbone": config.vision_backbone,
-            "pretrained_backbone_weights": config.pretrained_backbone_weights,
-            "spatial_softmax_num_keypoints": config.spatial_softmax_num_keypoints,
-            "use_group_norm": config.use_group_norm,
-            "crop_shape": config.crop_shape,
-            "crop_is_random": config.crop_is_random,
-            # DiffusionRgbEncoder outputs transformer_dim
-            "transformer_dim": config.hidden_dim,
-        }
-        # Ensure all required fields for DiffusionConfig are present or have defaults
-        # Add other DiffusionConfig defaults if necessary
-        required_diffusion_fields = {
-            "n_obs_steps": config.n_obs_steps, "horizon": 1, "n_action_steps": 1,  # Dummy values
-        }
-        for k, v in required_diffusion_fields.items():
-            if k not in diffusion_config_params:
-                diffusion_config_params[k] = v
-
-        try:
-            diffusion_cfg = DiffusionConfig(**diffusion_config_params)
-            self.diffusion_encoder = DiffusionRgbEncoder(diffusion_cfg)
-            self.projection = nn.Linear(
-                config.hidden_dim, config.image_latent_dim)
-            self.use_valid_encoder = True
-        except Exception as e:
-            print(
-                f"Warning: Failed to create DiffusionRgbEncoder due to missing FeatureSpec or other error: {e}. Falling back to simple CNN if available or erroring.")
-            # Will rely on simple_encoder if that path is taken by parent
-            self.use_valid_encoder = False
-            # To make this class fully standalone even in error, we might init simple_encoder here too.
-            # For now, assuming parent class (BidirectionalARTransformer) handles the fallback.
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        if not self.use_valid_encoder:
-            raise RuntimeError(
-                "DiffusionImageEncoder was not properly initialized.")
-        # Heuristic for [-1, 1] range
-        if images.min() < 0 and images.max() <= 1:
-            images = (images + 1.0) / 2.0
-        features = self.diffusion_encoder(images)
-        return self.projection(features)
-
-
 class ImageEncoder(nn.Module):  # Original Simple CNN Encoder
     def __init__(self, config: BidirectionalARTransformerConfig):
         super().__init__()
@@ -256,27 +198,9 @@ class BidirectionalARTransformer(nn.Module):
         from lerobot.configs.types import FeatureType
         self.feature_type = FeatureType  # For potential use, not directly used now
 
-        # config.use_diffusion_encoder 값에 따라 image_encoder 결정
-        if config.use_diffusion_encoder:
-            try:
-                print("Attempting to initialize DiffusionImageEncoder...")
-                self.image_encoder = DiffusionImageEncoder(config)
-                if not getattr(self.image_encoder, 'use_valid_encoder', False):
-                    print(
-                        "Warning: DiffusionImageEncoder indicated it's not valid. Forcing fallback to simple ImageEncoder in BDAT __init__.")
-                    raise ValueError(
-                        "DiffusionImageEncoder internal fallback or failure during its __init__.")
-                print(
-                    "Successfully initialized DiffusionImageEncoder in BidirectionalARTransformer.")
-            except Exception as e:
-                print(
-                    f"Failed to initialize DiffusionImageEncoder in BidirectionalARTransformer __init__: {e}")
-                print(
-                    "Falling back to simple ImageEncoder in BidirectionalARTransformer __init__.")
-                self.image_encoder = ImageEncoder(config)
-        else:
-            print("config.use_diffusion_encoder is False. Using simple ImageEncoder in BidirectionalARTransformer.")
-            self.image_encoder = ImageEncoder(config)
+        # Use simple ImageEncoder
+        print("Using ImageEncoder in BidirectionalARTransformer.")
+        self.image_encoder = ImageEncoder(config)
 
         self.image_decoder = ImageDecoder(config)
 
@@ -285,30 +209,30 @@ class BidirectionalARTransformer(nn.Module):
         self.image_latent_projection = nn.Linear(
             config.image_latent_dim, config.hidden_dim)
 
-        # Projector for the flattened history vector
-        flat_history_dim = config.n_obs_steps * \
-            (config.image_latent_dim + config.hidden_dim)
-        self.history_to_global_condition_projector = nn.Linear(
-            flat_history_dim, config.hidden_dim)
+        # 각 이력 스텝의 (이미지 잠재값 + 상태 임베딩)을 hidden_dim으로 투영하는 레이어
+        self.history_step_feature_dim = config.image_latent_dim + config.hidden_dim
+        self.history_step_projector = nn.Linear(
+            self.history_step_feature_dim, config.hidden_dim)
 
-        # Define token type indices for the query-based path
-        # These token types are used to help the model distinguish between different
-        # token roles, improving performance through role-aware attention
-
-        # Token type constants for query path
-        self.TYPE_HIST_COND = 0   # History condition token
-        self.TYPE_QUERY_GOAL = 1  # Goal query token for generating goal image
-        # Backward trajectory query token for generating backward states
+        # 토큰 타입 임베딩 (예: 0:HistStep, 1:QueryGoal, 2:QueryBwd, 3:QueryFwd)
+        # config.token_type_count 사용 (현재는 4로 하드코딩된 것과 유사)
+        self.NUM_QUERY_TYPES = 3  # Goal, Bwd, Fwd queries
+        self.TYPE_HIST_STEP = 0
+        self.TYPE_QUERY_GOAL = 1
         self.TYPE_QUERY_BWD = 2
-        self.TYPE_QUERY_FWD = 3   # Forward trajectory query token for generating forward states
+        self.TYPE_QUERY_FWD = 3
 
-        # Token type embeddings - we only need 4 types now (simplified from previous design)
-        self.token_type_embedding = nn.Embedding(
-            4, config.hidden_dim)  # Simplified: only need 4 token types for query path
+        # Calculate total sequence length for transformer
+        self.total_seq_len = config.n_obs_steps + self.NUM_QUERY_TYPES
 
-        # Position embeddings for the query sequence structure (length config.query_seq_len)
+        # 실제 Embedding 크기는 사용될 타입의 총 개수 (여기서는 4)
+        self.token_type_embedding = nn.Embedding(4, config.hidden_dim)
+
+        # 위치 임베딩: 전체 시퀀스 길이에 맞춰야 함 (n_obs_steps + 3개의 쿼리 토큰)
+        # config.query_seq_len을 순수 쿼리 토큰 수 (3)으로 해석하고, 전체 길이는 동적 계산
+        self.num_queries = 3  # goal, bwd, fwd
         self.position_embedding = nn.Embedding(
-            config.query_seq_len, config.hidden_dim)
+            self.total_seq_len, config.hidden_dim)
 
         self.goal_image_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
@@ -317,6 +241,7 @@ class BidirectionalARTransformer(nn.Module):
         self.forward_seq_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
 
+        # Output heads remain unchanged
         self.forward_state_head = nn.Linear(
             config.hidden_dim, (config.forward_steps - 1) * config.state_dim)
         self.goal_image_latent_head = nn.Linear(
@@ -333,8 +258,6 @@ class BidirectionalARTransformer(nn.Module):
             encoder_layer, num_layers=config.num_layers,
             norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
         )
-
-        # No AR-specific output heads needed for query-only approach
 
         self.apply(self._init_weights)
 
@@ -355,157 +278,170 @@ class BidirectionalARTransformer(nn.Module):
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
-    def _create_sequential_attention_mask(self, device: torch.device) -> torch.Tensor:
+    def _create_full_history_sequential_mask(self, device: torch.device) -> torch.Tensor:
         """
-        Creates a custom attention mask for the query-based sequence.
+        Creates a custom attention mask for the new sequence structure.
 
-        The query path has a specific conditional information flow:
+        The sequence now consists of:
+        [Hist_1, Hist_2, ..., Hist_n, Goal_Q, Bwd_Q, Fwd_Q]
+
+        With the following attention pattern:
         - Each token can attend to itself
-        - Goal query attends to history condition
-        - Backward query attends to history condition and goal query
-        - Forward query attends to all previous tokens
-
-        This creates a directed sequence of information flow:
-        History → Goal → Backward → Forward
-
-        Token sequence structure: [HistCond, Q_goal, Q_bwd, Q_fwd] (length 4)
-        Indices:                    0         1       2       3
+        - All tokens can attend to history tokens
+        - Goal query can only attend to history
+        - Backward query can attend to history and goal query
+        - Forward query can attend to all previous tokens
         """
-        seq_len = self.config.query_seq_len  # Should be 4
-        # Initialize a mask where True = cannot attend (will be masked out)
+        n_obs = self.config.n_obs_steps
+        num_queries = 3  # Goal, Bwd, Fwd
+        seq_len = n_obs + num_queries
+
         mask = torch.ones(seq_len, seq_len, dtype=torch.bool,
                           device=device)  # True = cannot attend
-        mask.fill_diagonal_(False)  # Allow tokens to attend to themselves
+        mask.fill_diagonal_(False)  # Attend to self
 
-        # Q_goal (idx 1) can attend to HistCond (idx 0)
-        mask[1, 0] = False
+        # 1. 이력 토큰들 간의 어텐션: 여기서는 간단히 인과적으로 설정 (또는 모두 False로 하여 전체 어텐션)
+        for i in range(n_obs):
+            mask[i, i+1:n_obs] = True  # H_i는 H_j (j>i)에 어텐션 불가 (인과적)
+            # 또는 이 부분을 mask[i, :i+1] = False 로 하여 H_i가 H_0..H_i에 어텐션하도록 할 수 있음
+            # Seer처럼 전체 이력을 한 번에 처리하려면 이력 내에서는 서로 다 볼 수 있게 할 수도:
+            # mask[0:n_obs, 0:n_obs] = False (대각선 제외하고는 다 False)
+            # 여기서는 각 이력 토큰이 이전 이력 토큰만 보도록 인과적으로 설정
+            if i > 0:
+                mask[i, 0:i] = False
 
-        # Q_bwd (idx 2) can attend to HistCond (idx 0), Q_goal (idx 1)
-        mask[2, 0:2] = False
+        # 2. 모든 쿼리 토큰은 모든 이력 토큰에 어텐션 가능
+        mask[n_obs:, :n_obs] = False
 
-        # Q_fwd (idx 3) can attend to HistCond (idx 0), Q_goal (idx 1), Q_bwd (idx 2)
-        mask[3, 0:3] = False
+        # 3. 쿼리 토큰들 간의 순차적 의존성
+        # Q_goal (idx n_obs)은 이력에만 의존 (이미 위에서 설정됨)
+
+        # Q_bwd (idx n_obs + 1)은 이력 및 Q_goal(n_obs)에 어텐션 가능
+        mask[n_obs + 1, n_obs] = False
+
+        # Q_fwd (idx n_obs + 2)은 이력, Q_goal(n_obs), Q_bwd(n_obs + 1)에 어텐션 가능
+        mask[n_obs + 2, n_obs: n_obs + 2] = False
+
         return mask
 
-    def _forward_training_with_global_cond(
+    def _forward_training_with_sequential_history(
         self,
-        global_history_condition_emb: torch.Tensor,  # [B, hidden_dim]
-        forward_states_gt: torch.Tensor,    # [B, forward_steps, state_dim]
-        # [B, C, H, W] (raw, for encoder to get target latent)
+        history_tokens: torch.Tensor,  # [B, n_obs_steps, hidden_dim]
+        forward_states_gt: torch.Tensor,
         goal_images_gt: torch.Tensor,
-        backward_states_gt: torch.Tensor,   # [B, backward_steps, state_dim]
+        backward_states_gt: torch.Tensor,
         device: torch.device
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for training using only the query-based path.
-
-        Uses global history condition embedding to generate predictions for:
-        - Goal image
-        - Backward trajectory states
-        - Forward trajectory states
+        Forward pass for training using observation history tokens directly.
         """
-        batch_size = global_history_condition_emb.shape[0]
+        batch_size = history_tokens.shape[0]
+        n_obs = self.config.n_obs_steps
         results = {}
 
-        # Create the query-based sequence
-        history_cond_token = global_history_condition_emb.unsqueeze(
-            1)  # [B, 1, D]
+        # Prepare query tokens
         goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
         bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
         fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
 
         # Concatenate tokens to form the input sequence
-        query_input_sequence = torch.cat(
-            [history_cond_token, goal_query, bwd_query, fwd_query], dim=1)
+        # [B, n_obs_steps + 3, hidden_dim]
+        input_sequence = torch.cat(
+            [history_tokens, goal_query, bwd_query, fwd_query], dim=1)
 
         # Add token type embeddings
-        query_token_types = torch.tensor(
-            [self.TYPE_HIST_COND, self.TYPE_QUERY_GOAL,
-             self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD],
+        # First n_obs positions are history steps
+        hist_types = torch.full((batch_size, n_obs), self.TYPE_HIST_STEP,
+                                device=device, dtype=torch.long)
+
+        # Last 3 positions are query tokens
+        query_types = torch.tensor(
+            [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD],
             device=device
         ).unsqueeze(0).expand(batch_size, -1)
-        query_input_sequence += self.token_type_embedding(query_token_types)
+
+        all_token_types = torch.cat([hist_types, query_types], dim=1)
+        input_sequence += self.token_type_embedding(all_token_types)
 
         # Add position embeddings
-        query_positions = torch.arange(
-            self.config.query_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        query_input_sequence += self.position_embedding(query_positions)
+        positions = torch.arange(self.total_seq_len, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        input_sequence += self.position_embedding(positions)
 
         # Apply attention mask and run through transformer
-        query_attn_mask = self._create_sequential_attention_mask(device)
-        hidden_states = self.transformer(
-            src=query_input_sequence, mask=query_attn_mask)
+        attn_mask = self._create_full_history_sequential_mask(device)
+        hidden_states = self.transformer(src=input_sequence, mask=attn_mask)
 
-        # Extract hidden states for each prediction head
-        goal_hidden = hidden_states[:, 1]  # Goal query position
-        bwd_hidden = hidden_states[:, 2]   # Backward query position
-        fwd_hidden = hidden_states[:, 3]    # Forward query position
+        # Extract query outputs for predictions
+        goal_hidden = hidden_states[:, n_obs]      # Goal query position
+        bwd_hidden = hidden_states[:, n_obs+1]     # Backward query position
+        fwd_hidden = hidden_states[:, n_obs+2]     # Forward query position
 
-        # Generate predictions
+        # Generate predictions (unchanged)
         results['predicted_goal_latents'] = self.goal_image_latent_head(
             goal_hidden)
         results['predicted_goal_images'] = self.image_decoder(
             results['predicted_goal_latents'])
 
-        # Predict backward states
         bwd_flat = self.backward_state_head(bwd_hidden)
         results['predicted_backward_states'] = bwd_flat.view(
             batch_size, self.config.backward_steps, self.config.state_dim)
 
-        # Predict forward states
         fwd_flat = self.forward_state_head(fwd_hidden)
         results['predicted_forward_states'] = fwd_flat.view(
             batch_size, self.config.forward_steps - 1, self.config.state_dim)
 
         return results
 
-    def _forward_inference_with_global_cond(self, global_history_condition_emb: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
-        """
-        Implementation of the query-based inference path with global history conditioning.
-
-        This method creates a sequence with the global history condition followed by query tokens
-        for goal image, backward trajectory, and forward trajectory prediction.
-
-        The sequence structure is:
-        [HistoryCondition, GoalQuery, BackwardQuery, ForwardQuery]
-
-        Each token is assigned a specific token type to help the model distinguish between roles.
-        """
-        batch_size = global_history_condition_emb.shape[0]
+    def _forward_inference_with_sequential_history(self,
+                                                   # [B, n_obs, hidden_dim]
+                                                   history_step_embeddings: torch.Tensor,
+                                                   device: torch.device
+                                                   ) -> Dict[str, torch.Tensor]:
+        batch_size = history_step_embeddings.shape[0]
+        n_obs = self.config.n_obs_steps
+        num_queries = 3  # Goal, Bwd, Fwd
         results = {}
 
-        # Prepare the input token sequence
-        history_cond_token = global_history_condition_emb.unsqueeze(
-            1)  # [B, 1, hidden_dim]
-        goal_query = self.goal_image_query_token.expand(
-            batch_size, -1, -1)  # [B, 1, hidden_dim]
-        bwd_query = self.backward_seq_query_token.expand(
-            batch_size, -1, -1)  # [B, 1, hidden_dim]
-        fwd_query = self.forward_seq_query_token.expand(
-            batch_size, -1, -1)   # [B, 1, hidden_dim]
+        # 1. 쿼리 토큰들 준비
+        goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
+        bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
+        fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
 
-        query_input_sequence = torch.cat(
-            [history_cond_token, goal_query, bwd_query, fwd_query], dim=1)
+        # 2. 전체 시퀀스 구성: [이력스텝들, 목표쿼리, 역방향쿼리, 순방향쿼리]
+        # history_step_embeddings: [B, n_obs, D]
+        # goal_query, bwd_query, fwd_query: [B, 1, D]
+        full_sequence = torch.cat(
+            [history_step_embeddings, goal_query, bwd_query, fwd_query], dim=1
+        )  # Shape: [B, n_obs + num_queries, hidden_dim]
 
-        # Use the defined token type indices for inference
-        query_token_types = torch.tensor(
-            [self.TYPE_HIST_COND, self.TYPE_QUERY_GOAL,
-                self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD],
-            device=device
-        ).unsqueeze(0).expand(batch_size, -1)
-        query_input_sequence += self.token_type_embedding(query_token_types)
+        # 3. 토큰 타입 임베딩 적용
+        hist_types = torch.full((batch_size, n_obs),
+                                self.TYPE_HIST_STEP, device=device)
+        query_types_list = [self.TYPE_QUERY_GOAL,
+                            self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD]
+        query_types = torch.tensor(query_types_list, device=device).unsqueeze(
+            0).expand(batch_size, -1)
 
-        query_positions = torch.arange(
-            self.config.query_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        query_input_sequence += self.position_embedding(query_positions)
+        all_token_types = torch.cat([hist_types, query_types], dim=1)
+        full_sequence += self.token_type_embedding(all_token_types)
 
-        attn_mask = self._create_sequential_attention_mask(device)
-        hidden_states = self.transformer(
-            src=query_input_sequence, mask=attn_mask)
+        # 4. 위치 임베딩 적용
+        positions = torch.arange(full_sequence.shape[1], device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        # self.position_embedding 크기 확인/조정 필요
+        full_sequence += self.position_embedding(positions)
 
-        goal_query_output = hidden_states[:, 1]
-        bwd_query_output = hidden_states[:, 2]
-        fwd_query_output = hidden_states[:, 3]
+        # 5. 새로운 어텐션 마스크 적용
+        attn_mask = self._create_full_history_sequential_mask(device)
+
+        # 6. 트랜스포머 통과
+        hidden_states = self.transformer(src=full_sequence, mask=attn_mask)
+
+        # 7. 예측 헤드 사용 (쿼리 토큰들의 인덱스는 이제 n_obs 부터 시작)
+        goal_query_output = hidden_states[:, n_obs]
+        bwd_query_output = hidden_states[:, n_obs + 1]
+        fwd_query_output = hidden_states[:, n_obs + 2]
 
         predicted_goal_latents = self.goal_image_latent_head(goal_query_output)
         results['predicted_goal_images'] = self.image_decoder(
@@ -525,26 +461,28 @@ class BidirectionalARTransformer(nn.Module):
 
     def forward(
         self,
-        initial_images: torch.Tensor,
-        initial_states: torch.Tensor,
-        forward_states: Optional[torch.Tensor] = None,
-        goal_images: Optional[torch.Tensor] = None,
-        backward_states: Optional[torch.Tensor] = None,
+        initial_images: torch.Tensor,  # Shape: [B, n_obs_steps, C, H, W]
+        initial_states: torch.Tensor,  # Shape: [B, n_obs_steps, state_dim]
+        forward_states: Optional[torch.Tensor] = None,  # GT for training
+        goal_images: Optional[torch.Tensor] = None,     # GT for training
+        backward_states: Optional[torch.Tensor] = None,  # GT for training
         training: bool = True
     ) -> Dict[str, torch.Tensor]:
         device = initial_images.device
         batch_size = initial_images.shape[0]
         n_obs = self.config.n_obs_steps
 
-        img_hist_flat = initial_images.view(
-            batch_size * n_obs, self.config.image_channels, self.config.image_size, self.config.image_size
+        # 1. 과거 이력의 각 스텝별 특징 추출
+        img_hist_flat = initial_images.reshape(
+            batch_size * n_obs, self.config.image_channels,
+            self.config.image_size, self.config.image_size
         )
         img_latents_per_step_flat = self.image_encoder(img_hist_flat)
         img_latents_history = img_latents_per_step_flat.view(
             batch_size, n_obs, self.config.image_latent_dim
         )
 
-        states_hist_flat = initial_states.view(
+        states_hist_flat = initial_states.reshape(
             batch_size * n_obs, self.config.state_dim)
         states_projected_per_step_flat = self.state_projection(
             states_hist_flat)
@@ -552,61 +490,36 @@ class BidirectionalARTransformer(nn.Module):
             batch_size, n_obs, self.config.hidden_dim
         )
 
-        # Combine image latents and state projections for each timestep
-        combined_history_per_step = torch.cat(
-            [img_latents_history, states_projected_history], dim=-1)
+        # 2. 각 이력 스텝별 (이미지 잠재값 + 상태 임베딩) 결합 후 hidden_dim으로 투영
+        combined_history_features_per_step = torch.cat(
+            [img_latents_history, states_projected_history], dim=-1
+        )  # Shape: [B, n_obs, image_latent_dim + hidden_dim]
 
-        # Flatten the entire history into a single vector
-        # This is the key step for global history conditioning - we compress
-        # multiple observation steps into a single conditioning vector
-        flat_history_vector = combined_history_per_step.flatten(start_dim=1)
+        # history_step_embeddings: [B, n_obs, hidden_dim]
+        history_step_embeddings = self.history_step_projector(
+            combined_history_features_per_step)
 
-        # Project the flattened history to the model's hidden dimension
-        # This creates a single global condition embedding that captures all history information
-        global_history_condition_embedding = self.history_to_global_condition_projector(
-            flat_history_vector)
-
+        # 이제 history_step_embeddings를 사용하여
+        # _forward_training_with_global_cond 또는 _forward_inference_with_sequential_history 호출
         if training:
             if forward_states is None or goal_images is None or backward_states is None:
-                raise ValueError(
-                    "Ground truth forward_states, goal_images, and backward_states must be provided for training.")
-            results = self._forward_training_with_global_cond(
-                global_history_condition_embedding,
-                forward_states,  # GT for forward path
-                # GT for goal image (will be encoded to latent for AR)
+                raise ValueError("Ground truth needed for training.")
+            results = self._forward_training_with_sequential_history(
+                history_step_embeddings,  # [B, n_obs, hidden_dim]
+                forward_states,
                 goal_images,
-                backward_states,  # GT for backward path
+                backward_states,
                 device
             )
         else:  # Inference
-            results = self._forward_inference_with_global_cond(
-                global_history_condition_embedding, device)
+            results = self._forward_inference_with_sequential_history(history_step_embeddings,  # [B, n_obs, hidden_dim]
+                                                                      device)
 
         return results
 
-    @classmethod
-    def from_pretrained(cls, path, device=None, **kwargs):  # Standard from_pretrained
-        path = Path(path)
-        config_path = path / "config.json"
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        config = BidirectionalARTransformerConfig(**config_dict)
-        model = cls(config=config, **kwargs)
-        model_path = path / "model_final.pth"
-        if not model_path.exists():
-            candidates = list(path.glob("*.pth"))
-            if candidates:
-                model_path = candidates[0]
-                print(f"Using model checkpoint: {model_path}")
-        state_dict = torch.load(model_path, map_location=torch.device(
-            'cpu') if device is None else device)
-        model.load_state_dict(state_dict)
-        if device is not None:
-            model = model.to(device)
-        return model
-
 
 def compute_loss(
+    # 여기서 'BidirectionalARTransformer'는 타입 힌트입니다.
     model: 'BidirectionalARTransformer',
     predictions: Dict[str, torch.Tensor],
     targets: Dict[str, torch.Tensor]
@@ -614,8 +527,9 @@ def compute_loss(
     """
     Compute losses for the query-based path outputs.
 
-    With the removal of the autoregressive path, we only compute losses
-    for the query path predictions.
+    This version assumes the autoregressive path has been removed or is not
+    directly producing outputs named 'predicted_...' for AR-specific losses.
+    It focuses on the outputs from the query-based mechanism.
     """
     losses = {}
 
@@ -639,6 +553,7 @@ def compute_loss(
     # Latent consistency for goal image
     if 'predicted_goal_latents' in predictions and 'goal_images' in targets:
         with torch.no_grad():
+            # model.image_encoder is now always a single-frame encoder
             goal_image_latents_gt = model.image_encoder(targets['goal_images'])
         losses['goal_latent_consistency_loss'] = F.mse_loss(
             predictions['predicted_goal_latents'], goal_image_latents_gt)
@@ -647,11 +562,12 @@ def compute_loss(
     weights = {
         'forward_state_loss': 1.0,
         'backward_state_loss': 1.0,
-        'goal_image_loss': 2.0,
+        'goal_image_loss': 2.0,          # 목표 이미지 예측에 더 큰 가중치
         'goal_latent_consistency_loss': 1.0,
     }
     total_loss = torch.tensor(
         0.0, device=predictions[next(iter(predictions))].device)
+
     for loss_name, loss_value in losses.items():
         if loss_name in weights and loss_value is not None:  # Check for None
             total_loss += weights.get(loss_name, 1.0) * loss_value

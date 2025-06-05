@@ -128,9 +128,7 @@ def main():
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
-    # Force disable diffusion encoder to ensure compatibility with trained weights
-    bidir_cfg.use_diffusion_encoder = True
-    print("Explicitly setting use_diffusion_encoder=False to match training configuration")
+    print("Using default image encoder configuration")
 
     transformer_model = BidirectionalARTransformer(
         config=bidir_cfg,

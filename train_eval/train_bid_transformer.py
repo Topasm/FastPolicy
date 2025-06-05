@@ -41,8 +41,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 5000  # Reduced for testing WandB integration
-    batch_size = 512
+    training_steps = 2000  # Reduced for testing WandB integration
+    batch_size = 1024
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
     save_freq = 500  # More frequent saving for testing
@@ -135,8 +135,6 @@ def main():
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features,  # Pass the actual FeatureSpec objects
-        # Enable diffusion encoder
-        use_diffusion_encoder=True,
         vision_backbone="resnet18",
         pretrained_backbone_weights="IMAGENET1K_V1",
         spatial_softmax_num_keypoints=32,

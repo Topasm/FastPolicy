@@ -233,12 +233,12 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         processed_obs = self._preprocess_observation(raw_obs)
         normalized_obs = self._normalize_observation(processed_obs)
 
-        self._queues = populate_queues(
-            self._queues, normalized_obs)
-        # Generate new action plan only when the action queue is empty
-        if len(self._queues["action"]) == 0:
-            # Check if we have enough history to make a prediction
-            required_obs = self.config.n_obs_steps
+        # Update observation queues with new observation
+        self._queues = populate_queues(self._queues, normalized_obs)
+
+        # Modified replanning trigger: only generate new plan when action queue is empty
+        if not self._action_execution_queue:
+            required_obs = self.n_obs_steps
             if len(self._queues["observation.state"]) < required_obs:
                 print(
                     f"Warning: Not enough history in queues. Have {len(self._queues['observation.state'])}, need {required_obs}")
@@ -254,42 +254,36 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                         item, torch.Tensor) else item for item in queue]
                     model_input_batch[key] = torch.stack(queue_list, dim=1)
 
-        # If we already have actions queued, return the next one
-        if self._action_execution_queue:
-            return self._get_next_action()
+            # Get the last state in the sequence
+            norm_state = model_input_batch["observation.state"][:, -1, :]
 
-        # Get the last state in the sequence
-        norm_state = model_input_batch["observation.state"][:, -1, :]
+            # Generate state plan using only the transformer (diffusion bypassed)
+            transformer_state_plan = self._generate_state_plan(
+                model_input_batch)
 
-        # Generate state plan using only the transformer (diffusion bypassed)
-        transformer_state_plan = self._generate_state_plan(model_input_batch)
+            # Log state plan details for debugging
+            print(f"Transformer state plan: min={transformer_state_plan.min().item():.4f}, "
+                  f"max={transformer_state_plan.max().item():.4f}, "
+                  f"mean={transformer_state_plan.mean().item():.4f}")
 
-        # Log state plan details for debugging
-        print(f"Transformer state plan: min={transformer_state_plan.min().item():.4f}, "
-              f"max={transformer_state_plan.max().item():.4f}, "
-              f"mean={transformer_state_plan.mean().item():.4f}")
+            # Generate actions using inverse dynamics directly from transformer predictions
+            actions = self._generate_actions_from_states(
+                norm_state, transformer_state_plan)
 
-        # Generate actions using inverse dynamics directly from transformer predictions
-        actions = self._generate_actions_from_states(
-            norm_state, transformer_state_plan)
+            # Queue up actions for execution
+            for i in range(actions.shape[1]):
+                self._action_execution_queue.append(actions[0, i, :])
 
-        # Queue up actions for execution
-        for i in range(actions.shape[1]):
-            # Store each action as a tensor of shape [action_dim], not [batch_size, action_dim]
-            # This way the queue contains simple action vectors
-            self._action_execution_queue.append(
-                actions[0, i, :])  # Assuming batch_size=1
+            # Print queue size for debugging
+            print(
+                f"Queued {len(self._action_execution_queue)} actions for execution")
 
-        # Print queue size for debugging
-        print(
-            f"Queued {len(self._action_execution_queue)} actions for execution")
-
-        # Return the first action
+        # Get next action from queue
         if self._action_execution_queue:
             return self._get_next_action()
         else:
             # Create zero action directly
-            batch_size = norm_state.shape[0]
+            batch_size = 1  # Default for inference
             action_dim = getattr(self.inverse_dynamics_model, 'a_dim',
                                  getattr(self.config.action_feature, 'shape', [2])[0])
             return torch.zeros((batch_size, action_dim), device=self.device)
