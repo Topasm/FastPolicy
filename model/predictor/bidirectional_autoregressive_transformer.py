@@ -40,7 +40,7 @@ class BidirectionalARTransformerConfig:
     image_size: int = 96
     forward_steps: int = 20
     backward_steps: int = 16
-    n_obs_steps: int = 2  # Number of observation steps in history
+    n_obs_steps: int = 3  # Number of observation steps in history
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
 

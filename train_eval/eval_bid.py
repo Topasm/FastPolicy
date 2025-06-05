@@ -134,24 +134,6 @@ def main():
     transformer_model.eval()
     transformer_model.to(device)
 
-    # --- Load State Prediction Diffusion Model (CLDiffPhyConModel) ---
-    state_diffusion_config_json_path = state_diffusion_output_dir / "config.json"
-    if not state_diffusion_config_json_path.is_file():
-        raise OSError(
-            f"State Diffusion config JSON not found at {state_diffusion_config_json_path}")
-    print(
-        f"Loading State Diffusion configuration from directory: {state_diffusion_output_dir}")
-
-    state_diff_ckpt_path = state_diffusion_output_dir / "model_final.pth"
-    if not state_diff_ckpt_path.is_file():
-        raise OSError(
-            f"State Diffusion checkpoint not found at {state_diff_ckpt_path}")
-
-    print(f"Loading State Diffusion model from: {state_diff_ckpt_path}")
-    checkpoint_statediff = torch.load(state_diff_ckpt_path, map_location="cpu")
-    model_state_dict_statediff = checkpoint_statediff.get(
-        "model_state_dict", checkpoint_statediff)
-
     # --- Load Inverse Dynamics Model (MlpInvDynamic) ---
     invdyn_o_dim = metadata.features["observation.state"]["shape"][-1]
     invdyn_a_dim = metadata.features["action"]["shape"][-1]
@@ -184,7 +166,7 @@ def main():
         bidirectional_transformer=transformer_model,
         inverse_dynamics_model=inv_dyn_model,
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
-        n_obs_steps=2,
+        n_obs_steps=3,
         dataset_stats=processed_dataset_stats,
         output_features=output_features,
     )

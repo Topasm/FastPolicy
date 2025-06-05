@@ -246,72 +246,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         print(
             f"Generated state plan of shape {transformer_predicted_future_states.shape}")
 
-        # Visualize the transformer predictions (only occasionally to avoid cluttering the output directory)
-        if torch.rand(1).item() < 0.1:  # 10% chance to visualize
-            self.visualize_transformer_predictions(
-                transformer_predicted_future_states,
-                current_state_for_bidir_transformer
-            )
-
         return transformer_predicted_future_states
-
-    def visualize_transformer_predictions(self, state_plan, current_state=None):
-        """
-        Visualize the transformer state predictions for debugging purposes.
-
-        Args:
-            state_plan: The state plan from transformer [batch_size, seq_len, state_dim]
-            current_state: Optional current state for reference [batch_size, state_dim]
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            from pathlib import Path
-
-            # Create output directory if needed
-            output_dir = Path("outputs/viz")
-            output_dir.mkdir(exist_ok=True, parents=True)
-
-            # Convert tensors to numpy arrays
-            plan_np = state_plan.detach().cpu().numpy()
-
-            # Flatten batch dimension if it's 1
-            if plan_np.shape[0] == 1:
-                plan_np = plan_np.squeeze(0)  # [seq_len, state_dim]
-
-            # Plot state dimensions over time
-            plt.figure(figsize=(10, 5))
-
-            # Get number of state dimensions to plot (limit to first 2-4 for clarity)
-            state_dim = min(4, plan_np.shape[1])
-
-            # Plot each state dimension over time
-            for i in range(state_dim):
-                plt.plot(plan_np[:, i], label=f'State dim {i}')
-
-            if current_state is not None:
-                current_np = current_state.detach().cpu().numpy()
-                if current_np.shape[0] == 1:
-                    current_np = current_np.squeeze(0)
-                # Add points for current state
-                for i in range(state_dim):
-                    plt.scatter(0, current_np[i], marker='o', color=f'C{i}')
-
-            plt.title('Transformer State Predictions')
-            plt.xlabel('Time step')
-            plt.ylabel('State value')
-            plt.legend()
-            plt.grid(True)
-
-            # Save the plot
-            timestamp = int(time.time())
-            plt.savefig(output_dir / f'transformer_plan_{timestamp}.png')
-            print(
-                f"Saved state plan visualization to outputs/viz/transformer_plan_{timestamp}.png")
-            plt.close()
-
-        except Exception as e:
-            print(f"Failed to visualize transformer predictions: {e}")
 
     def _generate_actions_from_states(self, state_plan):
         """
@@ -320,73 +255,38 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         Args:
             state_plan: State predictions from transformer [batch_size, seq_len, state_dim]
                        where the first state (index 0) is the current state
+            start: Starting index for state plan slicing (default: 0)
+            end: Ending index for state plan slicing (default: 8)
 
         Returns:
-            Tensor of shape [batch_size, seq_len-1, action_dim] with actions to transition between states
+            Tensor of shape [batch_size, seq_len-1, action_dim] with actions
         """
-        # Extract current state from the first element of state_plan
-        current_state = state_plan[:, 0, :]
 
-        # The rest of state_plan (from index 1 onward) contains future states
+        start = 0
+        end = 15
+        # Slice the state plan to use only the specified range
+        state_plan = state_plan[:, start:end, :]
+
+        # Extract current state and future states
+        current_state = state_plan[:, 0, :]
         future_states = state_plan[:, 1:, :]
 
-        # Prepare state dimensions for inverse dynamics
-        inv_dyn_state_dim = self.inverse_dynamics_model.o_dim
-
-        # Adjust current state if needed
-        if current_state.shape[-1] != inv_dyn_state_dim:
-            current_state = current_state[:, :inv_dyn_state_dim]
-
-        # Handle transformer output
-        plan_for_invdyn = future_states
-        print(f"Future states shape: {plan_for_invdyn.shape}")
-
-        # Check if plan is just a single state rather than a sequence
-        if len(plan_for_invdyn.shape) == 2:  # [batch_size, state_dim]
-            print(
-                f"Plan is single state shape {plan_for_invdyn.shape}, expanding to sequence with len=1")
-            # Make it a sequence of length 1: [batch_size, 1, state_dim]
-            plan_for_invdyn = plan_for_invdyn.unsqueeze(1)
-
-        # Adjust dimensions if needed
-        if plan_for_invdyn.shape[-1] != inv_dyn_state_dim:
-            if plan_for_invdyn.shape[-1] < inv_dyn_state_dim:
-                # Pad if too small
-                padding_size = inv_dyn_state_dim - plan_for_invdyn.shape[-1]
-                padding = torch.zeros(
-                    plan_for_invdyn.shape[0],
-                    plan_for_invdyn.shape[1],
-                    padding_size,
-                    device=self.device
-                )
-                plan_for_invdyn = torch.cat([plan_for_invdyn, padding], dim=-1)
-            else:
-                # Truncate if too large
-                plan_for_invdyn = plan_for_invdyn[:, :, :inv_dyn_state_dim]
-
-        # Check if we have a valid plan
-        num_planned_states = plan_for_invdyn.shape[1]
-        if num_planned_states == 0:
-            print("No planned states available")
-            return torch.zeros((current_state.shape[0], 0, self.inverse_dynamics_model.a_dim), device=self.device)
+        # Number of steps to generate actions for
+        n_action_steps = future_states.shape[1]
 
         # Generate actions from state pairs
         actions_list = []
-        current_state_t = current_state
+        current_s = current_state
 
-        for i in range(num_planned_states):
-            next_state = plan_for_invdyn[:, i, :]
-            state_pair = torch.cat([current_state_t, next_state], dim=-1)
+        for i in range(n_action_steps):
+            next_s = future_states[:, i]
+            # Create state pair (s_t, s_{t+1})
+            state_pair = torch.cat([current_s, next_s], dim=-1)
+            # Predict action a_t that transitions from s_t to s_{t+1}
             action_i = self.inverse_dynamics_model(state_pair)
             actions_list.append(action_i)
-            current_state_t = next_state
+            # Update current state for next iteration
+            current_s = next_s
 
-        # Stack actions into sequence
-        if actions_list:
-            actions = torch.stack(actions_list, dim=1)
-            print(f"Generated actions shape: {actions.shape}")
-            return actions
-        else:
-            return torch.zeros((current_state.shape[0], 0, self.inverse_dynamics_model.a_dim), device=self.device)
-
-    # Other helper methods and implementations...
+        # Stack actions into a sequence
+        return torch.stack(actions_list, dim=1)
