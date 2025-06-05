@@ -37,6 +37,20 @@ def main():
     # --- Load Dataset Metadata for normalization statistics ---
     print("Loading dataset metadata for normalization...")
     metadata = LeRobotDatasetMetadata("lerobot/pusht")
+
+    # Get features for normalization
+    # Convert raw feature dictionaries to PolicyFeature objects
+    policy_features = dataset_to_policy_features(metadata.features)
+
+    input_features = {
+        "observation.state": policy_features["observation.state"],
+        "observation.image": policy_features["observation.image"]
+    }
+
+    output_features = {
+        "action": policy_features["action"]
+    }
+
     processed_dataset_stats = {}
     for key, value_dict in metadata.stats.items():
         processed_dataset_stats[key] = {}
@@ -84,8 +98,9 @@ def main():
             image_channels=image_channels_from_meta,  # This should match training
             forward_steps=16,  # This should match training
             backward_steps=16,
-            input_features=metadata.features,  # Pass features for potential use in config
-            output_features={},  # Bidir model defines its own outputs conceptually
+            input_features=input_features,  # Pass features for potential use in config
+            # Bidir model defines its own outputs conceptually
+            output_features=output_features,
         )
         print(
             f"Using state_dim={bidir_cfg.state_dim}, image_channels={bidir_cfg.image_channels} for BidirectionalARTransformer.")
@@ -97,34 +112,6 @@ def main():
 
     # Create normalized transformer if possible
     print(f"Loading transformer model from: {bidirectional_ckpt_path}")
-
-    # Get features for normalization
-    # Convert raw feature dictionaries to PolicyFeature objects
-    policy_features = dataset_to_policy_features(metadata.features)
-
-    input_features = {
-        "observation.state": policy_features["observation.state"],
-        "observation.image": policy_features["observation.image"]
-    }
-
-    output_features = {
-        "action": policy_features["action"]
-    }
-
-    norm_mapping = {}
-    for key, value in bidir_cfg.normalization_mapping.items():
-        # Convert string values to NormalizationMode enum
-        if isinstance(value, str):
-            norm_mapping[key] = NormalizationMode(value)
-        else:
-            norm_mapping[key] = value
-
-    unnormalize_action_output = Unnormalize(
-        # Use all features for unnormalization
-        output_features,
-        norm_mapping,
-        processed_dataset_stats
-    )
 
     # Create the BidirectionalARTransformer model (without normalizer and unnormalizer)
     print("Loading transformer model manually")
@@ -154,19 +141,6 @@ def main():
             f"State Diffusion config JSON not found at {state_diffusion_config_json_path}")
     print(
         f"Loading State Diffusion configuration from directory: {state_diffusion_output_dir}")
-    state_diff_cfg = DiffusionConfig.from_pretrained(
-        state_diffusion_output_dir)
-
-    # CRITICAL CHECK: Ensure the loaded config is for state prediction
-    if not state_diff_cfg.interpolate_state:
-        print(f"CRITICAL WARNING: State Diffusion model config at {state_diffusion_output_dir} "
-              "has 'interpolate_state: False'. This model might be trained for ACTION prediction, "
-              "not state prediction as required for this pipeline stage.")
-
-    state_diffusion_model = CLDiffPhyConModel(
-        config=state_diff_cfg,
-        dataset_stats=metadata.stats
-    )
 
     state_diff_ckpt_path = state_diffusion_output_dir / "model_final.pth"
     if not state_diff_ckpt_path.is_file():
@@ -178,16 +152,11 @@ def main():
     model_state_dict_statediff = checkpoint_statediff.get(
         "model_state_dict", checkpoint_statediff)
 
-    state_diffusion_model.load_state_dict(
-        model_state_dict_statediff, strict=False)
-    state_diffusion_model.eval()
-    state_diffusion_model.to(device)
-
     # --- Load Inverse Dynamics Model (MlpInvDynamic) ---
     invdyn_o_dim = metadata.features["observation.state"]["shape"][-1]
     invdyn_a_dim = metadata.features["action"]["shape"][-1]
     # Use inv_dyn_hidden_dim from the state diffusion config if available, or a default
-    invdyn_hidden_dim = getattr(state_diff_cfg, 'inv_dyn_hidden_dim', 512)
+    invdyn_hidden_dim = 512
 
     inv_dyn_model = MlpInvDynamic(
         # MlpInvDynamic expects o_dim per state, so if input is s_t, s_{t+1}, it's 2*o_dim internally
@@ -213,12 +182,11 @@ def main():
 
     combined_policy = BidirectionalRTDiffusionPolicy(
         bidirectional_transformer=transformer_model,
-        state_diffusion_model=state_diffusion_model,
         inverse_dynamics_model=inv_dyn_model,
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs
-        n_obs_steps=state_diff_cfg.n_obs_steps,
-
+        n_obs_steps=2,
         dataset_stats=processed_dataset_stats,
+        output_features=output_features,
     )
 
     # --- Environment Setup ---
@@ -243,37 +211,29 @@ def main():
 
     print("Starting evaluation rollout with 3-stage pipeline...")
     while not done:
-        state_np = numpy_observation["agent_pos"].astype(
-            numpy.float32)  # [StateDim]
-        image_np = numpy_observation["pixels"]  # [H,W,C] uint8
+        state = torch.from_numpy(numpy_observation["agent_pos"])
+        image = torch.from_numpy(numpy_observation["pixels"])
 
-        # Policy expects BCHW float for image, Batch dim for state
-        current_state_tensor = torch.from_numpy(
-            state_np).unsqueeze(0)  # Add batch dim
-        # image_np is HWC uint8. BidirectionalRTDiffusionPolicy._normalize_observation handles conversion
-        current_image_tensor_for_policy = torch.from_numpy(
-            image_np).unsqueeze(0)  # Add batch dim, still HWC uint8
+        state = state.to(torch.float32)
+        image = image.to(torch.float32) / 255
+        image = image.permute(2, 0, 1)
+
+        state = state.to(device, non_blocking=True)
+        image = image.to(device, non_blocking=True)
+
+        state = state.unsqueeze(0)  # Add batch dimension
+        image = image.unsqueeze(0)  # Add batch dimension
 
         observation_for_policy = {
-            "observation.state": current_state_tensor,
-            "observation.image": current_image_tensor_for_policy,
+            "observation.state": state,
+            "observation.image": image,
         }
 
-        if step == 0:
-            combined_policy.reset()
-
         with torch.inference_mode():
-            # The select_action method already returns unnormalized actions from _get_next_action
             action = combined_policy.select_action(observation_for_policy)
 
-        act = {}
-        act['action'] = action[0]  # Action is already unnormalized
-        action = unnormalize_action_output(act)
-
-        unnorm_action = action["action"]
-
         # Make sure action is on CPU before converting to numpy
-        numpy_action = unnorm_action.squeeze(0).cpu().numpy()
+        numpy_action = action.squeeze(0).cpu().numpy()
         numpy_observation, reward, terminated, truncated, info = env.step(
             numpy_action)
 

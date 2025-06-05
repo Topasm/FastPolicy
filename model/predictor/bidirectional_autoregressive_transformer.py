@@ -21,6 +21,9 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
+# from lerobot.configs.policies import PreTrainedConfig
+# from lerobot.common.optim.optimizers import AdamConfig
+# from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
 
 
 @dataclass
@@ -44,6 +47,10 @@ class BidirectionalARTransformerConfig:
     # Number of pure query tokens (goal, backward, forward)
     num_query_tokens: int = 3
 
+    # Number of action steps (not used in this model, but kept for compatibility)
+    n_action_steps = 8
+
+    image_features = 1
     # Token types: HistStep, QueryGoal, QueryBwd, QueryFwd
     token_type_count: int = 4
 
@@ -122,6 +129,7 @@ class BidirectionalARTransformerConfig:
             config_dict["output_features"] = reconstructed_output_features
 
         return cls(**config_dict)
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
