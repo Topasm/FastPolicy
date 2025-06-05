@@ -11,7 +11,6 @@ This model implements the following pipeline with SOFT GOAL CONDITIONING and GLO
     c. Generate forward states st_0 ... (conditioned on global history + goal + backward path)
 
 The new prediction order (goal → backward → forward) enables soft conditioning.
-The model is trained with both an autoregressive path and a query-based path.
 """
 
 import torch
@@ -32,23 +31,15 @@ class BidirectionalARTransformerConfig:
     num_layers: int = 6
     num_heads: int = 8
     dropout: float = 0.1
-    max_position_value: int = 64  # Max length for AR path positional embeddings
     layernorm_epsilon: float = 1e-5
+    image_latent_dim: int = 256  # Latent dimension for image features
     image_channels: int = 3
     image_size: int = 96
-    image_latent_dim: int = 256
     forward_steps: int = 20
     backward_steps: int = 16
     n_obs_steps: int = 2  # Number of observation steps in history
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
-
-    vision_backbone: str = "resnet18"
-    pretrained_backbone_weights: str = "IMAGENET1K_V1"
-    spatial_softmax_num_keypoints: int = 32
-    use_group_norm: bool = False
-    crop_shape: Optional[tuple] = None
-    crop_is_random: bool = False
 
     # Number of pure query tokens (goal, backward, forward)
     num_query_tokens: int = 3
@@ -527,8 +518,7 @@ def compute_loss(
     """
     Compute losses for the query-based path outputs.
 
-    This version assumes the autoregressive path has been removed or is not
-    directly producing outputs named 'predicted_...' for AR-specific losses.
+
     It focuses on the outputs from the query-based mechanism.
     """
     losses = {}

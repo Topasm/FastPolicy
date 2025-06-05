@@ -126,21 +126,15 @@ def main():
         num_layers=6,
         num_heads=8,
         dropout=0.1,
-        max_position_value=64,  # Max sequence length for pos encoding
         image_channels=3,
         image_size=96,
-        image_latent_dim=256,
+        image_latent_dim=256,  # Assuming this is the latent dimension for images
         forward_steps=16,
         backward_steps=16,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
-        output_features=output_features,  # Pass the actual FeatureSpec objects
-        vision_backbone="resnet18",
-        pretrained_backbone_weights="IMAGENET1K_V1",
-        spatial_softmax_num_keypoints=32,
-        use_group_norm=False,
-        crop_shape=None,
-        crop_is_random=False,
+        output_features=output_features  # Pass the actual FeatureSpec objects
+
     )
     print(f"Dataset size: {len(dataset)}")
     print(f"Batches per iteration: {len(dataloader)}")
