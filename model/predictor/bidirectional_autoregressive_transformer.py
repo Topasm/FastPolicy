@@ -242,7 +242,7 @@ class BidirectionalARTransformer(nn.Module):
 
         # Output heads remain unchanged
         self.forward_state_head = nn.Linear(
-            config.hidden_dim, (config.forward_steps - 1) * config.state_dim)
+            config.hidden_dim, (config.forward_steps) * config.state_dim)
         self.goal_image_latent_head = nn.Linear(
             config.hidden_dim, config.image_latent_dim)
         self.backward_state_head = nn.Linear(
@@ -388,7 +388,7 @@ class BidirectionalARTransformer(nn.Module):
 
         fwd_flat = self.forward_state_head(fwd_hidden)
         results['predicted_forward_states'] = fwd_flat.view(
-            batch_size, self.config.forward_steps - 1, self.config.state_dim)
+            batch_size, self.config.forward_steps, self.config.state_dim)
 
         return results
 
@@ -453,8 +453,9 @@ class BidirectionalARTransformer(nn.Module):
         )
 
         predicted_fwd_states_flat = self.forward_state_head(fwd_query_output)
+        # Fix: Use config.forward_steps instead of config.forward_steps - 1 to match the tensor size
         results['predicted_forward_states'] = predicted_fwd_states_flat.view(
-            batch_size, self.config.forward_steps - 1, self.config.state_dim
+            batch_size, self.config.forward_steps, self.config.state_dim
         )
         return results
 
@@ -534,7 +535,7 @@ def compute_loss(
     # Forward state prediction loss
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         # GT is st_0 to st_F-1, target for model is st_1 to st_F-1
-        target_fwd = targets['forward_states'][:, 1:]
+        target_fwd = targets['forward_states']
         losses['forward_state_loss'] = F.mse_loss(
             predictions['predicted_forward_states'], target_fwd)
 

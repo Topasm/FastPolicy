@@ -8,7 +8,7 @@ from typing import Dict
 
 from lerobot.common.policies.utils import get_device_from_parameters, populate_queues
 from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE, OBS_ENV
+from lerobot.common.constants import OBS_STATE, OBS_IMAGE, OBS_ENV_STATE
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.common.datasets.utils import PolicyFeature
 

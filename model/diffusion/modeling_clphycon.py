@@ -6,7 +6,7 @@ from typing import Optional, Dict
 import torch
 from torch import Tensor
 
-from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+from lerobot.common.constants import OBS_ENV_STATE, OBS_STATE, OBS_IMAGES
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 # Import the refactored diffusion modules
@@ -68,20 +68,19 @@ class CLDiffPhyConModel(PreTrainedPolicy):
             device = prev_noisy_sequence.device
 
             # Create observation dict with expanded state
-            from lerobot.common.constants import OBS_ROBOT
             obs_state = current_env_state.unsqueeze(
                 1).expand(-1, self.config.n_obs_steps, -1)
-            obs_dict = {OBS_ROBOT: obs_state}
+            obs_dict = {OBS_STATE: obs_state}
 
             # Add image observations if available
-            if hasattr(self, '_queues') and self.config.image_features and 'observation.images' in self._queues:
-                if len(self._queues['observation.images']) == self.config.n_obs_steps:
+            if hasattr(self, '_queues') and self.config.image_features and OBS_IMAGES in self._queues:
+                if len(self._queues[OBS_IMAGES]) == self.config.n_obs_steps:
                     img_obs = torch.stack(
-                        list(self._queues['observation.images']), dim=0)
+                        list(self._queues[OBS_IMAGES]), dim=0)
                     if img_obs.dim() == 4:  # [S, C, H, W]
                         img_obs = img_obs.unsqueeze(0).expand(
                             batch_size, -1, -1, -1, -1).to(device)
-                    obs_dict['observation.images'] = img_obs
+                    obs_dict[OBS_IMAGES] = img_obs
 
         # Get global conditioning and timestep for denoising
         global_cond = self.diffusion._prepare_global_conditioning(obs_dict)
@@ -139,14 +138,14 @@ class CLDiffPhyConModel(PreTrainedPolicy):
 
     def reset(self):
         self._queues = {
-            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
         }
         if self.config.image_features:
-            self._queues["observation.images"] = deque(
+            self._queues[OBS_IMAGES] = deque(
                 maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
-            self._queues["observation.environment_state"] = deque(
+            self._queues[OBS_ENV_STATE] = deque(
                 maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
@@ -164,33 +163,33 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         normalized_obs_for_queue = self.normalize_inputs(
             current_raw_observation)
 
-        self._queues["observation.state"].append(
-            normalized_obs_for_queue["observation.state"].squeeze(0))
+        self._queues[OBS_STATE].append(
+            normalized_obs_for_queue[OBS_STATE].squeeze(0))
 
         if self.config.image_features:
             current_images_stacked_for_queue = torch.stack(
                 [normalized_obs_for_queue[key].squeeze(0) for key in self.config.image_features], dim=0
             )
-            self._queues["observation.images"].append(
+            self._queues[OBS_IMAGES].append(
                 current_images_stacked_for_queue)
 
         if len(self._queues["action"]) > 0:
             return self._queues["action"].popleft()
 
-        if len(self._queues["observation.state"]) < self.config.n_obs_steps:
+        if len(self._queues[OBS_STATE]) < self.config.n_obs_steps:
             action_dim = self.config.output_features["action"].shape[0]
             return torch.zeros(action_dim, device=device)
 
         obs_state_history = torch.stack(
-            list(self._queues["observation.state"]), dim=0).unsqueeze(0)
+            list(self._queues[OBS_STATE]), dim=0).unsqueeze(0)
 
         obs_dict_for_model = {
-            OBS_ROBOT: obs_state_history
+            OBS_STATE: obs_state_history
         }
         if self.config.image_features:
             obs_image_history = torch.stack(
-                list(self._queues["observation.images"]), dim=0).unsqueeze(0)
-            obs_dict_for_model["observation.images"] = obs_image_history
+                list(self._queues[OBS_IMAGES]), dim=0).unsqueeze(0)
+            obs_dict_for_model[OBS_IMAGES] = obs_image_history
 
         predicted_target_sequence_normalized = self.predict_action(
             obs_dict_for_model, previous_rt_diffusion_plan=None)
@@ -212,12 +211,12 @@ class CLDiffPhyConModel(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action(self, obs_dict: dict[str, Tensor], previous_rt_diffusion_plan: Optional[Tensor] = None) -> Tensor:
         batch_size = -1
-        if OBS_ROBOT in obs_dict and obs_dict[OBS_ROBOT] is not None:
-            batch_size = obs_dict[OBS_ROBOT].shape[0]
-        elif "observation.images" in obs_dict and obs_dict["observation.images"] is not None:
-            batch_size = obs_dict["observation.images"].shape[0]
-        elif OBS_ENV in obs_dict and obs_dict[OBS_ENV] is not None:
-            batch_size = obs_dict[OBS_ENV].shape[0]
+        if OBS_STATE in obs_dict and obs_dict[OBS_STATE] is not None:
+            batch_size = obs_dict[OBS_STATE].shape[0]
+        elif OBS_IMAGES in obs_dict and obs_dict[OBS_IMAGES] is not None:
+            batch_size = obs_dict[OBS_IMAGES].shape[0]
+        elif OBS_ENV_STATE in obs_dict and obs_dict[OBS_ENV_STATE] is not None:
+            batch_size = obs_dict[OBS_ENV_STATE].shape[0]
         else:
             if not obs_dict:
                 raise ValueError("obs_dict is empty in predict_action")
@@ -242,12 +241,12 @@ class CLDiffPhyConModel(PreTrainedPolicy):
         cond_horizon = self.config.n_obs_steps
 
         # Process robot state
-        if OBS_ROBOT in normalized_batch_inputs and self.config.robot_state_feature:
-            state_input = normalized_batch_inputs[OBS_ROBOT]
+        if OBS_STATE in normalized_batch_inputs and self.config.robot_state_feature:
+            state_input = normalized_batch_inputs[OBS_STATE]
             if state_input.shape[1] < cond_horizon:
                 raise ValueError(
                     f"State input length {state_input.shape[1]} < cond_horizon {cond_horizon}")
-            result[OBS_ROBOT] = state_input[:, :cond_horizon, :]
+            result[OBS_STATE] = state_input[:, :cond_horizon, :]
 
         # Process image features
         if self.config.image_features:
@@ -264,12 +263,12 @@ class CLDiffPhyConModel(PreTrainedPolicy):
                     image_tensors, dim=2)
 
         # Process environment state
-        if OBS_ENV in normalized_batch_inputs and self.config.env_state_feature:
-            env_input = normalized_batch_inputs[OBS_ENV]
+        if OBS_ENV_STATE in normalized_batch_inputs and self.config.env_state_feature:
+            env_input = normalized_batch_inputs[OBS_ENV_STATE]
             if env_input.shape[1] < cond_horizon:
                 raise ValueError(
                     f"Environment input length {env_input.shape[1]} < cond_horizon {cond_horizon}")
-            result[OBS_ENV] = env_input[:, :cond_horizon, :]
+            result[OBS_ENV_STATE] = env_input[:, :cond_horizon, :]
 
         return result
 

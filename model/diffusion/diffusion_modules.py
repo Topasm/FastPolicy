@@ -9,7 +9,7 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.diffusion.configuration_mymodel import DiffusionConfig
-from lerobot.common.constants import OBS_ROBOT, OBS_IMAGE, OBS_ENV
+from lerobot.common.constants import OBS_STATE, OBS_IMAGE, OBS_ENV_STATE
 import einops
 
 
@@ -558,19 +558,19 @@ class DiffusionModel(nn.Module):
            Expects batch to have normalized 'observation.state' and potentially 'observation.image'.
         """
         # Check required keys exist
-        if OBS_ROBOT not in batch:
+        if OBS_STATE not in batch:
             raise KeyError(
-                f"Missing '{OBS_ROBOT}' in batch for _prepare_global_conditioning")
+                f"Missing '{OBS_STATE}' in batch for _prepare_global_conditioning")
 
-        batch_size = batch[OBS_ROBOT].shape[0]
+        batch_size = batch[OBS_STATE].shape[0]
         n_obs_steps = self.config.n_obs_steps
 
-        if batch[OBS_ROBOT].shape[1] < n_obs_steps:
+        if batch[OBS_STATE].shape[1] < n_obs_steps:
             raise ValueError(
-                f"{OBS_ROBOT} sequence length ({batch[OBS_ROBOT].shape[1]}) "
+                f"{OBS_STATE} sequence length ({batch[OBS_STATE].shape[1]}) "
                 f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
             )
-        cond_state = batch[OBS_ROBOT][:, :n_obs_steps, :]
+        cond_state = batch[OBS_STATE][:, :n_obs_steps, :]
         global_cond_feats = [cond_state]
 
         # Check if images are configured AND present in the batch before processing
@@ -639,17 +639,17 @@ class DiffusionModel(nn.Module):
             # Continue without image features for this batch
 
         # Check if env state is configured AND present
-        if self.config.env_state_feature and OBS_ENV in batch:
-            if batch[OBS_ENV].shape[1] < n_obs_steps:
+        if self.config.env_state_feature and OBS_ENV_STATE in batch:
+            if batch[OBS_ENV_STATE].shape[1] < n_obs_steps:
                 raise ValueError(
-                    f"{OBS_ENV} sequence length ({batch[OBS_ENV].shape[1]}) "
+                    f"{OBS_ENV_STATE} sequence length ({batch[OBS_ENV_STATE].shape[1]}) "
                     f"is shorter than required n_obs_steps ({n_obs_steps}) for conditioning."
                 )
-            cond_env_state = batch[OBS_ENV][:, :n_obs_steps, :]
+            cond_env_state = batch[OBS_ENV_STATE][:, :n_obs_steps, :]
             global_cond_feats.append(cond_env_state)
-        elif self.config.env_state_feature and OBS_ENV not in batch:
+        elif self.config.env_state_feature and OBS_ENV_STATE not in batch:
             print(
-                f"Warning: env_state_feature configured but '{OBS_ENV}' not found in batch for _prepare_global_conditioning.")
+                f"Warning: env_state_feature configured but '{OBS_ENV_STATE}' not found in batch for _prepare_global_conditioning.")
             # Continue without env state features for this batch
 
         concatenated_features = torch.cat(global_cond_feats, dim=-1)
