@@ -81,51 +81,6 @@ class BidirectionalARTransformerConfig:
         with open(config_path, "r") as f:
             config_dict = json.load(f)
 
-        # input_features를 PolicyFeature 객체로 복원
-        if "input_features" in config_dict and isinstance(config_dict["input_features"], dict):
-            reconstructed_input_features = {}
-            for k, v_dict in config_dict["input_features"].items():
-                if isinstance(v_dict, dict) and "shape" in v_dict and "type" in v_dict:
-                    try:
-                        feature_type_str = v_dict["type"]
-                        actual_type_name = feature_type_str.split(
-                            '.')[-1] if '.' in feature_type_str else feature_type_str
-                        feature_type_val = FeatureType[actual_type_name]
-
-                        reconstructed_input_features[k] = PolicyFeature(
-                            shape=tuple(v_dict["shape"]),
-                            type=feature_type_val
-                        )
-                    except Exception as e:
-                        print(
-                            f"Warning: Could not reconstruct PolicyFeature for input_features key {k} from dict {v_dict}: {e}. Keeping as dict.")
-                        reconstructed_input_features[k] = v_dict
-                else:
-                    reconstructed_input_features[k] = v_dict
-            config_dict["input_features"] = reconstructed_input_features
-
-        # output_features도 필요한 경우 동일한 방식으로 복원
-        if "output_features" in config_dict and isinstance(config_dict["output_features"], dict):
-            reconstructed_output_features = {}
-            for k, v_dict in config_dict["output_features"].items():
-                if isinstance(v_dict, dict) and "shape" in v_dict and "type" in v_dict:
-                    try:
-                        feature_type_str = v_dict["type"]
-                        actual_type_name = feature_type_str.split(
-                            '.')[-1] if '.' in feature_type_str else feature_type_str
-                        feature_type_val = FeatureType[actual_type_name]
-                        reconstructed_output_features[k] = PolicyFeature(
-                            shape=tuple(v_dict["shape"]),
-                            type=feature_type_val
-                        )
-                    except Exception as e:
-                        print(
-                            f"Warning: Could not reconstruct PolicyFeature for output_features key {k} from dict {v_dict}: {e}. Keeping as dict.")
-                        reconstructed_output_features[k] = v_dict
-                else:
-                    reconstructed_output_features[k] = v_dict
-            config_dict["output_features"] = reconstructed_output_features
-
         return cls(**config_dict)
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -181,7 +136,7 @@ class ImageDecoder(nn.Module):  # Remains the same
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
                 64), nn.ReLU(inplace=True),
             nn.ConvTranspose2d(64, config.image_channels,
-                               kernel_size=4, stride=2, padding=1), nn.Tanh()
+                               kernel_size=4, stride=2, padding=1)
         )
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
@@ -474,7 +429,7 @@ def compute_loss(
     weights = {
         'forward_state_loss': 1.0,
         'backward_state_loss': 1.0,
-        'goal_image_loss': 2.0,          # 목표 이미지 예측에 더 큰 가중치
+        'goal_image_loss': 1.0,
         'goal_latent_consistency_loss': 1.0,
     }
     total_loss = torch.tensor(

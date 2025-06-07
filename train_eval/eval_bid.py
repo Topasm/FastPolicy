@@ -43,8 +43,7 @@ def main():
     policy_features = dataset_to_policy_features(metadata.features)
 
     input_features = {
-        "observation.state": policy_features["observation.state"],
-        "observation.image": policy_features["observation.image"]
+        "observation.state": policy_features["observation.state"]
     }
 
     output_features = {

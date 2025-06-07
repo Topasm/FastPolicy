@@ -52,9 +52,22 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             FeatureType.ACTION: NormalizationMode.MIN_MAX
         }
 
-        # Create normalizers with the proper enum-based mapping
+        # Create normalizers with only observation.state (no image)
+        filtered_input_features = {}
+        if hasattr(self.config, 'input_features') and 'observation.state' in self.config.input_features:
+            # Create a proper PolicyFeature object with type attribute
+            state_feature = self.config.input_features['observation.state']
+            filtered_input_features['observation.state'] = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=tuple(state_feature['shape']
+                            ) if 'shape' in state_feature else None
+            )
+
+        # Override the config's input_features to use only observation.state
+        self.config.input_features = filtered_input_features
+
         self.normalize_inputs = Normalize(
-            self.config.input_features,
+            filtered_input_features,
             proper_normalization_mapping,  # Use the fixed mapping
             dataset_stats
         )
@@ -67,14 +80,13 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Initialize queues
         self.n_obs_steps = n_obs_steps
 
-        # Initialize queues
+        # Initialize queues with only observation.state (no image)
         self._queues = {
+            "observation.image": deque(maxlen=self.config.n_obs_steps),
             "observation.state": deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.image_features:
-            self._queues["observation.image"] = deque(
-                maxlen=self.config.n_obs_steps)
+        # Image queue is intentionally not included
         # if self.config.env_state_feature:
         #     self._queues["observation.environment_state"] = deque(
         #         maxlen=self.config.n_obs_steps)
@@ -92,12 +104,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         action_queue_len = self.config.n_action_steps  # DiffusionConfig의 n_action_steps
 
         self._queues = {
+            "observation.image": deque(maxlen=self.config.n_obs_steps),
             "observation.state": deque(maxlen=obs_queue_len),
-            "action": deque(maxlen=action_queue_len),  # 이 큐의 역할 재고 필요 (아래 참조)
+            "action": deque(maxlen=action_queue_len),
         }
-        # self.config는 DiffusionConfig이므로 image_features 존재 여부 확인 방식 변경 가능
-        if hasattr(self.config, 'image_features') and self.config.image_features:
-            self._queues["observation.image"] = deque(maxlen=obs_queue_len)
+        # Image queue is intentionally not included
         # if hasattr(self.config, 'env_state_feature') and self.config.env_state_feature:
         #     self._queues["observation.environment_state"] = deque(
         #         maxlen=obs_queue_len)
@@ -111,7 +122,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         batch = {k: v.to(self.device) if isinstance(
             v, torch.Tensor) else v for k, v in current_raw_observation.items()}
 
-        # Process and normalize observation
+        # # Process and normalize observation
         normalized_obs = self.normalize_inputs(batch)
         # Update observation queues with new observation
         self._queues = populate_queues(self._queues, normalized_obs)
@@ -157,79 +168,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         Args:
             model_input_batch: Dict containing observation history with keys like "observation.state", "observation.image"
         """
-        # 1. Extract observations and prepare for Bidirectional Transformer
-        # model_input_batch already contains normalized, batched, and device-mapped history
-
-        # Check if transformer uses temporal encoding
-        n_obs_steps = getattr(self.base_transformer.config, 'n_obs_steps', 1)
-
-        if n_obs_steps > 1:
-            # Use full temporal sequences for temporal transformer
-            # [B, n_obs_steps, state_dim]
-            norm_state_sequence = model_input_batch["observation.state"]
-            norm_img_sequence = None
-            if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
-                # [B, n_obs_steps, C, H, W]
-                norm_img_sequence = model_input_batch["observation.image"]
-
-            # Ensure we have the right number of temporal steps
-            if norm_state_sequence.shape[1] != n_obs_steps:
-                # If we have more history than needed, take the last n_obs_steps
-                if norm_state_sequence.shape[1] > n_obs_steps:
-                    norm_state_sequence = norm_state_sequence[:, -
-                                                              n_obs_steps:, :]
-                    if norm_img_sequence is not None:
-                        norm_img_sequence = norm_img_sequence[:, -
-                                                              n_obs_steps:, :, :, :]
-                else:
-                    # If we have less history, pad with the first observation
-                    # This should not happen in normal operation, but handle it gracefully
-                    print(
-                        f"Warning: Expected {n_obs_steps} temporal steps, got {norm_state_sequence.shape[1]}")
-                    while norm_state_sequence.shape[1] < n_obs_steps:
-                        norm_state_sequence = torch.cat(
-                            [norm_state_sequence[:, :1, :], norm_state_sequence], dim=1)
-                        if norm_img_sequence is not None:
-                            norm_img_sequence = torch.cat(
-                                [norm_img_sequence[:, :1, :, :, :], norm_img_sequence], dim=1)
-
-            # Prepare state for bidirectional transformer
-            bidir_state_dim = self.base_transformer.config.state_dim
-            current_state_for_bidir_transformer = norm_state_sequence
-            if norm_state_sequence.shape[-1] != bidir_state_dim:
-                current_state_for_bidir_transformer = norm_state_sequence[:,
-                                                                          :, :bidir_state_dim]
-
-            # Use temporal sequences
-            initial_images_input = norm_img_sequence
-            initial_states_input = current_state_for_bidir_transformer
-        else:
-            # Use single-step observations for non-temporal transformer
-            # Current state s_0
-            norm_state_current = model_input_batch["observation.state"][:, -1, :]
-            norm_img_current = None
-            if "observation.image" in model_input_batch and model_input_batch["observation.image"] is not None:
-                # Extract last image from the sequence
-                # Current image i_0
-                norm_img_current = model_input_batch["observation.image"][:, -1, :, :, :]
-
-            # Prepare state for bidirectional transformer
-            bidir_state_dim = self.base_transformer.config.state_dim
-            current_state_for_bidir_transformer = norm_state_current
-            if norm_state_current.shape[-1] != bidir_state_dim:
-                current_state_for_bidir_transformer = norm_state_current[:,
-                                                                         :bidir_state_dim]
-
-            # Use single observations
-            initial_images_input = norm_img_current
-            initial_states_input = current_state_for_bidir_transformer
-
-        # Check if image is required but missing
-        bidir_uses_image = any(k.startswith("observation.image")
-                               for k in getattr(self.base_transformer.config, 'input_features', {}))
-        if bidir_uses_image and initial_images_input is None:
-            raise ValueError(
-                "BidirectionalARTransformer requires an image but none is available")
+        initial_images_input = model_input_batch["observation.image"]
+        initial_states_input = model_input_batch["observation.state"]
 
         # 2. Get state plan directly from Bidirectional Transformer
         print("Generating state plan directly from Bidirectional Transformer (diffusion bypassed)")

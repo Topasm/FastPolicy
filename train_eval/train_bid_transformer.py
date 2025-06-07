@@ -41,8 +41,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 1000  # Reduced for testing WandB integration
-    batch_size = 512
+    training_steps = 5000  # Reduced for testing WandB integration
+    batch_size = 64
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
     save_freq = 500  # More frequent saving for testing
@@ -79,8 +79,7 @@ def main():
         output_features={"observation.image": features["observation.image"]}
     )  # Dummy config to access properties
     input_features = {
-        "observation.state": features["observation.state"],
-        "observation.image": features["observation.image"],
+        "observation.state": features["observation.state"]
     }
     output_features = {
         # Define what the model is expected to output, matching keys in compute_loss
@@ -128,7 +127,7 @@ def main():
         dropout=0.1,
         image_channels=3,
         image_size=96,
-        image_latent_dim=256,  # Assuming this is the latent dimension for images
+        image_latent_dim=512,  # Assuming this is the latent dimension for images
         forward_steps=16,
         backward_steps=16,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
@@ -204,11 +203,6 @@ def main():
                 else:
                     # Handle cases where batch items might not be tensors (e.g., metadata)
                     batch_device[key] = value
-            if 'initial_images' in batch_device:
-                batch_device['initial_images'] = batch_device['initial_images'] * 2.0 - 1.0
-
-            if 'goal_images' in batch_device:  # compute_loss에 전달되는 target 이미지에 중요
-                batch_device['goal_images'] = batch_device['goal_images'] * 2.0 - 1.0
 
             optimizer.zero_grad()
 
@@ -265,9 +259,10 @@ def main():
 
                     # Process ground truth and predicted images
                     for i in range(min(4, gt_images.shape[0])):
-                        # Normalize images to [0, 1] for visualization
-                        gt_img = (gt_images[i].clamp(-1, 1) + 1) / 2.0
-                        pred_img = (pred_images[i].clamp(-1, 1) + 1) / 2.0
+                        # Images are already in 0-1 range, no normalization needed
+                        gt_img = gt_images[i]
+                        pred_img = predictions['predicted_goal_images'][i].detach(
+                        ).cpu()
 
                         # Add images to wandb log
                         wandb_log[f'images/sample_{i}_gt'] = wandb.Image(
