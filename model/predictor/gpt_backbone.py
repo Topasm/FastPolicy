@@ -73,6 +73,7 @@ class Attention(nn.Module):
 
         q, k, v = self.wq(x), self.wk(x), self.wv(x)
 
+        # Reshape queries, keys, values for multi-head attention
         q = q.view(batch_size, seq_len, self.n_head,
                    self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.n_head,
@@ -80,14 +81,19 @@ class Attention(nn.Module):
         v = v.view(batch_size, seq_len, self.n_head,
                    self.head_dim).transpose(1, 2)
 
+        # Apply rotary embeddings - ensure dimensions match
         cos, sin = rotary_emb
-        q, k = apply_rotary_emb(q, k, cos, sin)
+        # Permute cos and sin to match q,k dimensions after transpose
+        cos = cos.permute(0, 2, 1, 3)  # [1, 1, S, D] -> [1, S, 1, D]
+        sin = sin.permute(0, 2, 1, 3)  # [1, 1, S, D] -> [1, S, 1, D]
+        q, k = apply_rotary_emb(q, k, cos[:, :seq_len], sin[:, :seq_len])
 
         # Use efficient scaled dot-product attention
-        # mask needs to be additive (-inf for masked positions) or boolean (True for masked)
+        # Handle mask properly for scaled_dot_product_attention
         if mask is not None:
-            if mask.dtype != torch.bool:  # If it's an additive mask
-                mask = mask.bool()
+            # PyTorch expects a 4D attention mask [B, H, T, S]
+            if mask.dim() == 3:  # [B, T, S]
+                mask = mask.unsqueeze(1)  # Add head dimension [B, 1, T, S]
 
         output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=self.attn_dropout.p if self.training else 0.0)
@@ -117,7 +123,7 @@ class SwiGLUFeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """
     A transformer block with Pre-Layer Normalization.
-    - LayerNorm을 어텐션과 FFN '이후'가 아닌 '이전'에 적용하여 학습 안정성을 높입니다.
+    - LayerNorm을 어텐션와 FFN '이후'가 아닌 '이전'에 적용하여 학습 안정성을 높입니다.
     """
 
     def __init__(self, d_model: int, n_head: int, dropout: float):
@@ -148,17 +154,22 @@ class GPTBackbone(nn.Module):
         self.rotary_embeddings = RotaryEmbedding(dim=d_model // n_head)
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        # mask: [S, S] or [B, S, S] boolean mask (True means masked)
+        # Get proper sequence length from input
+        seq_len = x.shape[1]
+
+        # Ensure rotary embeddings match the sequence length
         rotary_emb = self.rotary_embeddings(x)
 
-        # Transformer's attention mask is 4D [B, H, T, T] or broadcastable
-        # Let's prepare it for scaled_dot_product_attention
+        # Handle mask format - convert boolean mask to attention mask format
+        # In PyTorch attention, True = masked position
         if mask is not None:
-            # Ensure mask is broadcastable to [B, H, T, T] if it's [T, T]
-            if mask.dim() == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
-            elif mask.dim() == 3:  # Maybe [B, T, T]
-                mask = mask.unsqueeze(1)  # [B, 1, T, T]
+            # We'll invert our boolean mask if needed - in our case True means masked
+            # For GPT models with causal attention or custom attention patterns
+
+            # First ensure mask is proper shape for transformer layers
+            if mask.dim() == 2:  # [S, S]
+                # Add batch and head dimensions for broadcasting
+                mask = mask.unsqueeze(0)  # [1, S, S]
 
         for layer in self.layers:
             x = layer(x, rotary_emb, mask)

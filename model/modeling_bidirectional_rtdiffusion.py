@@ -83,13 +83,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # Initialize queues
         self.n_obs_steps = n_obs_steps
 
-        # Initialize queues with only observation.state (no image)
-        self._queues = {
-            "observation.image": deque(maxlen=self.config.n_obs_steps),
-            "observation.state": deque(maxlen=self.config.n_obs_steps),
-            "action": deque(maxlen=self.config.n_action_steps),
-        }
-
         self.reset()
 
     def reset(self):
@@ -200,7 +193,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         """
 
         start = 0
-        end = 8
+        end = 7
         # Slice the state plan to use only the specified range
         state_plan = state_plan[:, start:end, :]
 

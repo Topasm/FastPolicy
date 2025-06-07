@@ -41,7 +41,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 10000  # Reduced for testing WandB integration
+    training_steps = 20000  # Reduced for testing WandB integration
     batch_size = 64
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
@@ -102,7 +102,6 @@ def main():
         lerobot_dataset=lerobot_dataset,
         forward_steps=16,
         backward_steps=16,
-        min_episode_length=16,  # Ensure episodes are long enough for sampling
         image_key="observation.image",
         state_key="observation.state",
         n_obs_steps=n_obs_steps  # Enable temporal encoding
@@ -126,8 +125,9 @@ def main():
         num_heads=8,
         dropout=0.1,
         image_channels=3,
-        image_size=96,
-        image_latent_dim=256,  # Assuming this is the latent dimension for images
+        image_size=84,
+        output_image_size=96,
+        image_latent_dim=256,
         forward_steps=16,
         backward_steps=16,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
@@ -211,11 +211,9 @@ def main():
             predictions = model(
                 initial_images=batch_device['initial_images'],
                 initial_states=batch_device['initial_states'],
-                # Ground truth for teacher forcing
+                normalized_timestep=batch_device['normalized_timestep'],
                 forward_states=batch_device['forward_states'],
-                # Ground truth for teacher forcing
                 goal_images=batch_device['goal_images'],
-                # Ground truth for teacher forcing
                 backward_states=batch_device['backward_states'],
                 training=True
             )
