@@ -45,6 +45,9 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         self.config = bidirectional_transformer.config
         self.device = get_device_from_parameters(bidirectional_transformer)
 
+        # Store the latest predicted image from the transformer
+        self.latest_predicted_image = None
+
         # Convert string keys to FeatureType enum keys for normalization_mapping
         proper_normalization_mapping = {
             FeatureType.VISUAL: NormalizationMode.MEAN_STD,
@@ -86,10 +89,6 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             "observation.state": deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
         }
-        # Image queue is intentionally not included
-        # if self.config.env_state_feature:
-        #     self._queues["observation.environment_state"] = deque(
-        #         maxlen=self.config.n_obs_steps)
 
         self.reset()
 
@@ -97,21 +96,11 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         """Reset observation history queues. Should be called on env.reset()"""
         print("Resetting BidirectionalRTDiffusionPolicy queues")
 
-        # __init__에서 사용하는 self.n_obs_steps와 self.config를 일관되게 사용
-        # self.n_obs_steps는 __init__에서 인자로 받아 설정됨
-        # self.config는 state_diffusion_model.config에서 옴
-        obs_queue_len = self.n_obs_steps
-        action_queue_len = self.config.n_action_steps  # DiffusionConfig의 n_action_steps
-
         self._queues = {
             "observation.image": deque(maxlen=self.config.n_obs_steps),
-            "observation.state": deque(maxlen=obs_queue_len),
-            "action": deque(maxlen=action_queue_len),
+            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "action": deque(maxlen=self.config.n_action_steps),
         }
-        # Image queue is intentionally not included
-        # if hasattr(self.config, 'env_state_feature') and self.config.env_state_feature:
-        #     self._queues["observation.environment_state"] = deque(
-        #         maxlen=obs_queue_len)
 
         self._action_execution_queue = deque()  # 이것은 액션 실행용 큐
 
@@ -138,8 +127,12 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
                     model_input_batch[key] = torch.stack(queue_list, dim=1)
 
             # Generate state plan using only the transformer (diffusion bypassed)
-            transformer_state_plan = self._generate_state_plan(
+            transformer_state_plan, predicted_goal_image = self._generate_state_plan(
                 model_input_batch)
+
+            self.latest_predicted_image = predicted_goal_image
+            print(
+                f"Predicted goal image available: {predicted_goal_image is not None}")
 
             # Generate actions using inverse dynamics directly from transformer predictions
             actions = self._generate_actions_from_states(
@@ -173,6 +166,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
         # 2. Get state plan directly from Bidirectional Transformer
         print("Generating state plan directly from Bidirectional Transformer (diffusion bypassed)")
+        print("Generating state plan directly from Bidirectional Transformer (diffusion bypassed)")
         transformer_predictions = self.base_transformer(
             initial_images=initial_images_input,  # Temporal sequence or single image
             initial_states=initial_states_input,  # Temporal sequence or single state
@@ -182,11 +176,14 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         # 'predicted_forward_states' from transformer is [s_1_pred, s_2_pred, ..., s_{F-1}_pred]
         # This is the plan of future states that _generate_actions_from_states expects.
         transformer_predicted_future_states = transformer_predictions['predicted_forward_states']
+        # Note: The key is 'predicted_goal_images' (plural) in the transformer output
+        predicted_goal_image = transformer_predictions.get(
+            'predicted_goal_images', None)
 
         print(
             f"Generated state plan of shape {transformer_predicted_future_states.shape}")
 
-        return transformer_predicted_future_states
+        return transformer_predicted_future_states, predicted_goal_image
 
     def _generate_actions_from_states(self, state_plan):
         """
@@ -202,8 +199,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             Tensor of shape [batch_size, seq_len-1, action_dim] with actions
         """
 
-        start = 1
-        end = 8
+        start = 0
+        end = 7
         # Slice the state plan to use only the specified range
         state_plan = state_plan[:, start:end, :]
 

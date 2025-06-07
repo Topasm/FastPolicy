@@ -22,6 +22,10 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
 import torchvision.models as models
+import torchvision.transforms as transforms
+from torch import Tensor
+
+from model.modules.modules import SpatialSoftmax
 
 
 @dataclass
@@ -74,8 +78,6 @@ class BidirectionalARTransformerConfig:
 
     @classmethod
     def from_pretrained(cls, output_dir: Path):
-        from lerobot.common.datasets.utils import PolicyFeature  # PolicyFeature 클래스 임포트
-        from lerobot.configs.types import FeatureType           # FeatureType enum 임포트
 
         config_path = Path(output_dir) / "config.json"
         with open(config_path, "r") as f:
@@ -94,30 +96,79 @@ class BidirectionalARTransformerConfig:
 
 class ImageEncoder(nn.Module):
     """
-    ResNet-18 based image encoder for better feature extraction performance.
+    Improved ResNet-18 based image encoder with SpatialSoftmax for better spatial feature extraction.
+
+    This encoder uses a pretrained ResNet-18 backbone followed by SpatialSoftmax pooling
+    which extracts spatial keypoint features from the convolutional feature maps.
     """
 
     def __init__(self, config: BidirectionalARTransformerConfig):
         super().__init__()
         self.config = config
 
+        # Set up optional preprocessing (center crop for standardizing input size)
+        self.image_size = config.image_size
+        self.do_crop = True
+        self.center_crop = transforms.CenterCrop(self.image_size)
+
         # Load pre-trained ResNet-18
         resnet = models.resnet18(pretrained=True)
 
-        # Remove the final fully connected layer
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        # Remove the final fully connected layer and average pooling
+        # Keep only the convolutional feature extraction parts
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
 
-        # Add a new fully connected layer to match the desired output dimension
-        self.fc = nn.Linear(512, config.image_latent_dim)
+        # Use a dry run to get the feature map shape
+        dummy_shape = (1, config.image_channels,
+                       self.image_size, self.image_size)
+        self.register_buffer("dummy_input", torch.zeros(dummy_shape))
+        with torch.no_grad():
+            feature_map_shape = self.backbone(self.dummy_input).shape[1:]
+
+        # Number of spatial keypoints to extract
+        num_keypoints = 32  # Can be tuned based on needs
+
+        # Set up spatial softmax pooling
+        self.pool = SpatialSoftmax(
+            feature_map_shape, num_kp=num_keypoints
+        )
+
+        # The output dim of SpatialSoftmax is num_kp * 2
+        pool_out_dim = num_keypoints * 2
+
+        # Project to latent dimension
+        self.out = nn.Linear(pool_out_dim, config.image_latent_dim)
+        self.layer_norm = nn.LayerNorm(config.image_latent_dim)
 
         # Optional: freeze early layers for transfer learning
         # for param in list(self.backbone.parameters())[:-4]:
         #     param.requires_grad = False
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        features = self.backbone(images)
-        features = features.view(features.size(0), -1)  # Flatten
-        return self.fc(features)
+        """
+        Args:
+            images: (B, C, H, W) image tensor with pixel values in [0, 1].
+        Returns:
+            (B, D) image feature, where D is config.image_latent_dim.
+        """
+        # Ensure images are properly sized
+        if self.do_crop and (images.shape[-1] != self.image_size or images.shape[-2] != self.image_size):
+            images = self.center_crop(images)
+
+        # Extract backbone features
+        features = self.backbone(images)  # (B, C, H, W)
+
+        # Apply spatial softmax pooling
+        keypoints = self.pool(features)  # (B, K, 2)
+
+        # Flatten keypoints
+        features_flat = torch.flatten(keypoints, start_dim=1)  # (B, K*2)
+
+        # Apply final projection and layer norm
+        # (B, image_latent_dim)
+        output = self.layer_norm(self.out(features_flat))
+
+        return output
 
 
 class ImageDecoder(nn.Module):  # Remains the same
@@ -136,7 +187,7 @@ class ImageDecoder(nn.Module):  # Remains the same
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
                 64), nn.ReLU(inplace=True),
             nn.ConvTranspose2d(64, config.image_channels,
-                               kernel_size=4, stride=2, padding=1)
+                               kernel_size=4, stride=2, padding=1), nn.Sigmoid()
         )
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
@@ -404,12 +455,12 @@ def compute_loss(
     if 'predicted_forward_states' in predictions and 'forward_states' in targets:
         # GT is st_0 to st_F-1, target for model is st_1 to st_F-1
         target_fwd = targets['forward_states']
-        losses['forward_state_loss'] = F.mse_loss(
+        losses['forward_state_loss'] = F.l1_loss(
             predictions['predicted_forward_states'], target_fwd)
 
     # Backward state prediction loss
     if 'predicted_backward_states' in predictions and 'backward_states' in targets:
-        losses['backward_state_loss'] = F.mse_loss(
+        losses['backward_state_loss'] = F.l1_loss(
             predictions['predicted_backward_states'], targets['backward_states'])
 
     # Goal image reconstruction loss

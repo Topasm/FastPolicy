@@ -38,6 +38,9 @@ def main():
     print("Loading dataset metadata for normalization...")
     metadata = LeRobotDatasetMetadata("lerobot/pusht")
 
+    predicted_image_dir = Path("outputs/eval/predicted_images")
+    predicted_image_dir.mkdir(parents=True, exist_ok=True)
+
     # Get features for normalization
     # Convert raw feature dictionaries to PolicyFeature objects
     policy_features = dataset_to_policy_features(metadata.features)
@@ -212,6 +215,36 @@ def main():
 
         with torch.inference_mode():
             action = combined_policy.select_action(observation_for_policy)
+
+        predicted_img = combined_policy.latest_predicted_image
+        if predicted_img is not None:
+            print(
+                f"Predicted image shape before processing: {predicted_img.shape}")
+            print(f"Predicted image data type: {predicted_img.dtype}")
+
+            # First make sure we have the right dimensions for an image
+            predicted_img = predicted_img.squeeze(0).cpu().numpy()
+            print(
+                f"Predicted image shape after squeeze: {predicted_img.shape}")
+
+            # Check if we need to transpose dimensions to get HWC format
+            # Image should be in format (H, W, C) for saving
+            if len(predicted_img.shape) == 3 and predicted_img.shape[0] in [1, 3]:
+                # Image is likely in CHW format, convert to HWC
+                predicted_img = numpy.transpose(predicted_img, (1, 2, 0))
+                print(f"Transposed image shape: {predicted_img.shape}")
+
+            # Convert from 0-1 range to 0-255 range for proper image saving
+            predicted_img = (predicted_img * 255).astype(numpy.uint8)
+
+            try:
+                # Save the predicted image
+                imageio.imwrite(
+                    str(predicted_image_dir / f"predicted_image_{step}.png"), predicted_img)
+                print(f"Successfully saved predicted image for step {step}")
+            except Exception as e:
+                print(
+                    f"Error saving image: {e}, Image shape: {predicted_img.shape}")
 
         # Make sure action is on CPU before converting to numpy
         numpy_action = action.squeeze(0).cpu().numpy()
