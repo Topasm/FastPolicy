@@ -24,7 +24,7 @@ import json
 
 def main():
     # --- Configuration ---
-    bidirectional_output_dir = Path("outputs/train/bidirectional_transformer")
+    bidirectional_output_dir = Path("outputs/train/bidirectional_transformer2")
 
     state_diffusion_output_dir = Path(
         "outputs/train/rtdiffusion_state_predictor")

@@ -36,7 +36,7 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 def main():
     """Main training function."""
     # Configuration
-    output_directory = Path("outputs/train/bidirectional_transformer")
+    output_directory = Path("outputs/train/bidirectional_transformer2")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

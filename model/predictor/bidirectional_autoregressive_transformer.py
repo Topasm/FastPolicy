@@ -26,6 +26,7 @@ import torchvision.transforms as transforms
 from torch import Tensor
 
 from model.modules.modules import SpatialSoftmax
+from model.predictor.gpt_backbone import GPTBackbone
 
 
 @dataclass
@@ -468,20 +469,11 @@ def compute_loss(
         losses['goal_image_loss'] = F.mse_loss(
             predictions['predicted_goal_images'], targets['goal_images'])
 
-    # Latent consistency for goal image
-    if 'predicted_goal_latents' in predictions and 'goal_images' in targets:
-        with torch.no_grad():
-            # model.image_encoder is now always a single-frame encoder
-            goal_image_latents_gt = model.image_encoder(targets['goal_images'])
-        losses['goal_latent_consistency_loss'] = F.mse_loss(
-            predictions['predicted_goal_latents'], goal_image_latents_gt)
-
     # Loss weighting - simplified without AR losses
     weights = {
         'forward_state_loss': 1.0,
         'backward_state_loss': 1.0,
-        'goal_image_loss': 1.0,
-        'goal_latent_consistency_loss': 1.0,
+        'goal_image_loss': 1.0
     }
     total_loss = torch.tensor(
         0.0, device=predictions[next(iter(predictions))].device)
