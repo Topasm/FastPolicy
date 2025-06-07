@@ -262,8 +262,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
             Tensor of shape [batch_size, seq_len-1, action_dim] with actions
         """
 
-        start = 0
-        end = 15
+        start = 1
+        end = 8
         # Slice the state plan to use only the specified range
         state_plan = state_plan[:, start:end, :]
 

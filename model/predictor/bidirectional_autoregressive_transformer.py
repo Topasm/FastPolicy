@@ -21,9 +21,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any
 from pathlib import Path
 from lerobot.configs.types import NormalizationMode
-# from lerobot.configs.policies import PreTrainedConfig
-# from lerobot.common.optim.optimizers import AdamConfig
-# from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
+import torchvision.models as models
 
 
 @dataclass
@@ -139,27 +137,32 @@ class BidirectionalARTransformerConfig:
     )
 
 
-class ImageEncoder(nn.Module):  # Original Simple CNN Encoder
+class ImageEncoder(nn.Module):
+    """
+    ResNet-18 based image encoder for better feature extraction performance.
+    """
+
     def __init__(self, config: BidirectionalARTransformerConfig):
         super().__init__()
         self.config = config
-        self.encoder = nn.Sequential(
-            nn.Conv2d(config.image_channels, 64, kernel_size=4, stride=2,
-                      padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                256), nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                512), nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1), nn.BatchNorm2d(
-                512), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(512, config.image_latent_dim), nn.ReLU()
-        )
 
-    def forward(
-        self, images: torch.Tensor) -> torch.Tensor: return self.encoder(images)
+        # Load pre-trained ResNet-18
+        resnet = models.resnet18(pretrained=True)
+
+        # Remove the final fully connected layer
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+
+        # Add a new fully connected layer to match the desired output dimension
+        self.fc = nn.Linear(512, config.image_latent_dim)
+
+        # Optional: freeze early layers for transfer learning
+        # for param in list(self.backbone.parameters())[:-4]:
+        #     param.requires_grad = False
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(images)
+        features = features.view(features.size(0), -1)  # Flatten
+        return self.fc(features)
 
 
 class ImageDecoder(nn.Module):  # Remains the same
@@ -195,41 +198,32 @@ class BidirectionalARTransformer(nn.Module):
         self.image_key = image_key
 
         from lerobot.configs.types import FeatureType
-        self.feature_type = FeatureType  # For potential use, not directly used now
+        self.feature_type = FeatureType
 
-        # Use simple ImageEncoder
         print("Using ImageEncoder in BidirectionalARTransformer.")
         self.image_encoder = ImageEncoder(config)
-
         self.image_decoder = ImageDecoder(config)
 
         self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)
-        # Add back the image_latent_projection that was missing
         self.image_latent_projection = nn.Linear(
             config.image_latent_dim, config.hidden_dim)
 
-        # 각 이력 스텝의 (이미지 잠재값 + 상태 임베딩)을 hidden_dim으로 투영하는 레이어
-        self.history_step_feature_dim = config.image_latent_dim + config.hidden_dim
-        self.history_step_projector = nn.Linear(
-            self.history_step_feature_dim, config.hidden_dim)
+        # Removed history_step_projector - we'll use image_latent_projection and state_projection directly
 
-        # 토큰 타입 임베딩 (예: 0:HistStep, 1:QueryGoal, 2:QueryBwd, 3:QueryFwd)
-        # config.token_type_count 사용 (현재는 4로 하드코딩된 것과 유사)
-        self.NUM_QUERY_TYPES = 3  # Goal, Bwd, Fwd queries
-        self.TYPE_HIST_STEP = 0
-        self.TYPE_QUERY_GOAL = 1
-        self.TYPE_QUERY_BWD = 2
-        self.TYPE_QUERY_FWD = 3
+        # 새로운 토큰 타입 상수 정의
+        self.TYPE_HIST_IMG = 0    # History Image Token
+        self.TYPE_HIST_STATE = 1  # History State Token
+        self.TYPE_QUERY_GOAL = 2  # Goal Query Token
+        self.TYPE_QUERY_BWD = 3   # Backward Query Token
+        self.TYPE_QUERY_FWD = 4   # Forward Query Token
 
-        # Calculate total sequence length for transformer
-        self.total_seq_len = config.n_obs_steps + self.NUM_QUERY_TYPES
+        # 토큰 타입 임베딩 크기 수정 (총 5가지 타입)
+        self.token_type_embedding = nn.Embedding(5, config.hidden_dim)
 
-        # 실제 Embedding 크기는 사용될 타입의 총 개수 (여기서는 4)
-        self.token_type_embedding = nn.Embedding(4, config.hidden_dim)
-
-        # 위치 임베딩: 전체 시퀀스 길이에 맞춰야 함 (n_obs_steps + 3개의 쿼리 토큰)
-        # config.query_seq_len을 순수 쿼리 토큰 수 (3)으로 해석하고, 전체 길이는 동적 계산
-        self.num_queries = 3  # goal, bwd, fwd
+        # 위치 임베딩 크기 수정
+        # 전체 시퀀스 길이: (n_obs_steps * 2 (이미지+상태)) + 3 (쿼리 토큰들)
+        self.num_queries = 3
+        self.total_seq_len = (config.n_obs_steps * 2) + self.num_queries
         self.position_embedding = nn.Embedding(
             self.total_seq_len, config.hidden_dim)
 
@@ -279,169 +273,91 @@ class BidirectionalARTransformer(nn.Module):
 
     def _create_full_history_sequential_mask(self, device: torch.device) -> torch.Tensor:
         """
-        Creates a custom attention mask for the new sequence structure.
-
-        The sequence now consists of:
-        [Hist_1, Hist_2, ..., Hist_n, Goal_Q, Bwd_Q, Fwd_Q]
-
-        With the following attention pattern:
-        - Each token can attend to itself
-        - All tokens can attend to history tokens
-        - Goal query can only attend to history
-        - Backward query can attend to history and goal query
-        - Forward query can attend to all previous tokens
+        Creates an attention mask for the sequence of individual history tokens.
+        Seq: [ImgH_0, StateH_0, ..., ImgH_{n-1}, StateH_{n-1}, Q_goal, Q_bwd, Q_fwd]
         """
         n_obs = self.config.n_obs_steps
-        num_queries = 3  # Goal, Bwd, Fwd
-        seq_len = n_obs + num_queries
+        num_hist_tokens = n_obs * 2  # 각 스텝마다 이미지와 상태 토큰
+        num_queries = 3
+        seq_len = num_hist_tokens + num_queries
 
-        mask = torch.ones(seq_len, seq_len, dtype=torch.bool,
-                          device=device)  # True = cannot attend
-        mask.fill_diagonal_(False)  # Attend to self
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+        mask.fill_diagonal_(False)
 
-        # 1. 이력 토큰들 간의 어텐션: 여기서는 간단히 인과적으로 설정 (또는 모두 False로 하여 전체 어텐션)
-        for i in range(n_obs):
-            mask[i, i+1:n_obs] = True  # H_i는 H_j (j>i)에 어텐션 불가 (인과적)
-            # 또는 이 부분을 mask[i, :i+1] = False 로 하여 H_i가 H_0..H_i에 어텐션하도록 할 수 있음
-            # Seer처럼 전체 이력을 한 번에 처리하려면 이력 내에서는 서로 다 볼 수 있게 할 수도:
-            # mask[0:n_obs, 0:n_obs] = False (대각선 제외하고는 다 False)
-            # 여기서는 각 이력 토큰이 이전 이력 토큰만 보도록 인과적으로 설정
-            if i > 0:
-                mask[i, 0:i] = False
+        # 1. 이력 토큰들 간에는 서로 자유롭게 어텐션 허용 (Seer와 유사)
+        mask[0:num_hist_tokens, 0:num_hist_tokens] = False
 
         # 2. 모든 쿼리 토큰은 모든 이력 토큰에 어텐션 가능
-        mask[n_obs:, :n_obs] = False
+        mask[num_hist_tokens:, :num_hist_tokens] = False
 
         # 3. 쿼리 토큰들 간의 순차적 의존성
-        # Q_goal (idx n_obs)은 이력에만 의존 (이미 위에서 설정됨)
+        # Q_goal (idx: num_hist_tokens)
+        # Q_bwd (idx: num_hist_tokens + 1)
+        # Q_fwd (idx: num_hist_tokens + 2)
 
-        # Q_bwd (idx n_obs + 1)은 이력 및 Q_goal(n_obs)에 어텐션 가능
-        mask[n_obs + 1, n_obs] = False
+        # Q_bwd가 Q_goal에 어텐션 가능
+        mask[num_hist_tokens + 1, num_hist_tokens] = False
 
-        # Q_fwd (idx n_obs + 2)은 이력, Q_goal(n_obs), Q_bwd(n_obs + 1)에 어텐션 가능
-        mask[n_obs + 2, n_obs: n_obs + 2] = False
+        # Q_fwd가 Q_goal과 Q_bwd에 어텐션 가능
+        mask[num_hist_tokens + 2, num_hist_tokens: num_hist_tokens + 2] = False
 
         return mask
 
-    def _forward_training_with_sequential_history(
+    def _run_prediction(
         self,
-        history_tokens: torch.Tensor,  # [B, n_obs_steps, hidden_dim]
-        forward_states_gt: torch.Tensor,
-        goal_images_gt: torch.Tensor,
-        backward_states_gt: torch.Tensor,
-        device: torch.device
+        img_history_embeddings: torch.Tensor,   # [B, n_obs, hidden_dim]
+        state_history_embeddings: torch.Tensor,  # [B, n_obs, hidden_dim]
+        device: torch.device,
+        forward_states: Optional[torch.Tensor] = None,
+        goal_images: Optional[torch.Tensor] = None,
+        backward_states: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for training using observation history tokens directly.
-        """
-        batch_size = history_tokens.shape[0]
+        batch_size = img_history_embeddings.shape[0]
         n_obs = self.config.n_obs_steps
-        results = {}
 
-        # Prepare query tokens
+        # 1. 이력 토큰 시퀀스 구성 (이미지-상태 인터리빙)
+        # 결과: [B, 2 * n_obs, hidden_dim]
+        history_sequence = torch.stack(
+            [img_history_embeddings, state_history_embeddings], dim=2
+        ).flatten(start_dim=1, end_dim=2)
+
+        # 2. 쿼리 토큰 준비
         goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
         bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
         fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
 
-        # Concatenate tokens to form the input sequence
-        # [B, n_obs_steps + 3, hidden_dim]
-        input_sequence = torch.cat(
-            [history_tokens, goal_query, bwd_query, fwd_query], dim=1)
-
-        # Add token type embeddings
-        # First n_obs positions are history steps
-        hist_types = torch.full((batch_size, n_obs), self.TYPE_HIST_STEP,
-                                device=device, dtype=torch.long)
-
-        # Last 3 positions are query tokens
-        query_types = torch.tensor(
-            [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD],
-            device=device
-        ).unsqueeze(0).expand(batch_size, -1)
-
-        all_token_types = torch.cat([hist_types, query_types], dim=1)
-        input_sequence += self.token_type_embedding(all_token_types)
-
-        # Add position embeddings
-        positions = torch.arange(self.total_seq_len, device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        input_sequence += self.position_embedding(positions)
-
-        # Apply attention mask and run through transformer
-        attn_mask = self._create_full_history_sequential_mask(device)
-        hidden_states = self.transformer(src=input_sequence, mask=attn_mask)
-
-        # Extract query outputs for predictions
-        goal_hidden = hidden_states[:, n_obs]      # Goal query position
-        bwd_hidden = hidden_states[:, n_obs+1]     # Backward query position
-        fwd_hidden = hidden_states[:, n_obs+2]     # Forward query position
-
-        # Generate predictions (unchanged)
-        results['predicted_goal_latents'] = self.goal_image_latent_head(
-            goal_hidden)
-        results['predicted_goal_images'] = self.image_decoder(
-            results['predicted_goal_latents'])
-
-        bwd_flat = self.backward_state_head(bwd_hidden)
-        results['predicted_backward_states'] = bwd_flat.view(
-            batch_size, self.config.backward_steps, self.config.state_dim)
-
-        fwd_flat = self.forward_state_head(fwd_hidden)
-        results['predicted_forward_states'] = fwd_flat.view(
-            batch_size, self.config.forward_steps, self.config.state_dim)
-
-        return results
-
-    def _forward_inference_with_sequential_history(self,
-                                                   # [B, n_obs, hidden_dim]
-                                                   history_step_embeddings: torch.Tensor,
-                                                   device: torch.device
-                                                   ) -> Dict[str, torch.Tensor]:
-        batch_size = history_step_embeddings.shape[0]
-        n_obs = self.config.n_obs_steps
-        num_queries = 3  # Goal, Bwd, Fwd
-        results = {}
-
-        # 1. 쿼리 토큰들 준비
-        goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
-        bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
-        fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
-
-        # 2. 전체 시퀀스 구성: [이력스텝들, 목표쿼리, 역방향쿼리, 순방향쿼리]
-        # history_step_embeddings: [B, n_obs, D]
-        # goal_query, bwd_query, fwd_query: [B, 1, D]
+        # 3. 전체 시퀀스 구성
         full_sequence = torch.cat(
-            [history_step_embeddings, goal_query, bwd_query, fwd_query], dim=1
-        )  # Shape: [B, n_obs + num_queries, hidden_dim]
+            [history_sequence, goal_query, bwd_query, fwd_query], dim=1
+        )
 
-        # 3. 토큰 타입 임베딩 적용
-        hist_types = torch.full((batch_size, n_obs),
-                                self.TYPE_HIST_STEP, device=device)
-        query_types_list = [self.TYPE_QUERY_GOAL,
-                            self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD]
-        query_types = torch.tensor(query_types_list, device=device).unsqueeze(
+        # 4. 토큰 타입 및 위치 임베딩 적용
+        # 토큰 타입: [Img, State, Img, State, ..., Q_goal, Q_bwd, Q_fwd]
+        hist_types_per_step = torch.tensor(
+            [self.TYPE_HIST_IMG, self.TYPE_HIST_STATE], device=device)
+        hist_types = hist_types_per_step.repeat(n_obs)
+        query_types = torch.tensor(
+            [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD], device=device)
+        all_token_types = torch.cat([hist_types, query_types]).unsqueeze(
             0).expand(batch_size, -1)
-
-        all_token_types = torch.cat([hist_types, query_types], dim=1)
         full_sequence += self.token_type_embedding(all_token_types)
 
-        # 4. 위치 임베딩 적용
+        # 위치 임베딩
         positions = torch.arange(full_sequence.shape[1], device=device).unsqueeze(
             0).expand(batch_size, -1)
-        # self.position_embedding 크기 확인/조정 필요
         full_sequence += self.position_embedding(positions)
 
-        # 5. 새로운 어텐션 마스크 적용
+        # 5. 어텐션 마스크 적용 및 트랜스포머 통과
         attn_mask = self._create_full_history_sequential_mask(device)
-
-        # 6. 트랜스포머 통과
         hidden_states = self.transformer(src=full_sequence, mask=attn_mask)
 
-        # 7. 예측 헤드 사용 (쿼리 토큰들의 인덱스는 이제 n_obs 부터 시작)
-        goal_query_output = hidden_states[:, n_obs]
-        bwd_query_output = hidden_states[:, n_obs + 1]
-        fwd_query_output = hidden_states[:, n_obs + 2]
+        # 6. 예측 헤드 사용
+        num_hist_tokens = n_obs * 2
+        goal_query_output = hidden_states[:, num_hist_tokens]
+        bwd_query_output = hidden_states[:, num_hist_tokens + 1]
+        fwd_query_output = hidden_states[:, num_hist_tokens + 2]
 
+        results = {}
         predicted_goal_latents = self.goal_image_latent_head(goal_query_output)
         results['predicted_goal_images'] = self.image_decoder(
             predicted_goal_latents)
@@ -453,27 +369,27 @@ class BidirectionalARTransformer(nn.Module):
         )
 
         predicted_fwd_states_flat = self.forward_state_head(fwd_query_output)
-        # Fix: Use config.forward_steps instead of config.forward_steps - 1 to match the tensor size
         results['predicted_forward_states'] = predicted_fwd_states_flat.view(
             batch_size, self.config.forward_steps, self.config.state_dim
         )
+
         return results
 
     def forward(
         self,
         initial_images: torch.Tensor,  # Shape: [B, n_obs_steps, C, H, W]
         initial_states: torch.Tensor,  # Shape: [B, n_obs_steps, state_dim]
-        forward_states: Optional[torch.Tensor] = None,  # GT for training
-        goal_images: Optional[torch.Tensor] = None,     # GT for training
-        backward_states: Optional[torch.Tensor] = None,  # GT for training
+        forward_states: Optional[torch.Tensor] = None,
+        goal_images: Optional[torch.Tensor] = None,
+        backward_states: Optional[torch.Tensor] = None,
         training: bool = True
     ) -> Dict[str, torch.Tensor]:
         device = initial_images.device
         batch_size = initial_images.shape[0]
         n_obs = self.config.n_obs_steps
 
-        # 1. 과거 이력의 각 스텝별 특징 추출
-        img_hist_flat = initial_images.reshape(
+        # 1. 과거 이력의 각 스텝별 특징 추출 (기존과 동일)
+        img_hist_flat = initial_images.view(
             batch_size * n_obs, self.config.image_channels,
             self.config.image_size, self.config.image_size
         )
@@ -482,7 +398,7 @@ class BidirectionalARTransformer(nn.Module):
             batch_size, n_obs, self.config.image_latent_dim
         )
 
-        states_hist_flat = initial_states.reshape(
+        states_hist_flat = initial_states.view(
             batch_size * n_obs, self.config.state_dim)
         states_projected_per_step_flat = self.state_projection(
             states_hist_flat)
@@ -490,30 +406,27 @@ class BidirectionalARTransformer(nn.Module):
             batch_size, n_obs, self.config.hidden_dim
         )
 
-        # 2. 각 이력 스텝별 (이미지 잠재값 + 상태 임베딩) 결합 후 hidden_dim으로 투영
-        combined_history_features_per_step = torch.cat(
-            [img_latents_history, states_projected_history], dim=-1
-        )  # Shape: [B, n_obs, image_latent_dim + hidden_dim]
+        # 2. Seer와 유사하게, 이미지와 상태를 별도의 토큰으로 처리
+        # 이미지 잠재 벡터를 hidden_dim으로 투영
+        img_history_embeddings = self.image_latent_projection(
+            img_latents_history)  # [B, n_obs, hidden_dim]
+        # 상태 프로젝션은 이미 hidden_dim
+        # [B, n_obs, hidden_dim]
+        state_history_embeddings = states_projected_history
 
-        # history_step_embeddings: [B, n_obs, hidden_dim]
-        history_step_embeddings = self.history_step_projector(
-            combined_history_features_per_step)
+        # Training 체크는 하지만 내부 로직은 동일한 함수 사용
+        if training and (forward_states is None or goal_images is None or backward_states is None):
+            raise ValueError("Ground truth needed for training.")
 
-        # 이제 history_step_embeddings를 사용하여
-        # _forward_training_with_global_cond 또는 _forward_inference_with_sequential_history 호출
-        if training:
-            if forward_states is None or goal_images is None or backward_states is None:
-                raise ValueError("Ground truth needed for training.")
-            results = self._forward_training_with_sequential_history(
-                history_step_embeddings,  # [B, n_obs, hidden_dim]
-                forward_states,
-                goal_images,
-                backward_states,
-                device
-            )
-        else:  # Inference
-            results = self._forward_inference_with_sequential_history(history_step_embeddings,  # [B, n_obs, hidden_dim]
-                                                                      device)
+        # 통합된 예측 함수 호출
+        results = self._run_prediction(
+            img_history_embeddings,
+            state_history_embeddings,
+            device,
+            forward_states,
+            goal_images,
+            backward_states
+        )
 
         return results
 
