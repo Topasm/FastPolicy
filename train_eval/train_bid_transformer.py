@@ -36,7 +36,7 @@ from model.diffusion.configuration_mymodel import DiffusionConfig
 def main():
     """Main training function."""
     # Configuration
-    output_directory = Path("outputs/train/bidirectional_transformer2")
+    output_directory = Path("outputs/train/bidirectional_transformer32")
     output_directory.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,8 +58,8 @@ def main():
             "training_steps": training_steps,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
-            "forward_steps": 16,
-            "backward_steps": 16,
+            "forward_steps": 32,
+            "backward_steps": 32,
             "n_obs_steps": n_obs_steps,
         }
     )
@@ -100,8 +100,8 @@ def main():
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
-        forward_steps=16,
-        backward_steps=16,
+        forward_steps=32,
+        backward_steps=32,
         image_key="observation.image",
         state_key="observation.state",
         n_obs_steps=n_obs_steps  # Enable temporal encoding
@@ -128,8 +128,8 @@ def main():
         image_size=84,
         output_image_size=96,
         image_latent_dim=256,
-        forward_steps=16,
-        backward_steps=16,
+        forward_steps=32,
+        backward_steps=32,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features  # Pass the actual FeatureSpec objects

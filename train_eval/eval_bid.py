@@ -24,7 +24,8 @@ import json
 
 def main():
     # --- Configuration ---
-    bidirectional_output_dir = Path("outputs/train/bidirectional_transformer2")
+    bidirectional_output_dir = Path(
+        "outputs/train/bidirectional_transformer32")
 
     state_diffusion_output_dir = Path(
         "outputs/train/rtdiffusion_state_predictor")
@@ -96,10 +97,10 @@ def main():
 
         bidir_cfg = BidirectionalARTransformerConfig(
             state_dim=state_dim_from_meta,
-            image_size=96,  # This should match training
+            image_size=84,  # This should match training
             image_channels=image_channels_from_meta,  # This should match training
-            forward_steps=16,  # This should match training
-            backward_steps=16,
+            forward_steps=32,  # This should match training
+            backward_steps=32,
             input_features=input_features,  # Pass features for potential use in config
             # Bidir model defines its own outputs conceptually
             output_features=output_features,

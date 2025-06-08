@@ -55,7 +55,7 @@ class BidirectionalARTransformerConfig:
     num_query_tokens: int = 3
 
     # Number of action steps (not used in this model, but kept for compatibility)
-    n_action_steps = 8
+    n_action_steps = 32
 
     image_features = 1
     # Token types: HistImg, HistState, QueryGoal, QueryBwd, QueryFwd
