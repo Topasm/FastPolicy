@@ -211,7 +211,6 @@ def main():
             predictions = model(
                 initial_images=batch_device['initial_images'],
                 initial_states=batch_device['initial_states'],
-                normalized_timestep=batch_device['normalized_timestep'],
                 forward_states=batch_device['forward_states'],
                 goal_images=batch_device['goal_images'],
                 backward_states=batch_device['backward_states'],
