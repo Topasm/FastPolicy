@@ -163,6 +163,8 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
         transformer_predictions = self.base_transformer(
             initial_images=initial_images_input,  # Temporal sequence or single image
             initial_states=initial_states_input,  # Temporal sequence or single state
+            normalized_timestep=torch.ones(
+                initial_images_input.shape[0], device=self.device) * 0.1,  # Add the missing parameter
             training=False
         )
 
