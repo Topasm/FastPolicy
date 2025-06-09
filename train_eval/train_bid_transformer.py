@@ -28,7 +28,7 @@ from model.predictor.policy import (
     compute_loss
 )
 
-from model.predictor.config import BidirectionalARTransformerConfig
+from model.predictor.config import HierarchicalPolicyConfig
 from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
 from model.predictor.normalization_utils import KeyMappingNormalizer, KeyMappingUnnormalizer
 from model.diffusion.configuration_mymodel import DiffusionConfig
@@ -119,7 +119,7 @@ def main():
     )
 
     # --- Model Configuration ---
-    config = BidirectionalARTransformerConfig(
+    config = HierarchicalPolicyConfig(
         state_dim=state_dim,
         hidden_dim=512,  # Single dimension parameter used throughout the model
         num_layers=6,

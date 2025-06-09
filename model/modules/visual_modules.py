@@ -6,11 +6,11 @@ import torchvision.transforms as transforms
 from model.modules.modules import SpatialSoftmax
 
 # Import configuration from dedicated config file
-from model.predictor.config import BidirectionalARTransformerConfig
+from model.predictor.config import HierarchicalPolicyConfig
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, config: BidirectionalARTransformerConfig):
+    def __init__(self, config: HierarchicalPolicyConfig):
         super().__init__()
         self.config = config
         self.do_crop = True
@@ -41,7 +41,7 @@ class ImageEncoder(nn.Module):
 
 
 class ImageDecoder(nn.Module):
-    def __init__(self, config: BidirectionalARTransformerConfig):
+    def __init__(self, config: HierarchicalPolicyConfig):
         super().__init__()
         self.config = config
         self.initial_linear = nn.Sequential(

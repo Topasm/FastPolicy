@@ -3,13 +3,13 @@ import torch.nn as nn
 from typing import Dict
 
 from model.modules.visual_modules import ImageEncoder, ImageDecoder
-from model.predictor.config import BidirectionalARTransformerConfig
+from model.predictor.config import HierarchicalPolicyConfig
 
 
 class InputBlock(nn.Module):
     """이미지와 상태 입력을 받아 hidden_dim의 임베딩으로 변환합니다."""
 
-    def __init__(self, config: BidirectionalARTransformerConfig):
+    def __init__(self, config: HierarchicalPolicyConfig):
         super().__init__()
         self.config = config
         self.image_encoder = ImageEncoder(config)
@@ -32,7 +32,7 @@ class InputBlock(nn.Module):
 class OutputHeadBlock(nn.Module):
     """트랜스포머의 출력을 받아 최종 예측값을 생성합니다."""
 
-    def __init__(self, config: BidirectionalARTransformerConfig):
+    def __init__(self, config: HierarchicalPolicyConfig):
         super().__init__()
         self.config = config
         self.image_decoder = ImageDecoder(config)

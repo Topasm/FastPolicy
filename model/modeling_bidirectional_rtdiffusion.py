@@ -12,12 +12,12 @@ from lerobot.common.constants import OBS_STATE, OBS_IMAGE, OBS_ENV_STATE
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.common.datasets.utils import PolicyFeature
 
-from model.predictor.policy import BidirectionalARTransformer
+from model.predictor.policy import HierarchicalPolicyConfig
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.invdyn.invdyn import MlpInvDynamic
 
 
-class BidirectionalRTDiffusionPolicy(nn.Module):
+class HierarchicalPolicy(nn.Module):
     """
     Combined policy class that integrates:
     1. Bidirectional Transformer for state plan generation
@@ -29,7 +29,7 @@ class BidirectionalRTDiffusionPolicy(nn.Module):
 
     def __init__(
         self,
-        bidirectional_transformer: BidirectionalARTransformer,
+        bidirectional_transformer: HierarchicalPolicyConfig,
         inverse_dynamics_model: MlpInvDynamic,
         dataset_stats: dict,
         all_dataset_features: Dict[str, any],

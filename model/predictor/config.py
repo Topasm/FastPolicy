@@ -3,9 +3,11 @@
 Configuration classes for the Bidirectional Autoregressive Transformer.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any
 from lerobot.configs.types import NormalizationMode
+from pathlib import Path
+import json
 
 
 @dataclass
@@ -40,7 +42,35 @@ class HierarchicalPolicyConfig:
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
 
-    # Normalization mapping
+    def to_dict(self):
+        def feature_to_dict(feat):
+            if hasattr(feat, 'to_dict'):
+                return feat.to_dict()
+            if hasattr(feat, '__dataclass_fields__'):
+                return asdict(feat)
+            return str(feat)
+        d = asdict(self)
+        d["input_features"] = {k: feature_to_dict(
+            v) for k, v in self.input_features.items()}
+        d["output_features"] = {k: feature_to_dict(
+            v) for k, v in self.output_features.items()}
+        return d
+
+    def save_pretrained(self, output_dir: Path):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(self.to_dict(), f, indent=4)
+
+    @classmethod
+    def from_pretrained(cls, output_dir: Path):
+
+        config_path = Path(output_dir) / "config.json"
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+
+        return cls(**config_dict)
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
@@ -48,29 +78,3 @@ class HierarchicalPolicyConfig:
             "ACTION": NormalizationMode.MIN_MAX
         }
     )
-
-    def save_pretrained(self, output_dir):
-        """Save the configuration to a JSON file."""
-        import json
-        from pathlib import Path
-
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Convert to serializable dict
-        config_dict = {k: v for k, v in self.__dict__.items()}
-
-        # Handle non-serializable objects
-        if 'input_features' in config_dict:
-            config_dict['input_features'] = {
-                k: str(v) for k, v in config_dict['input_features'].items()}
-        if 'output_features' in config_dict:
-            config_dict['output_features'] = {
-                k: str(v) for k, v in config_dict['output_features'].items()}
-        if 'normalization_mapping' in config_dict:
-            config_dict['normalization_mapping'] = {k: v.value if hasattr(v, 'value') else v
-                                                    for k, v in config_dict['normalization_mapping'].items()}
-
-        # Save to file
-        with open(output_dir / "config.json", "w") as f:
-            json.dump(config_dict, f, indent=2)

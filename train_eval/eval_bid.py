@@ -3,14 +3,14 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
 from model.predictor.policy import (
-    BidirectionalARTransformer,
-    BidirectionalARTransformerConfig
+    HierarchicalAutoregressivePolicy,
+    HierarchicalPolicyConfig
 )
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.configs.types import NormalizationMode
 from lerobot.common.datasets.utils import dataset_to_policy_features
 # Import the modified BidirectionalRTDiffusionPolicy
-from model.modeling_bidirectional_rtdiffusion import BidirectionalRTDiffusionPolicy
+from model.modeling_bidirectional_rtdiffusion import HierarchicalPolicy
 from model.invdyn.invdyn import MlpInvDynamic  # Import MlpInvDynamic
 
 from pathlib import Path
@@ -76,16 +76,16 @@ def main():
     bidir_config_path = bidirectional_output_dir / "config.json"
     if bidir_config_path.is_file():
         # Load the configuration from the pretrained model
-        bidir_cfg = BidirectionalARTransformerConfig.from_pretrained(
+        bidir_cfg = HierarchicalPolicyConfig.from_pretrained(
             bidirectional_output_dir)
         print(
-            f"Loaded BidirectionalARTransformerConfig from {bidir_config_path}")
+            f"Loaded HierarchicalPolicyConfig from {bidir_config_path}")
 
         print("Note: Using modified BidirectionalARTransformer with query-based inference. "
               "This version should be significantly faster during inference.")
     else:
         print(
-            f"BidirectionalARTransformerConfig json not found at {bidir_config_path}. Using manual config.")
+            f"HierarchicalPolicyConfig json not found at {bidir_config_path}. Using manual config.")
         state_dim_from_meta = metadata.features.get(
             "observation.state", {}).get("shape", [2])[-1]
         # Ensure image_channels from metadata if available
@@ -95,7 +95,7 @@ def main():
             image_channels_from_meta = metadata.features[image_example_key][
                 "shape"][-1] if metadata.features[image_example_key]["shape"][-1] in [1, 3] else 3
 
-        bidir_cfg = BidirectionalARTransformerConfig(
+        bidir_cfg = HierarchicalPolicyConfig(
             state_dim=state_dim_from_meta,
             image_size=84,  # This should match training
             image_channels=image_channels_from_meta,  # This should match training
@@ -120,7 +120,7 @@ def main():
     print("Loading transformer model manually")
     print("Using default image encoder configuration")
 
-    transformer_model = BidirectionalARTransformer(
+    transformer_model = HierarchicalAutoregressivePolicy(
         config=bidir_cfg,
         state_key="observation.state",
         image_key="observation.image" if metadata.camera_keys else None
@@ -165,7 +165,7 @@ def main():
     inv_dyn_model.eval()
     inv_dyn_model.to(device)
 
-    combined_policy = BidirectionalRTDiffusionPolicy(
+    combined_policy = HierarchicalPolicy(
         bidirectional_transformer=transformer_model,
         inverse_dynamics_model=inv_dyn_model,
         all_dataset_features=metadata.features,  # MODIFICATION: Pass all feature specs

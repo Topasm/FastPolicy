@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional
 
 from model.modules.modules import SpatialSoftmax
 from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
-from model.predictor.config import BidirectionalARTransformerConfig
+from model.predictor.config import HierarchicalPolicyConfig
 from model.modules.component_blocks import InputBlock, OutputHeadBlock
 from model.modules.visual_modules import ImageEncoder, ImageDecoder
 import torch
@@ -68,7 +68,7 @@ def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.
 
 
 class HierarchicalAutoregressivePolicy(nn.Module):
-    def __init__(self, config: BidirectionalARTransformerConfig, **kwargs):
+    def __init__(self, config: HierarchicalPolicyConfig, **kwargs):
         super().__init__()
         self.config = config
 
