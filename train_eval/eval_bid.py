@@ -2,7 +2,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
 # CLDiffPhyConModel will be used as the State Diffusion Model
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.diffusion.configuration_mymodel import DiffusionConfig
-from model.predictor.bidirectional_autoregressive_transformer import (
+from model.predictor.policy import (
     BidirectionalARTransformer,
     BidirectionalARTransformerConfig
 )

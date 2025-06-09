@@ -23,11 +23,11 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatas
 from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 
-from model.predictor.bidirectional_autoregressive_transformer import (
-    BidirectionalARTransformer,
-    BidirectionalARTransformerConfig,
-    compute_loss  # Import the consolidated loss function
+from model.predictor.policy import (
+    GoalConditionedAutoregressivePolicy
 )
+
+from model.predictor.config import BidirectionalARTransformerConfig
 from model.predictor.bidirectional_dataset import BidirectionalTrajectoryDataset
 from model.predictor.normalization_utils import KeyMappingNormalizer, KeyMappingUnnormalizer
 from model.diffusion.configuration_mymodel import DiffusionConfig
@@ -120,20 +120,19 @@ def main():
     # --- Model Configuration ---
     config = BidirectionalARTransformerConfig(
         state_dim=state_dim,
-        hidden_dim=512,
+        hidden_dim=512,  # Single dimension parameter used throughout the model
         num_layers=6,
         num_heads=8,
         dropout=0.1,
         image_channels=3,
         image_size=84,
         output_image_size=96,
-        image_latent_dim=256,
         forward_steps=32,
         backward_steps=32,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
-        output_features=output_features  # Pass the actual FeatureSpec objects
-
+        output_features=output_features,  # Pass the actual FeatureSpec objects
+        max_sequence_length=512,  # Adjusted for forward/backward steps
     )
     print(f"Dataset size: {len(dataset)}")
     print(f"Batches per iteration: {len(dataloader)}")
@@ -157,10 +156,8 @@ def main():
         normalize_state_base, key_mapping)
 
     # Create the model without internal normalizers (we'll use external normalization)
-    model = BidirectionalARTransformer(
-        config=config,
-        state_key="observation.state",  # Keep state key for reference
-        image_key="observation.image"   # Keep image key for reference
+    model = GoalConditionedAutoregressivePolicy(
+        config=config
     )
     model.to(device)
     model.train()  # Set model to training mode
@@ -208,7 +205,7 @@ def main():
 
             # Forward pass
             # We've already normalized the batch with wrapped_normalizer above
-            predictions = model(
+            total_loss = model(
                 initial_images=batch_device['initial_images'],
                 initial_states=batch_device['initial_states'],
                 forward_states=batch_device['forward_states'],
@@ -217,11 +214,6 @@ def main():
                 training=True
             )
 
-            # Compute losses using the consolidated function
-            # Targets for loss are directly from the batch_device (already normalized)
-            losses = compute_loss(model, predictions, batch_device)
-            total_loss = losses['total_loss']
-
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -229,43 +221,14 @@ def main():
 
             # Logging
             if step % log_freq == 0:
-                log_str = f"Step: {step}/{training_steps} | Total Loss: {total_loss.item():.4f}"
+                # 훨씬 간결해진 로깅
+                log_str = f"Step: {step}/{training_steps} | Autoregressive Loss: {total_loss.item():.4f}"
+                print(log_str)
 
-                # Create a dictionary for WandB logging
                 wandb_log = {
-                    'train/total_loss': total_loss.item(),
+                    'train/autoregressive_loss': total_loss.item(),
                     'train/learning_rate': optimizer.param_groups[0]['lr']
                 }
-
-                # Log individual losses
-                for loss_name, loss_val in losses.items():
-                    if loss_name != 'total_loss':
-                        log_str += f" | {loss_name}: {loss_val.item():.4f}"
-                        wandb_log[f'train/{loss_name}'] = loss_val.item()
-
-                print(log_str)
-                print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6e}")
-
-                # Log image reconstructions if they exist in predictions
-                if 'predicted_goal_images' in predictions and batch_device['goal_images'] is not None:
-                    # Get a sample of ground truth and predicted images
-                    # Take first 4 images
-                    gt_images = batch_device['goal_images'][:4].detach().cpu()
-                    pred_images = predictions['predicted_goal_images'][:4].detach(
-                    ).cpu()
-
-                    # Process ground truth and predicted images
-                    for i in range(min(4, gt_images.shape[0])):
-                        # Images are already in 0-1 range, no normalization needed
-                        gt_img = gt_images[i]
-                        pred_img = predictions['predicted_goal_images'][i].detach(
-                        ).cpu()
-
-                        # Add images to wandb log
-                        wandb_log[f'images/sample_{i}_gt'] = wandb.Image(
-                            gt_img.permute(1, 2, 0).numpy())
-                        wandb_log[f'images/sample_{i}_pred'] = wandb.Image(
-                            pred_img.permute(1, 2, 0).numpy())
 
                 # Log to WandB
                 wandb.log(wandb_log, step=step)

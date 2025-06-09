@@ -25,7 +25,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 
 from model.modules.modules import SpatialSoftmax
-from model.predictor.custom_transformer import CustomTransformerEncoderLayer, CustomTransformerEncoder, RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
+from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 
 
 @dataclass
@@ -317,7 +317,11 @@ class BidirectionalARTransformer(nn.Module):
 
         # --- 모듈화된 블록 초기화 ---
         self.input_block = InputBlock(config)
-        self.output_block = OutputHeadBlock(config)
+        # self.output_block = OutputHeadBlock(config)  # 제거
+
+        # --- 새로운 단일 출력 헤드 추가 ---
+        # 트랜스포머의 hidden_dim을 입력받아 다음 state_dim을 예측
+        self.next_state_head = nn.Linear(config.hidden_dim, config.state_dim)
 
         # --- ❗️❗️ PyTorch 기본 라이브러리를 사용했을 때와 동일한 방식으로 조립 ❗️❗️ ---
 
@@ -399,6 +403,179 @@ class BidirectionalARTransformer(nn.Module):
 
         return mask
 
+    # 추가: 미래 타임스텝을 보지 못하도록 하는 Causal Mask 생성 메서드
+    def _create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """미래 타임스텝을 보지 못하도록 하는 Causal Mask를 생성합니다."""
+        mask = torch.triu(torch.ones(seq_len, seq_len,
+                          device=device), diagonal=1).bool()
+        # True인 위치는 어텐션 계산에서 무시됩니다.
+        return mask
+
+    def forward(self,
+                initial_images,
+                initial_states,
+                goal_images,
+                backward_states,
+                forward_states,
+                **kwargs):
+        device = initial_images.device
+        batch_size = initial_images.shape[0]
+
+        # --- 1. 입력 시퀀스 구성 ---
+        # 가. 이력(History) 임베딩
+        img_embed, state_embed = self.input_block(
+            initial_images, initial_states)
+        history_sequence = torch.stack(
+            [img_embed, state_embed], dim=2
+        ).flatten(start_dim=1, end_dim=2)
+
+        # 나. 목표(Target) 시퀀스 구성 (state만 사용, 이미지는 생략)
+        target_sequence_states = torch.cat([
+            torch.flip(backward_states, [1]),  # 역방향 궤적을 시간순으로 뒤집음
+            forward_states
+        ], dim=1)
+
+        # 다. 목표 시퀀스를 hidden_dim으로 임베딩
+        target_sequence_embed = self.state_projection(target_sequence_states)
+
+        # 라. 전체 시퀀스 결합: [이력, 목표 궤적]
+        full_sequence = torch.cat(
+            [history_sequence, target_sequence_embed], dim=1)
+        seq_len = full_sequence.shape[1]
+
+        # 위치 임베딩 적용
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+        full_sequence += self.position_embedding(positions)
+
+        # --- 2. Causal Mask를 사용하여 디코더 순전파 ---
+        causal_mask = self._create_causal_mask(seq_len, device)
+        hidden_states = self.transformer(src=full_sequence, mask=causal_mask)
+
+        # --- 3. 다음 스텝 예측 및 Loss 계산 준비 ---
+        predicted_next_states = self.next_state_head(hidden_states)
+
+        # Loss 계산을 위해, 예측의 마지막 스텝은 제외
+        predictions_for_loss = predicted_next_states[:, :-1, :]
+
+        # 정답 시퀀스는 첫 스텝을 제외하고 예측 대상이 됨
+        targets_for_loss = target_sequence_states
+
+        loss = F.l1_loss(predictions_for_loss, targets_for_loss)
+
+        return loss, predictions_for_loss
+
+    @torch.no_grad()
+    def generate(self, initial_images, initial_states, max_traj_len: int):
+        """Autoregressively generate future states up to max_traj_len."""
+        self.eval()  # switch to inference mode
+        device = initial_images.device
+
+        # 1. prepare history embeddings
+        img_embed, state_embed = self.input_block(
+            initial_images, initial_states)
+        generated_sequence = torch.stack(
+            [img_embed, state_embed], dim=2
+        ).flatten(start_dim=1, end_dim=2)
+
+        # 2. autoregressive loop
+        for _ in range(max_traj_len):
+            current_len = generated_sequence.shape[1]
+            positions = torch.arange(current_len, device=device).unsqueeze(0)
+            input_sequence = generated_sequence + \
+                self.position_embedding(positions)
+
+            causal_mask = self._create_causal_mask(current_len, device)
+            hidden_states = self.transformer(
+                src=input_sequence, mask=causal_mask)
+
+            last_hidden = hidden_states[:, -1, :]
+            next_state = self.next_state_head(last_hidden)
+
+            next_embed = self.state_projection(next_state).unsqueeze(1)
+            generated_sequence = torch.cat(
+                [generated_sequence, next_embed], dim=1)
+
+        # return embeddings for generated steps
+        return generated_sequence[:, -max_traj_len:, :]
+
+
+# --- 새로운 Encoder-Decoder 기반 트랜스포머 모델 ---
+class EncoderDecoderTransformer(nn.Module):
+    def __init__(self, config: BidirectionalARTransformerConfig, state_key: str = "observation.state", image_key: str = "observation.image"):
+        super().__init__()
+        self.config = config
+        self.state_key = state_key
+        self.image_key = image_key
+
+        from lerobot.configs.types import FeatureType
+        self.feature_type = FeatureType
+
+        # --- 1. 입력 처리 모듈 ---
+        self.input_block = InputBlock(config)
+
+        # --- 2. 인코더 정의 ---
+        # 이력 정보를 처리하여 '기억(memory)'을 생성
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim, nhead=config.num_heads, dim_feedforward=config.hidden_dim * 4,
+            dropout=config.dropout, activation='gelu', batch_first=True, norm_first=True
+        )
+        self.context_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=config.num_layers,
+            norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
+        )
+
+        # --- 3. 디코더 정의 ---
+        # '기억'을 바탕으로 쿼리에 대한 답을 생성
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.hidden_dim, nhead=config.num_heads, dim_feedforward=config.hidden_dim * 4,
+            dropout=config.dropout, activation='gelu', batch_first=True, norm_first=True
+        )
+        self.prediction_decoder = nn.TransformerDecoder(
+            decoder_layer, num_layers=config.num_layers,
+            norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
+        )
+
+        # --- 4. 출력 처리 모듈 ---
+        self.output_block = OutputHeadBlock(config)
+
+        # --- 5. 임베딩 및 쿼리 토큰 ---
+        self.TYPE_HIST_IMG, self.TYPE_HIST_STATE, self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD = 0, 1, 2, 3, 4
+        self.token_type_embedding = nn.Embedding(5, config.hidden_dim)
+
+        # 인코더와 디코더의 위치 임베딩을 별도로 가질 수 있음
+        self.encoder_pos_embedding = nn.Embedding(
+            config.n_obs_steps * 2, config.hidden_dim)
+        self.decoder_pos_embedding = nn.Embedding(
+            config.num_query_tokens, config.hidden_dim)
+
+        self.goal_image_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+        self.backward_seq_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+        self.forward_seq_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
+
+        self.apply(self._init_weights)
+
+        print("✅ Using Encoder-Decoder Transformer architecture")
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d)):
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            if module.weight is not None:
+                torch.nn.init.ones_(module.weight)
+        elif isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+            torch.nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
     def forward(
         self,
         initial_images: torch.Tensor,
@@ -410,54 +587,63 @@ class BidirectionalARTransformer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         device = initial_images.device
         batch_size = initial_images.shape[0]
-        n_obs = self.config.n_obs_steps
-
-        # 1. 입력 처리 (모듈 호출)
-        img_history_embeddings, state_history_embeddings = self.input_block(
-            initial_images, initial_states)
 
         # Training 체크 (그대로 유지)
         if training and (forward_states is None or goal_images is None or backward_states is None):
             raise ValueError("Ground truth needed for training.")
 
-        # 2. 시퀀스 구성
+        # === 인코더 순전파 ===
+        # 1. 이력 데이터를 임베딩으로 변환
+        img_embed, state_embed = self.input_block(
+            initial_images, initial_states)
         history_sequence = torch.stack(
-            [img_history_embeddings, state_history_embeddings], dim=2
-        ).flatten(start_dim=1, end_dim=2)
+            [img_embed, state_embed], dim=2).flatten(start_dim=1, end_dim=2)
 
-        goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
-        bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
-        fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
+        # 2. 이력 시퀀스에 위치 및 타입 정보 추가
+        n_hist_tokens = history_sequence.shape[1]
+        hist_types = torch.tensor(
+            [self.TYPE_HIST_IMG, self.TYPE_HIST_STATE], device=device).repeat(self.config.n_obs_steps)
+        hist_types = hist_types.unsqueeze(0).expand(batch_size, -1)
+        history_sequence = history_sequence + \
+            self.token_type_embedding(hist_types)
 
-        full_sequence = torch.cat(
-            [history_sequence, goal_query, bwd_query, fwd_query], dim=1
-        )
+        pos_indices = torch.arange(n_hist_tokens, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        history_sequence = history_sequence + \
+            self.encoder_pos_embedding(pos_indices)
 
-        # 3. 토큰 타입 및 위치 임베딩 적용
-        hist_types_per_step = torch.tensor(
-            [self.TYPE_HIST_IMG, self.TYPE_HIST_STATE], device=device)
-        hist_types = hist_types_per_step.repeat(n_obs)
+        # 3. 인코더를 통과시켜 '기억' 생성
+        memory = self.context_encoder(history_sequence)
 
+        # === 디코더 순전파 ===
+        # 4. 쿼리 토큰으로 디코더 입력(tgt) 생성
+        goal_q = self.goal_image_query_token.expand(batch_size, -1, -1)
+        bwd_q = self.backward_seq_query_token.expand(batch_size, -1, -1)
+        fwd_q = self.forward_seq_query_token.expand(batch_size, -1, -1)
+        tgt_sequence = torch.cat([goal_q, bwd_q, fwd_q], dim=1)
+
+        # 5. 디코더 입력에 위치 및 타입 정보 추가
+        n_query_tokens = tgt_sequence.shape[1]
         query_types = torch.tensor(
             [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD], device=device)
+        query_types = query_types.unsqueeze(0).expand(batch_size, -1)
+        tgt_sequence = tgt_sequence + self.token_type_embedding(query_types)
 
-        all_token_types = torch.cat([hist_types, query_types]).unsqueeze(
-            0).expand(batch_size, -1)
+        query_pos_indices = torch.arange(
+            n_query_tokens, device=device).unsqueeze(0).expand(batch_size, -1)
+        tgt_sequence = tgt_sequence + \
+            self.decoder_pos_embedding(query_pos_indices)
 
-        full_sequence += self.token_type_embedding(all_token_types)
+        # 6. 디코더를 통과시켜 최종 hidden_states 생성
+        # 디코더는 타겟(tgt)과 메모리(memory)를 모두 입력으로 받음
+        # 현재 구현에서는 마스크 없이 full attention을 사용
+        decoder_output = self.prediction_decoder(
+            tgt=tgt_sequence, memory=memory)
 
-        positions = torch.arange(full_sequence.shape[1], device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        full_sequence += self.position_embedding(positions)
+        # 7. 출력 헤드를 통해 최종 예측값 생성
+        predictions = self.output_block(decoder_output)
 
-        # 4. 트랜스포머 백본 통과
-        attn_mask = self._create_full_history_sequential_mask(device)
-        hidden_states = self.transformer(src=full_sequence, mask=attn_mask)
-
-        # 5. 출력 처리 (모듈 호출)
-        results = self.output_block(hidden_states)
-
-        return results
+        return predictions
 
 
 def compute_loss(

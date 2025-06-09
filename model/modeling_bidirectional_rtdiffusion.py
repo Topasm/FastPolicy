@@ -12,7 +12,7 @@ from lerobot.common.constants import OBS_STATE, OBS_IMAGE, OBS_ENV_STATE
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.common.datasets.utils import PolicyFeature
 
-from model.predictor.bidirectional_autoregressive_transformer import BidirectionalARTransformer
+from model.predictor.policy import BidirectionalARTransformer
 from model.diffusion.modeling_clphycon import CLDiffPhyConModel
 from model.invdyn.invdyn import MlpInvDynamic
 
