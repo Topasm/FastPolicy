@@ -193,7 +193,7 @@ class HierarchicalPolicy(nn.Module):
         """
 
         start = 0
-        end = 31
+        end = 7
         # Slice the state plan to use only the specified range
         state_plan = state_plan[:, start:end, :]
 

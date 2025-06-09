@@ -37,6 +37,7 @@ class HierarchicalPolicyConfig:
     forward_steps: int = 32
     backward_steps: int = 32
     n_obs_steps: int = 3  # Number of observation steps for temporal encoding
+    n_action_steps: int = 8  # Number of action steps to predict
 
     # Feature specifications
     input_features: Dict[str, Any] = field(default_factory=dict)
