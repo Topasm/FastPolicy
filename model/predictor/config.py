@@ -9,7 +9,7 @@ from lerobot.configs.types import NormalizationMode
 
 
 @dataclass
-class BidirectionalARTransformerConfig:
+class HierarchicalPolicyConfig:
     """Configuration for the Bidirectional Autoregressive Transformer."""
     state_dim: int = 7
     hidden_dim: int = 256  # Main dimension parameter used throughout the model
