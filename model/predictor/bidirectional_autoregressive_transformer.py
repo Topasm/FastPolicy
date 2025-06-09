@@ -23,10 +23,8 @@ from pathlib import Path
 from lerobot.configs.types import NormalizationMode
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch import Tensor
 
 from model.modules.modules import SpatialSoftmax
-from model.predictor.gpt_backbone import GPTBackbone
 
 
 @dataclass
@@ -34,8 +32,8 @@ class BidirectionalARTransformerConfig:
     """Configuration for the Bidirectional Autoregressive Transformer."""
     state_dim: int = 7
     hidden_dim: int = 512
-    num_layers: int = 6
-    num_heads: int = 12
+    num_layers: int = 8
+    num_heads: int = 8  # Changed from 12 to 8 to make 512 evenly divisible
     dropout: float = 0.1
     layernorm_epsilon: float = 1e-5
     image_latent_dim: int = 256  # Latent dimension for image features
@@ -211,6 +209,101 @@ class ImageDecoder(nn.Module):  # Remains the same
         return self.decoder(x)
 
 
+# --- 1. 입력 처리 모듈 ---
+class InputBlock(nn.Module):
+    """이미지와 상태 입력을 받아 hidden_dim의 임베딩으로 변환합니다."""
+
+    def __init__(self, config: BidirectionalARTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.image_encoder = ImageEncoder(config)
+        self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)
+        self.image_latent_projection = nn.Linear(
+            config.image_latent_dim, config.hidden_dim)
+
+    def forward(self, initial_images: torch.Tensor, initial_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = initial_images.shape[0]
+        n_obs = self.config.n_obs_steps
+
+        # 이미지 처리
+        img_hist_flat = initial_images.view(
+            batch_size * n_obs, self.config.image_channels,
+            self.config.output_image_size, self.config.output_image_size
+        )
+        img_latents_per_step_flat = self.image_encoder(img_hist_flat)
+        img_latents_history = img_latents_per_step_flat.view(
+            batch_size, n_obs, self.config.image_latent_dim
+        )
+        img_history_embeddings = self.image_latent_projection(
+            img_latents_history)
+
+        # 상태 처리
+        states_hist_flat = initial_states.view(
+            batch_size * n_obs, self.config.state_dim)
+        states_projected_per_step_flat = self.state_projection(
+            states_hist_flat)
+        state_history_embeddings = states_projected_per_step_flat.view(
+            batch_size, n_obs, self.config.hidden_dim
+        )
+
+        return img_history_embeddings, state_history_embeddings
+
+
+# --- 2. 출력 처리 모듈 ---
+class OutputHeadBlock(nn.Module):
+    """트랜스포머의 출력을 받아 최종 예측값을 생성합니다."""
+
+    def __init__(self, config: BidirectionalARTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.image_decoder = ImageDecoder(config)
+        self.progress_head = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2), nn.ReLU(),
+            nn.Linear(config.hidden_dim // 2, 1), nn.Sigmoid())
+        self.forward_state_head = nn.Linear(
+            config.hidden_dim, config.forward_steps * config.state_dim)
+        self.goal_image_latent_head = nn.Linear(
+            config.hidden_dim, config.image_latent_dim)
+        self.backward_state_head = nn.Linear(
+            config.hidden_dim, config.backward_steps * config.state_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        batch_size = hidden_states.shape[0]
+        n_obs = self.config.n_obs_steps
+        num_hist_tokens = n_obs * 2
+
+        # 각 쿼리의 출력 추출
+        goal_query_output = hidden_states[:, num_hist_tokens]
+        bwd_query_output = hidden_states[:, num_hist_tokens + 1]
+        fwd_query_output = hidden_states[:, num_hist_tokens + 2]
+
+        # 예측 헤드 통과
+        results = {}
+        predicted_goal_latents = self.goal_image_latent_head(goal_query_output)
+        results['predicted_goal_images'] = self.image_decoder(
+            predicted_goal_latents)
+        results['predicted_goal_latents'] = predicted_goal_latents
+
+        predicted_bwd_states_flat = self.backward_state_head(bwd_query_output)
+        results['predicted_backward_states'] = predicted_bwd_states_flat.view(
+            batch_size, self.config.backward_steps, self.config.state_dim
+        )
+
+        predicted_fwd_states_flat = self.forward_state_head(fwd_query_output)
+        results['predicted_forward_states'] = predicted_fwd_states_flat.view(
+            batch_size, self.config.forward_steps, self.config.state_dim
+        )
+
+        # 진행도(progress) 예측
+        history_output_embeddings = hidden_states[:, :num_hist_tokens]
+        avg_history_embedding = torch.mean(history_output_embeddings, dim=1)
+        results['predicted_progress'] = self.progress_head(
+            avg_history_embedding)
+
+        return results
+
+
+# --- 3. 메인 BidirectionalARTransformer 리팩토링 ---
 class BidirectionalARTransformer(nn.Module):
     def __init__(self, config: BidirectionalARTransformerConfig, state_key: str = "observation.state", image_key: str = "observation.image"):
         super().__init__()
@@ -221,60 +314,42 @@ class BidirectionalARTransformer(nn.Module):
         from lerobot.configs.types import FeatureType
         self.feature_type = FeatureType
 
-        print("Using ImageEncoder in BidirectionalARTransformer.")
-        self.image_encoder = ImageEncoder(config)
-        self.image_decoder = ImageDecoder(config)
+        # --- 모듈화된 블록 초기화 ---
+        self.input_block = InputBlock(config)
+        self.output_block = OutputHeadBlock(config)
 
-        self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)
-        self.image_latent_projection = nn.Linear(
-            config.image_latent_dim, config.hidden_dim)
-
-        # Remove timestep projection layer
-
-        # Keep progress_head for auxiliary loss
-        self.progress_head = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim // 2, 1),
-            nn.Sigmoid()
+        # --- 트랜스포머 백본 (표준 PyTorch 트랜스포머) ---
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.hidden_dim * 4,
+            dropout=config.dropout,
+            activation='gelu',      # 표준적이고 안정적인 GELU 사용
+            batch_first=True,       # (batch, seq, feature) 순서
+            norm_first=True         # Pre-LN 구조로 안정적인 학습 유도
         )
 
-        # Simplified token type definitions (5 types total)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config.num_layers,
+            norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
+        )
+
+        print("✅ Using PyTorch's standard `nn.TransformerEncoder` as the backbone.")
+
+        # --- 시퀀스 구성을 위한 임베딩 및 쿼리 토큰 (메인 클래스에서 관리) ---
         self.TYPE_HIST_IMG, self.TYPE_HIST_STATE, self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD = 0, 1, 2, 3, 4
-
-        # Update token type embedding size to 5
         self.token_type_embedding = nn.Embedding(5, config.hidden_dim)
-
-        # Update position embedding size (removed time token)
         self.num_queries = 3
         self.total_seq_len = (config.n_obs_steps * 2) + self.num_queries
         self.position_embedding = nn.Embedding(
             self.total_seq_len, config.hidden_dim)
-
         self.goal_image_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
         self.backward_seq_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
         self.forward_seq_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
-
-        # Output heads remain unchanged
-        self.forward_state_head = nn.Linear(
-            config.hidden_dim, (config.forward_steps) * config.state_dim)
-        self.goal_image_latent_head = nn.Linear(
-            config.hidden_dim, config.image_latent_dim)
-        self.backward_state_head = nn.Linear(
-            config.hidden_dim, config.backward_steps * config.state_dim)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_dim, nhead=config.num_heads,
-            dim_feedforward=config.hidden_dim * 4, dropout=config.dropout,
-            activation='gelu', batch_first=True, norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=config.num_layers,
-            norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
-        )
 
         self.apply(self._init_weights)
 
@@ -322,87 +397,6 @@ class BidirectionalARTransformer(nn.Module):
 
         return mask
 
-    def _run_prediction(
-        self,
-        img_history_embeddings: torch.Tensor,
-        state_history_embeddings: torch.Tensor,
-        device: torch.device,
-        forward_states: Optional[torch.Tensor] = None,
-        goal_images: Optional[torch.Tensor] = None,
-        backward_states: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
-        batch_size = img_history_embeddings.shape[0]
-        n_obs = self.config.n_obs_steps
-
-        # 1. Construct history token sequence (interleaving image-state)
-        history_sequence = torch.stack(
-            [img_history_embeddings, state_history_embeddings], dim=2
-        ).flatten(start_dim=1, end_dim=2)
-
-        # 2. Prepare query tokens
-        goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
-        bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
-        fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
-
-        # 3. Construct full sequence (without time condition token)
-        full_sequence = torch.cat(
-            [history_sequence, goal_query, bwd_query, fwd_query], dim=1
-        )
-
-        # 4. Apply token type and position embeddings
-        hist_types_per_step = torch.tensor(
-            [self.TYPE_HIST_IMG, self.TYPE_HIST_STATE], device=device)
-        hist_types = hist_types_per_step.repeat(n_obs)
-
-        query_types = torch.tensor(
-            [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD], device=device)
-
-        all_token_types = torch.cat([hist_types, query_types]).unsqueeze(
-            0).expand(batch_size, -1)
-
-        full_sequence += self.token_type_embedding(all_token_types)
-
-        # Position embeddings
-        positions = torch.arange(full_sequence.shape[1], device=device).unsqueeze(
-            0).expand(batch_size, -1)
-        full_sequence += self.position_embedding(positions)
-
-        # 5. Apply attention mask and run transformer
-        attn_mask = self._create_full_history_sequential_mask(device)
-        hidden_states = self.transformer(src=full_sequence, mask=attn_mask)
-
-        # 6. Predict progress (auxiliary prediction)
-        num_hist_tokens = n_obs * 2
-        history_output_embeddings = hidden_states[:, :num_hist_tokens]
-        avg_history_embedding = torch.mean(history_output_embeddings, dim=1)
-        predicted_progress = self.progress_head(avg_history_embedding)
-
-        # 7. Use prediction heads (updated indices)
-        # No time token to skip
-        goal_query_output = hidden_states[:, num_hist_tokens]
-        bwd_query_output = hidden_states[:, num_hist_tokens + 1]
-        fwd_query_output = hidden_states[:, num_hist_tokens + 2]
-
-        results = {}
-        predicted_goal_latents = self.goal_image_latent_head(goal_query_output)
-        results['predicted_goal_images'] = self.image_decoder(
-            predicted_goal_latents)
-        results['predicted_goal_latents'] = predicted_goal_latents
-
-        predicted_bwd_states_flat = self.backward_state_head(bwd_query_output)
-        results['predicted_backward_states'] = predicted_bwd_states_flat.view(
-            batch_size, self.config.backward_steps, self.config.state_dim
-        )
-
-        predicted_fwd_states_flat = self.forward_state_head(fwd_query_output)
-        results['predicted_forward_states'] = predicted_fwd_states_flat.view(
-            batch_size, self.config.forward_steps, self.config.state_dim
-        )
-
-        results['predicted_progress'] = predicted_progress
-
-        return results
-
     def forward(
         self,
         initial_images: torch.Tensor,
@@ -416,50 +410,55 @@ class BidirectionalARTransformer(nn.Module):
         batch_size = initial_images.shape[0]
         n_obs = self.config.n_obs_steps
 
-        # 1. 과거 이력의 각 스텝별 특징 추출 (기존과 동일)
-        img_hist_flat = initial_images.view(
-            batch_size * n_obs, self.config.image_channels,
-            self.config.output_image_size, self.config.output_image_size
-        )
-        img_latents_per_step_flat = self.image_encoder(img_hist_flat)
-        img_latents_history = img_latents_per_step_flat.view(
-            batch_size, n_obs, self.config.image_latent_dim
-        )
+        # 1. 입력 처리 (모듈 호출)
+        img_history_embeddings, state_history_embeddings = self.input_block(
+            initial_images, initial_states)
 
-        states_hist_flat = initial_states.view(
-            batch_size * n_obs, self.config.state_dim)
-        states_projected_per_step_flat = self.state_projection(
-            states_hist_flat)
-        states_projected_history = states_projected_per_step_flat.view(
-            batch_size, n_obs, self.config.hidden_dim
-        )
-
-        # 2. Seer와 유사하게, 이미지와 상태를 별도의 토큰으로 처리
-        # 이미지 잠재 벡터를 hidden_dim으로 투영
-        img_history_embeddings = self.image_latent_projection(
-            img_latents_history)  # [B, n_obs, hidden_dim]
-        # 상태 프로젝션은 이미 hidden_dim
-        # [B, n_obs, hidden_dim]
-        state_history_embeddings = states_projected_history
-
-        # Training 체크는 하지만 내부 로직은 동일한 함수 사용
+        # Training 체크 (그대로 유지)
         if training and (forward_states is None or goal_images is None or backward_states is None):
             raise ValueError("Ground truth needed for training.")
 
-        results = self._run_prediction(
-            img_history_embeddings,
-            state_history_embeddings,
-            device,
-            forward_states,
-            goal_images,
-            backward_states
+        # 2. 시퀀스 구성
+        history_sequence = torch.stack(
+            [img_history_embeddings, state_history_embeddings], dim=2
+        ).flatten(start_dim=1, end_dim=2)
+
+        goal_query = self.goal_image_query_token.expand(batch_size, -1, -1)
+        bwd_query = self.backward_seq_query_token.expand(batch_size, -1, -1)
+        fwd_query = self.forward_seq_query_token.expand(batch_size, -1, -1)
+
+        full_sequence = torch.cat(
+            [history_sequence, goal_query, bwd_query, fwd_query], dim=1
         )
+
+        # 3. 토큰 타입 및 위치 임베딩 적용
+        hist_types_per_step = torch.tensor(
+            [self.TYPE_HIST_IMG, self.TYPE_HIST_STATE], device=device)
+        hist_types = hist_types_per_step.repeat(n_obs)
+
+        query_types = torch.tensor(
+            [self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD], device=device)
+
+        all_token_types = torch.cat([hist_types, query_types]).unsqueeze(
+            0).expand(batch_size, -1)
+
+        full_sequence += self.token_type_embedding(all_token_types)
+
+        positions = torch.arange(full_sequence.shape[1], device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        full_sequence += self.position_embedding(positions)
+
+        # 4. 트랜스포머 백본 통과
+        attn_mask = self._create_full_history_sequential_mask(device)
+        hidden_states = self.transformer(src=full_sequence, mask=attn_mask)
+
+        # 5. 출력 처리 (모듈 호출)
+        results = self.output_block(hidden_states)
 
         return results
 
 
 def compute_loss(
-    # 여기서 'BidirectionalARTransformer'는 타입 힌트입니다.
     model: 'BidirectionalARTransformer',
     predictions: Dict[str, torch.Tensor],
     targets: Dict[str, torch.Tensor]
