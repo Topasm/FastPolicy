@@ -24,7 +24,8 @@ from lerobot.common.datasets.utils import dataset_to_policy_features
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 
 from model.predictor.policy import (
-    GoalConditionedAutoregressivePolicy
+    HierarchicalAutoregressivePolicy,
+    compute_loss
 )
 
 from model.predictor.config import BidirectionalARTransformerConfig
@@ -41,7 +42,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
-    training_steps = 20000  # Reduced for testing WandB integration
+    training_steps = 500  # Reduced for testing WandB integration
     batch_size = 64
     learning_rate = 1e-4
     log_freq = 100  # More frequent logging for testing
@@ -156,7 +157,7 @@ def main():
         normalize_state_base, key_mapping)
 
     # Create the model without internal normalizers (we'll use external normalization)
-    model = GoalConditionedAutoregressivePolicy(
+    model = HierarchicalAutoregressivePolicy(
         config=config
     )
     model.to(device)
@@ -205,15 +206,13 @@ def main():
 
             # Forward pass
             # We've already normalized the batch with wrapped_normalizer above
-            total_loss = model(
+            predictions = model(
                 initial_images=batch_device['initial_images'],
-                initial_states=batch_device['initial_states'],
-                forward_states=batch_device['forward_states'],
-                goal_images=batch_device['goal_images'],
-                backward_states=batch_device['backward_states'],
-                training=True
+                initial_states=batch_device['initial_states']
             )
 
+            # 2. 예측값과 정답(batch_device)으로 Loss 계산
+            total_loss = compute_loss(predictions, batch_device)
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -222,11 +221,11 @@ def main():
             # Logging
             if step % log_freq == 0:
                 # 훨씬 간결해진 로깅
-                log_str = f"Step: {step}/{training_steps} | Autoregressive Loss: {total_loss.item():.4f}"
+                log_str = f"Step: {step}/{training_steps} | Hierarchical Loss: {total_loss.item():.4f}"
                 print(log_str)
 
                 wandb_log = {
-                    'train/autoregressive_loss': total_loss.item(),
+                    'train/hierarchical_loss': total_loss.item(),
                     'train/learning_rate': optimizer.param_groups[0]['lr']
                 }
 

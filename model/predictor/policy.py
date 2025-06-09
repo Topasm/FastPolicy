@@ -16,47 +16,72 @@ The new prediction order (goal → backward → forward) enables soft conditioni
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import json
-from typing import Optional, Dict, Any
-from dataclasses import dataclass, field
-from pathlib import Path
-import torchvision.models as models
-import torchvision.transforms as transforms
+from typing import Dict, Any, Optional
 
 from model.modules.modules import SpatialSoftmax
 from model.modules.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 from model.predictor.config import BidirectionalARTransformerConfig
 from model.modules.component_blocks import InputBlock, OutputHeadBlock
 from model.modules.visual_modules import ImageEncoder, ImageDecoder
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Dict, Any
+
+# 필요한 다른 모듈들을 import 합니다.
+# 이 클래스들은 별도의 파일(예: visual_modules.py)에 있어도 무방합니다.
+from model.modules.visual_modules import ImageEncoder, ImageDecoder
 
 
-class GoalConditionedAutoregressivePolicy(nn.Module):
-    """
-    Encoder-Decoder 구조를 사용하여 목표를 먼저 예측하고,
-    이를 조건으로 궤적을 순차적으로 생성하는 최종 모델입니다.
-    """
+def compute_loss(predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """모델의 예측값과 정답 값을 받아 전체 Loss를 계산합니다."""
+    losses = {}
+    weights = {
+        'forward_state_loss': 1.0, 'backward_state_loss': 1.0,
+        'goal_image_loss': 1.0, 'progress_loss': 0.5
+    }
 
+    if 'predicted_forward_states' in predictions and 'forward_states' in targets:
+        losses['forward_state_loss'] = F.l1_loss(
+            predictions['predicted_forward_states'], targets['forward_states'])
+    if 'predicted_backward_states' in predictions and 'backward_states' in targets:
+        losses['backward_state_loss'] = F.l1_loss(
+            predictions['predicted_backward_states'], targets['backward_states'])
+    if 'predicted_goal_images' in predictions and 'goal_images' in targets:
+        losses['goal_image_loss'] = F.mse_loss(
+            predictions['predicted_goal_images'], targets['goal_images'])
+    if 'predicted_progress' in predictions and 'normalized_timestep' in targets:
+        predicted = predictions['predicted_progress'].squeeze(-1)
+        target = targets['normalized_timestep']
+        losses['progress_loss'] = F.mse_loss(predicted, target)
+
+    total_loss = torch.tensor(0.0, device=next(
+        iter(predictions.values())).device)
+    for name, loss in losses.items():
+        if name in weights and loss is not None:
+            total_loss += loss * weights.get(name, 1.0)
+
+    return total_loss
+
+# --- 2. 최종 정책 모델 ---
+
+
+class HierarchicalAutoregressivePolicy(nn.Module):
     def __init__(self, config: BidirectionalARTransformerConfig, **kwargs):
         super().__init__()
         self.config = config
 
-        # --- 1. 입력 처리 모듈 ---
+        # --- 모듈 초기화 ---
         self.image_encoder = ImageEncoder(config)
         self.image_decoder = ImageDecoder(config)
         self.state_projection = nn.Linear(config.state_dim, config.hidden_dim)
-        self.image_latent_projection = nn.Linear(
+        self.goal_latent_reprojection = nn.Linear(
             config.image_latent_dim, config.hidden_dim)
+        self.bwd_summary_projection = nn.Linear(
+            config.hidden_dim, config.hidden_dim)
 
-        # --- 2. 위치 및 타입 임베딩 ---
-        # 이력, 목표, 생성될 궤적을 위한 임베딩
-        self.history_pos_embedding = nn.Embedding(
-            config.n_obs_steps * 2, config.hidden_dim)
-        self.trajectory_pos_embedding = nn.Embedding(
-            config.forward_steps + config.backward_steps, config.hidden_dim)
-        # 0:ImgHist, 1:StateHist, 2:Goal, 3:StateTraj
-        self.token_type_embedding = nn.Embedding(4, config.hidden_dim)
-
-        # --- 3. 인코더와 디코더 (PyTorch 기본 모듈 사용) ---
+        # --- 인코더와 디코더 ---
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.hidden_dim, nhead=config.num_heads, dim_feedforward=config.hidden_dim * 4,
             dropout=config.dropout, activation='gelu', batch_first=True, norm_first=True)
@@ -69,136 +94,111 @@ class GoalConditionedAutoregressivePolicy(nn.Module):
         self.prediction_decoder = nn.TransformerDecoder(
             decoder_layer, num_layers=config.num_layers, norm=nn.LayerNorm(config.hidden_dim))
 
-        # --- 4. 출력 헤드 ---
-        self.goal_head = nn.Sequential(nn.Linear(config.hidden_dim, config.hidden_dim), nn.ReLU(
-        ), nn.Linear(config.hidden_dim, config.image_latent_dim))
-        self.next_state_head = nn.Linear(config.hidden_dim, config.state_dim)
+        # --- 쿼리 토큰 및 임베딩 ---
+        self.history_pos_embedding = nn.Embedding(
+            config.n_obs_steps * 2, config.hidden_dim)
+        self.query_embedding = nn.Embedding(
+            3, config.hidden_dim)  # 0:Goal, 1:Bwd, 2:Fwd
 
-        print("✅ Initialized Goal-Conditioned Encoder-Decoder Policy.")
+        # --- 출력 헤드 ---
+        self.goal_head = nn.Linear(config.hidden_dim, config.image_latent_dim)
+        self.bwd_head = nn.Linear(
+            config.hidden_dim, config.backward_steps * config.state_dim)
+        self.fwd_head = nn.Linear(
+            config.hidden_dim, config.forward_steps * config.state_dim)
+        self.progress_head = nn.Linear(config.hidden_dim, 1)
 
     def encode(self, initial_images, initial_states):
         """과거 이력을 인코딩하여 memory를 생성합니다."""
         device = initial_images.device
         batch_size, n_obs, _, _, _ = initial_images.shape
-
-        # 이력 임베딩
         img_embeds = self.image_encoder(
             initial_images.flatten(0, 1)).view(batch_size, n_obs, -1)
-        img_embeds = self.image_latent_projection(img_embeds)
         state_embeds = self.state_projection(initial_states)
-
-        # 이력 시퀀스 구성 및 임베딩
         history_sequence = torch.cat([img_embeds, state_embeds], dim=1)
 
-        hist_pos_ids = torch.arange(n_obs * 2, device=device).unsqueeze(0)
-        history_sequence += self.history_pos_embedding(hist_pos_ids)
+        pos_ids = torch.arange(
+            history_sequence.shape[1], device=device).unsqueeze(0)
+        history_sequence += self.history_pos_embedding(pos_ids)
 
-        hist_type_ids = torch.cat([torch.full((n_obs,), 0, device=device), torch.full(
-            (n_obs,), 1, device=device)], dim=0).unsqueeze(0)
-        history_sequence += self.token_type_embedding(hist_type_ids)
-
-        # 인코더 통과
         return self.context_encoder(history_sequence)
 
-    def forward(self, initial_images, initial_states, goal_images=None, forward_states=None, backward_states=None, training=True, **kwargs):
-        """학습(Training)을 위한 forward 함수"""
-        # 1. 인코더로 이력 문맥(memory) 생성
+    def forward(self, initial_images, initial_states, **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        학습을 위한 forward 함수. 한 번의 pass로 모든 예측을 효율적으로 처리합니다.
+        """
+        device = initial_images.device
+        batch_size = initial_images.shape[0]
+
         memory = self.encode(initial_images, initial_states)
 
-        # 2. 목표(Goal) 예측 및 Loss 계산
-        # memory의 모든 정보를 종합하여(mean) 목표 예측
-        memory_summary = memory.mean(dim=1)
-        predicted_goal_latent = self.goal_head(memory_summary)
+        query_ids = torch.arange(3, device=device).unsqueeze(
+            0).expand(batch_size, -1)
+        query_embeds = self.query_embedding(query_ids)
 
-        if goal_images is not None:
-            with torch.no_grad():
-                true_goal_latent = self.image_encoder(goal_images)
-            goal_loss = F.mse_loss(predicted_goal_latent, true_goal_latent)
-        else:
-            goal_loss = torch.tensor(0.0, device=initial_images.device)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(
+            query_embeds.size(1)).to(device)
 
-        # 3. 궤적(Trajectory) 예측 및 Loss 계산 (Teacher Forcing)
-        if forward_states is not None and backward_states is not None:
-            # 디코더 입력(tgt)으로 사용할 정답 궤적 준비
-            target_states = torch.cat(
-                [torch.flip(backward_states, [1]), forward_states], dim=1)
+        decoder_output = self.prediction_decoder(
+            tgt=query_embeds, memory=memory, tgt_mask=tgt_mask)
 
-            # 디코더 입력의 시작을 알리는 [SOS] 토큰 역할로 예측된 목표를 사용
-            goal_embed = self.image_latent_projection(
-                predicted_goal_latent.detach()).unsqueeze(1)  # gradient 흐름 차단
+        goal_h, bwd_h, fwd_h = decoder_output[:,
+                                              0], decoder_output[:, 1], decoder_output[:, 2]
 
-            # 정답 궤적 state를 임베딩
-            target_embeds = self.state_projection(target_states)
+        predictions = {
+            "predicted_goal_latents": self.goal_head(goal_h),
+            "predicted_backward_states": self.bwd_head(bwd_h).view(batch_size, self.config.backward_steps, -1),
+            "predicted_forward_states": self.fwd_head(fwd_h).view(batch_size, self.config.forward_steps, -1),
+            "predicted_progress": torch.sigmoid(self.progress_head(memory.mean(dim=1)))
+        }
+        predictions["predicted_goal_images"] = self.image_decoder(
+            predictions["predicted_goal_latents"])
 
-            # 최종 디코더 입력: [예측된 Goal, 정답 궤적의 첫 스텝 ~ 마지막-1 스텝]
-            decoder_input = torch.cat(
-                [goal_embed, target_embeds[:, :-1, :]], dim=1)
-
-            # 위치 및 타입 임베딩 추가
-            traj_pos_ids = torch.arange(
-                decoder_input.shape[1], device=initial_images.device).unsqueeze(0)
-            decoder_input += self.trajectory_pos_embedding(traj_pos_ids)
-
-            traj_type_ids = torch.full(
-                (decoder_input.shape[1],), 3, device=initial_images.device).unsqueeze(0)
-            decoder_input += self.token_type_embedding(traj_type_ids)
-
-            # Causal Mask와 함께 디코더 통과
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(
-                decoder_input.shape[1]).to(initial_images.device)
-            decoder_output = self.prediction_decoder(
-                tgt=decoder_input, memory=memory, tgt_mask=tgt_mask)
-
-            # 다음 스텝 상태 예측
-            predicted_trajectory = self.next_state_head(decoder_output)
-
-            # 궤적 Loss 계산
-            trajectory_loss = F.l1_loss(predicted_trajectory, target_states)
-
-            # 최종 Loss
-            total_loss = goal_loss + trajectory_loss
-            return total_loss
-        else:
-            return goal_loss
+        return predictions
 
     @torch.no_grad()
-    def generate(self, initial_images, initial_states, steps_to_generate):
-        """추론(Inference)을 위한 Autoregressive 생성 함수"""
+    def generate(self, initial_images, initial_states) -> Dict[str, torch.Tensor]:
+        """추론을 위한 generate 함수. Goal -> Bwd -> Fwd 순서로 순차 생성합니다."""
         self.eval()
         device = initial_images.device
 
-        # 1. 인코더로 memory 생성
         memory = self.encode(initial_images, initial_states)
 
-        # 2. 목표(Goal) 예측
-        predicted_goal_latent = self.goal_head(memory.mean(dim=1))
-        predicted_goal_image = self.image_decoder(predicted_goal_latent)
+        # 단계 1: Goal 예측
+        goal_query = self.query_embedding.weight[0].unsqueeze(0).unsqueeze(0)
+        goal_h = self.prediction_decoder(
+            tgt=goal_query, memory=memory).squeeze(1)
+        pred_goal_latent = self.goal_head(goal_h)
+        pred_goal_image = self.image_decoder(pred_goal_latent)
 
-        # 3. Autoregressive 궤적 생성 시작
-        # 디코더의 첫 입력([SOS] 토큰)으로 예측된 목표 사용
-        current_token_embed = self.image_latent_projection(
-            predicted_goal_latent).unsqueeze(1)
-        generated_states = []
+        # 단계 2: Bwd 예측
+        goal_result_embed = self.goal_latent_reprojection(
+            pred_goal_latent).unsqueeze(1)
+        bwd_query = self.query_embedding.weight[1].unsqueeze(0).unsqueeze(0)
+        bwd_tgt = torch.cat([goal_result_embed, bwd_query], dim=1)
+        bwd_mask = nn.Transformer.generate_square_subsequent_mask(
+            bwd_tgt.size(1)).to(device)
+        bwd_h = self.prediction_decoder(
+            tgt=bwd_tgt, memory=memory, tgt_mask=bwd_mask)[:, -1, :]
+        pred_bwd_states = self.bwd_head(bwd_h).view(
+            1, self.config.backward_steps, -1)
 
-        for i in range(steps_to_generate):
-            pos_id = torch.tensor([[i]], device=device)
-            # Trajectory state type
-            type_id = torch.tensor([[3]], device=device)
+        # 단계 3: Fwd 예측
+        bwd_summary = self.state_projection(pred_bwd_states.mean(dim=1))
+        bwd_result_embed = self.bwd_summary_projection(
+            bwd_summary).unsqueeze(1)
+        fwd_query = self.query_embedding.weight[2].unsqueeze(0).unsqueeze(0)
+        fwd_tgt = torch.cat(
+            [goal_result_embed, bwd_result_embed, fwd_query], dim=1)
+        fwd_mask = nn.Transformer.generate_square_subsequent_mask(
+            fwd_tgt.size(1)).to(device)
+        fwd_h = self.prediction_decoder(
+            tgt=fwd_tgt, memory=memory, tgt_mask=fwd_mask)[:, -1, :]
+        pred_fwd_states = self.fwd_head(fwd_h).view(
+            1, self.config.forward_steps, -1)
 
-            decoder_input = current_token_embed + \
-                self.trajectory_pos_embedding(
-                    pos_id) + self.token_type_embedding(type_id)
-
-            # 디코더는 매 스텝 전체 memory를 참고
-            decoder_output = self.prediction_decoder(
-                tgt=decoder_input, memory=memory)
-
-            # 다음 state 예측
-            next_state = self.next_state_head(decoder_output.squeeze(1))
-            generated_states.append(next_state)
-
-            # 다음 입력을 위해 예측된 state를 다시 임베딩
-            current_token_embed = self.state_projection(
-                next_state).unsqueeze(1)
-
-        return torch.stack(generated_states, dim=1), predicted_goal_image
+        return {
+            "predicted_goal_images": pred_goal_image,
+            "predicted_backward_states": pred_bwd_states,
+            "predicted_forward_states": pred_fwd_states
+        }
