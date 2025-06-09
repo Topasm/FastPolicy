@@ -25,6 +25,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 
 from model.modules.modules import SpatialSoftmax
+from model.predictor.custom_transformer import CustomTransformerEncoderLayer, CustomTransformerEncoder, RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 
 
 @dataclass
@@ -318,24 +319,25 @@ class BidirectionalARTransformer(nn.Module):
         self.input_block = InputBlock(config)
         self.output_block = OutputHeadBlock(config)
 
-        # --- 트랜스포머 백본 (표준 PyTorch 트랜스포머) ---
-        encoder_layer = nn.TransformerEncoderLayer(
+        # --- ❗️❗️ PyTorch 기본 라이브러리를 사용했을 때와 동일한 방식으로 조립 ❗️❗️ ---
+
+        # 1. '복제' 레이어를 정의합니다.
+        replica_encoder_layer = ReplicaTransformerEncoderLayer(
             d_model=config.hidden_dim,
             nhead=config.num_heads,
             dim_feedforward=config.hidden_dim * 4,
             dropout=config.dropout,
-            activation='gelu',      # 표준적이고 안정적인 GELU 사용
-            batch_first=True,       # (batch, seq, feature) 순서
-            norm_first=True         # Pre-LN 구조로 안정적인 학습 유도
+            batch_first=True  # 중요
         )
 
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
+        # 2. '복제' 레이어를 N개 쌓아 최종 트랜스포머를 만듭니다.
+        self.transformer = ReplicaTransformerEncoder(
+            encoder_layer=replica_encoder_layer,
             num_layers=config.num_layers,
-            norm=nn.LayerNorm(config.hidden_dim, eps=config.layernorm_epsilon)
+            norm=RMSNorm(config.hidden_dim, eps=config.layernorm_epsilon)
         )
 
-        print("✅ Using PyTorch's standard `nn.TransformerEncoder` as the backbone.")
+        print("✅ Initialized with 'ReplicaTransformerEncoder' which is a 1:1 copy of PyTorch's implementation.")
 
         # --- 시퀀스 구성을 위한 임베딩 및 쿼리 토큰 (메인 클래스에서 관리) ---
         self.TYPE_HIST_IMG, self.TYPE_HIST_STATE, self.TYPE_QUERY_GOAL, self.TYPE_QUERY_BWD, self.TYPE_QUERY_FWD = 0, 1, 2, 3, 4
