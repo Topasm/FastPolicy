@@ -442,8 +442,8 @@ class BidirectionalARTransformer(nn.Module):
         self.image_latent_projection = nn.Linear(
             config.image_latent_dim, config.hidden_dim)
 
-        # Token type embeddings (0: image, 1: state, 2: goal_image, 3: forward_query, 4: goal_query, 5: backward_query)
-        self.token_type_embedding = nn.Embedding(6, config.hidden_dim)
+        # Token type embeddings (0: image, 1: state, 2: goal_image, 3: forward_query, 4: goal_query, 5: backward_query, 6: progress_query)
+        self.token_type_embedding = nn.Embedding(7, config.hidden_dim)
 
         # Position embeddings for the full sequence
         # We need positions for: 1 initial_image + 16 forward_states + 1 goal_image + 16 backward_states
@@ -457,6 +457,8 @@ class BidirectionalARTransformer(nn.Module):
             torch.randn(1, 1, config.hidden_dim) * 0.02)
         self.backward_seq_query_token = nn.Parameter(
             torch.randn(1, 1, config.hidden_dim) * 0.02)
+        self.progress_query_token = nn.Parameter(
+            torch.randn(1, 1, config.hidden_dim) * 0.02)
 
         # Output prediction heads for the query tokens
         # Modified: Ensure we predict F-1 states for forward trajectory (as we have initial state)
@@ -466,6 +468,7 @@ class BidirectionalARTransformer(nn.Module):
             config.hidden_dim, config.image_latent_dim)
         self.backward_state_head = nn.Linear(
             config.hidden_dim, config.backward_steps * config.state_dim)
+        self.progress_head = nn.Linear(config.hidden_dim, 1)
 
         # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -556,6 +559,22 @@ class BidirectionalARTransformer(nn.Module):
             # Forward query (position 4) can attend to: conditioning tokens + goal query + backward query
             mask[4, 2] = False  # Can attend to goal query
             mask[4, 3] = False  # Can attend to backward query
+
+        # With progress query: [cond0, cond1, progress_q, goal_q, bwd_q, fwd_q]
+        elif seq_len == 6:
+            # Progress query (pos 2) can attend to conditioning tokens (pos 0, 1) - handled by default
+
+            # Goal query (pos 3) can attend to: conditioning tokens + progress query
+            mask[3, 2] = False  # attend to progress_q
+
+            # Backward query (pos 4) can attend to: conditioning tokens + progress_q + goal_q
+            mask[4, 2] = False  # attend to progress_q
+            mask[4, 3] = False  # attend to goal_q
+
+            # Forward query (pos 5) can attend to: conditioning tokens + progress_q + goal_q + bwd_q
+            mask[5, 2] = False  # attend to progress_q
+            mask[5, 3] = False  # attend to goal_q
+            mask[5, 4] = False  # attend to bwd_q
 
         return mask
 
@@ -679,6 +698,8 @@ class BidirectionalARTransformer(nn.Module):
         projected_initial_state = projected_initial_state.unsqueeze(1)
 
         # Expand query tokens for the batch
+        batch_progress_query = self.progress_query_token.expand(
+            batch_size, -1, -1)
         batch_goal_query = self.goal_image_query_token.expand(
             batch_size, -1, -1)
         batch_backward_query = self.backward_seq_query_token.expand(
@@ -686,19 +707,20 @@ class BidirectionalARTransformer(nn.Module):
         batch_forward_query = self.forward_seq_query_token.expand(
             batch_size, -1, -1)
 
-        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, goal_query, backward_query, forward_query]
-        # This reflects the prediction sequence: goal → backward → forward
+        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, progress_query, goal_query, backward_query, forward_query]
+        # This reflects the prediction sequence: progress -> goal → backward → forward
         query_sequence = torch.cat([
             projected_initial_image,
             projected_initial_state,
+            batch_progress_query,
             batch_goal_query,
             batch_backward_query,
             batch_forward_query
-        ], dim=1)  # [B, 5, D]
+        ], dim=1)  # [B, 6, D]
 
-        # Define token types: 0=image, 1=state, 4=goal_query, 5=backward_query, 3=forward_query
+        # Define token types: 0=image, 1=state, 6=progress_query, 4=goal_query, 5=backward_query, 3=forward_query
         query_token_types_tensor = torch.tensor(
-            [0, 1, 4, 5, 3], device=device).unsqueeze(0).expand(batch_size, -1)
+            [0, 1, 6, 4, 5, 3], device=device).unsqueeze(0).expand(batch_size, -1)
 
         # Add token type embeddings
         query_type_embeddings = self.token_type_embedding(
@@ -707,14 +729,14 @@ class BidirectionalARTransformer(nn.Module):
 
         # Add position embeddings
         query_positions = torch.arange(
-            5, device=device).unsqueeze(0).expand(batch_size, -1)
+            6, device=device).unsqueeze(0).expand(batch_size, -1)
         query_pos_embeddings = self.position_embedding(query_positions)
         query_sequence = query_sequence + query_pos_embeddings
 
         # Create attention mask for query-based approach
         num_condition_tokens = 2  # initial_image and initial_state
         query_attn_mask = self._create_query_based_mask(
-            5, device, num_condition_tokens)
+            6, device, num_condition_tokens)
 
         # Pass through transformer for query-based learning
         query_hidden_states = self.transformer(
@@ -723,26 +745,32 @@ class BidirectionalARTransformer(nn.Module):
         )
 
         # Extract hidden states for the query tokens (NEW ORDER)
+        # [B, D] - progress prediction
+        progress_query_hidden = query_hidden_states[:, 2]
         # [B, D] - goal prediction
-        goal_query_hidden = query_hidden_states[:, 2]
+        goal_query_hidden = query_hidden_states[:, 3]
         # [B, D] - backward prediction
-        backward_query_hidden = query_hidden_states[:, 3]
+        backward_query_hidden = query_hidden_states[:, 4]
         # [B, D] - forward prediction
-        forward_query_hidden = query_hidden_states[:, 4]
+        forward_query_hidden = query_hidden_states[:, 5]
 
-        # Predict goal image latent (first in sequence)
+        # Predict progress (first in sequence)
+        query_predicted_progress = torch.sigmoid(
+            self.progress_head(progress_query_hidden))
+
+        # Predict goal image latent (second in sequence)
         query_predicted_goal_latents = self.goal_image_latent_head(
             goal_query_hidden)
         query_goal_images = self.image_decoder(query_predicted_goal_latents)
 
-        # Predict backward states sequence (second in sequence, conditioned on goal)
+        # Predict backward states sequence (third in sequence, conditioned on goal)
         query_predicted_bwd_states_flat = self.backward_state_head(
             backward_query_hidden)
         query_bwd_states = query_predicted_bwd_states_flat.view(
             batch_size, self.config.backward_steps, self.config.state_dim
         )
 
-        # Predict forward states sequence (third in sequence, conditioned on goal + backward)
+        # Predict forward states sequence (fourth in sequence, conditioned on goal + backward)
         query_predicted_fwd_states_flat = self.forward_state_head(
             forward_query_hidden)
 
@@ -761,6 +789,7 @@ class BidirectionalARTransformer(nn.Module):
             'predicted_backward_states': ar_results['predicted_backward_states'],
 
             # Query-based results (for training the query approach to match autoregressive)
+            'query_predicted_progress': query_predicted_progress,
             'query_predicted_forward_states': query_fwd_states,
             'query_predicted_goal_images': query_goal_images,
             'query_predicted_goal_latents': query_predicted_goal_latents,
@@ -792,6 +821,8 @@ class BidirectionalARTransformer(nn.Module):
             1)  # [B, 1, D]
 
         # Expand query tokens for the batch
+        batch_progress_query = self.progress_query_token.expand(
+            batch_size, -1, -1)  # [B, 1, D]
         batch_goal_query = self.goal_image_query_token.expand(
             batch_size, -1, -1)  # [B, 1, D]
         batch_backward_query = self.backward_seq_query_token.expand(
@@ -799,27 +830,28 @@ class BidirectionalARTransformer(nn.Module):
         batch_forward_query = self.forward_seq_query_token.expand(
             batch_size, -1, -1)  # [B, 1, D]
 
-        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, goal_query, backward_query, forward_query]
-        # This reflects the prediction sequence: goal → backward → forward
+        # Construct the input sequence with NEW ORDER: [initial_image, initial_state, progress_query, goal_query, backward_query, forward_query]
+        # This reflects the prediction sequence: progress -> goal → backward → forward
         sequence = torch.cat([
             projected_initial_image,       # [B, 1, D]
             projected_initial_state,       # [B, 1, D]
+            batch_progress_query,          # [B, 1, D] - progress prediction
             batch_goal_query,              # [B, 1, D] - goal prediction
             batch_backward_query,          # [B, 1, D] - backward prediction
             batch_forward_query            # [B, 1, D] - forward prediction
-        ], dim=1)  # [B, 5, D]
+        ], dim=1)  # [B, 6, D]
 
-        # Define token types: 0=image, 1=state, 4=goal_query, 5=backward_query, 3=forward_query
+        # Define token types: 0=image, 1=state, 6=progress_query, 4=goal_query, 5=backward_query, 3=forward_query
         token_types_tensor = torch.tensor(
-            [0, 1, 4, 5, 3], device=device
-        ).unsqueeze(0).expand(batch_size, -1)  # [B, 5]
+            [0, 1, 6, 4, 5, 3], device=device
+        ).unsqueeze(0).expand(batch_size, -1)  # [B, 6]
 
         # Add token type embeddings
         type_embeddings = self.token_type_embedding(token_types_tensor)
         sequence = sequence + type_embeddings
 
         # Add position embeddings
-        positions = torch.arange(5, device=device).unsqueeze(
+        positions = torch.arange(6, device=device).unsqueeze(
             0).expand(batch_size, -1)
         pos_embeddings = self.position_embedding(positions)
         sequence = sequence + pos_embeddings
@@ -827,7 +859,7 @@ class BidirectionalARTransformer(nn.Module):
         # Create attention mask - query tokens can attend only to condition tokens
         num_condition_tokens = 2  # initial_image and initial_state
         attn_mask = self._create_query_based_mask(
-            5, device, num_condition_tokens)
+            6, device, num_condition_tokens)
 
         # Pass through transformer
         hidden_states = self.transformer(
@@ -836,26 +868,32 @@ class BidirectionalARTransformer(nn.Module):
         )
 
         # Extract hidden states for the query tokens (NEW ORDER)
-        goal_query_hidden = hidden_states[:, 2]     # [B, D] - goal prediction
+        # [B, D] - progress prediction
+        progress_query_hidden = hidden_states[:, 2]
+        goal_query_hidden = hidden_states[:, 3]     # [B, D] - goal prediction
         # [B, D] - backward prediction
-        backward_query_hidden = hidden_states[:, 3]
+        backward_query_hidden = hidden_states[:, 4]
         # [B, D] - forward prediction
-        forward_query_hidden = hidden_states[:, 4]
+        forward_query_hidden = hidden_states[:, 5]
 
-        # Predict goal image latent (first in sequence)
+        # Predict progress (first in sequence)
+        results['predicted_progress'] = torch.sigmoid(
+            self.progress_head(progress_query_hidden))
+
+        # Predict goal image latent (second in sequence)
         predicted_goal_latents = self.goal_image_latent_head(goal_query_hidden)
         results['predicted_goal_latents'] = predicted_goal_latents
         results['predicted_goal_images'] = self.image_decoder(
             predicted_goal_latents)
 
-        # Predict backward states sequence (second in sequence, conditioned on goal)
+        # Predict backward states sequence (third in sequence, conditioned on goal)
         predicted_bwd_states_flat = self.backward_state_head(
             backward_query_hidden)
         results['predicted_backward_states'] = predicted_bwd_states_flat.view(
             batch_size, self.config.backward_steps, self.config.state_dim
         )
 
-        # Predict forward states sequence (third in sequence, conditioned on goal + backward)
+        # Predict forward states sequence (fourth in sequence, conditioned on goal + backward)
         predicted_fwd_states_flat = self.forward_state_head(
             forward_query_hidden)
 
@@ -1111,6 +1149,13 @@ def compute_loss(
             goal_image_latents
         )
 
+    # Add query progress loss
+    if 'query_predicted_progress' in predictions and 'normalized_timestep' in targets:
+        losses['query_progress_loss'] = F.mse_loss(
+            predictions['query_predicted_progress'].squeeze(-1),
+            targets['normalized_timestep']
+        )
+
     # Compute weighted total loss
     weights = {
         # Original autoregressive weights
@@ -1123,6 +1168,8 @@ def compute_loss(
         'query_backward_state_loss': 1.0,
         'query_goal_image_loss': 2.0,
         'query_goal_latent_consistency_loss': 1.0,
+        # Progress loss weight
+        'query_progress_loss': 0.5,
     }
 
     total_loss = torch.tensor(

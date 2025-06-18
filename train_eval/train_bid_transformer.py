@@ -38,7 +38,7 @@ def main():
     # Configuration
     output_directory = Path("outputs/train/bidirectional_transformer")
     output_directory.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     # Training hyperparameters
     training_steps = 1000  # Reduced for testing WandB integration
