@@ -45,6 +45,9 @@ class BidirectionalARTransformerConfig:
     image_latent_dim: int = 256       # Dimension of image latent representation
     forward_steps: int = 20
     backward_steps: int = 16
+    num_query_tokens: int = 6  # Number of query tokens in the sequence
+    # Number of token types (image, state, goal, forward_query, goal_query, backward_query, progress_query)
+    token_type_count: int = 7
     # Number of observation steps (history + current)
     n_obs_steps: int = 2
     input_features: Dict[str, Any] = field(default_factory=dict)
