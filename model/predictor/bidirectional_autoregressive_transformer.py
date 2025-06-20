@@ -25,7 +25,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 
 from model.modules.modules import SpatialSoftmax
-from model.predictor.custom_transformer import CustomTransformerEncoderLayer, CustomTransformerEncoder, RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
+from model.predictor.custom_transformer import RMSNorm, ReplicaTransformerEncoderLayer, ReplicaTransformerEncoder
 
 
 @dataclass
