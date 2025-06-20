@@ -101,8 +101,8 @@ def main():
 
     dataset = BidirectionalTrajectoryDataset(
         lerobot_dataset=lerobot_dataset,
-        forward_steps=32,
-        backward_steps=32,
+        forward_steps=64,
+        backward_steps=64,
         image_key="observation.image",
         state_key="observation.state",
         n_obs_steps=n_obs_steps  # Enable temporal encoding
@@ -128,8 +128,8 @@ def main():
         image_channels=3,
         image_size=84,
         output_image_size=96,
-        forward_steps=32,
-        backward_steps=32,
+        forward_steps=64,
+        backward_steps=64,
         n_obs_steps=n_obs_steps,  # Enable temporal encoding
         input_features=input_features,  # Pass the actual FeatureSpec objects
         output_features=output_features,  # Pass the actual FeatureSpec objects

@@ -42,8 +42,8 @@ class BidirectionalARTransformerConfig:
     image_channels: int = 3
     image_size: int = 84
     output_image_size: int = 96  # Output image size after decoding
-    forward_steps: int = 20
-    backward_steps: int = 16
+    forward_steps: int = 64
+    backward_steps: int = 64
     n_obs_steps: int = 3  # Number of observation steps in history
     input_features: Dict[str, Any] = field(default_factory=dict)
     output_features: Dict[str, Any] = field(default_factory=dict)
@@ -55,7 +55,7 @@ class BidirectionalARTransformerConfig:
     num_query_tokens: int = 3
 
     # Number of action steps (not used in this model, but kept for compatibility)
-    n_action_steps = 32
+    n_action_steps = 64
 
     image_features = 1
     # Token types: HistImg, HistState, QueryGoal, QueryBwd, QueryFwd

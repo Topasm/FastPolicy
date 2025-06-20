@@ -34,8 +34,8 @@ class HierarchicalPolicyConfig:
 
     # Sequence parameters
     max_sequence_length: int = 128
-    forward_steps: int = 32
-    backward_steps: int = 32
+    forward_steps: int = 64
+    backward_steps: int = 64
     n_obs_steps: int = 3  # Number of observation steps for temporal encoding
     n_action_steps: int = 8  # Number of action steps to predict
 
